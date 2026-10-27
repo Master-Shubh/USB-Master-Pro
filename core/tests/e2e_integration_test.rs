@@ -78,9 +78,16 @@ fn get_daemon_binary_path() -> PathBuf {
     }
 
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let target_debug = manifest_dir.join("target/debug/usb_master_daemon");
-    if target_debug.exists() {
-        return target_debug;
+    let exe_name = if cfg!(windows) { "usb_master_daemon.exe" } else { "usb_master_daemon" };
+
+    let candidate_release = manifest_dir.join("target/release").join(exe_name);
+    if candidate_release.exists() {
+        return candidate_release;
+    }
+
+    let candidate_debug = manifest_dir.join("target/debug").join(exe_name);
+    if candidate_debug.exists() {
+        return candidate_debug;
     }
 
     // Fallback build if not yet compiled
@@ -91,7 +98,7 @@ fn get_daemon_binary_path() -> PathBuf {
         .status()
         .expect("Failed to run cargo build for usb_master_daemon");
     assert!(status.success(), "cargo build failed for usb_master_daemon");
-    target_debug
+    candidate_debug
 }
 
 #[derive(Debug)]
