@@ -1,0 +1,49 @@
+;
+; USB Master Pro — Upper Filter Driver for Physical Hardware Capture INF
+;
+[Version]
+Signature="$WINDOWS NT$"
+Class=USB
+ClassGUID={36FC9E60-C465-11CF-8056-444553540000}
+Provider=%ProviderName%
+DriverVer=10/27/2026,1.0.0.1
+CatalogFile=anyusb_filter.cat
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+anyusb_filter.sys = 1,,
+
+[DefaultInstall.NTamd64]
+CopyFiles = Drivers_Dir
+
+[DefaultInstall.NTarm64]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+anyusb_filter.sys
+
+[DefaultInstall.NTamd64.Services]
+AddService = anyusb_filter,,AnyUsbFilter_Service_Inst
+
+[DefaultInstall.NTarm64.Services]
+AddService = anyusb_filter,,AnyUsbFilter_Service_Inst
+
+[AnyUsbFilter_Service_Inst]
+DisplayName    = %AnyUsbFilter.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\anyusb_filter.sys
+
+[Strings]
+ProviderName           = "BhartX Ecosystems Pvt Ltd"
+MfgName                = "BhartX Ecosystems"
+DiskId1                = "USB Master Pro Filter Driver Disk"
+AnyUsbFilter.SVCDESC   = "USB Master Pro Hardware Capture Filter Service"
+Website                = "https://bhartx.in"
+SupportEmail           = "admin@bhartx.in"

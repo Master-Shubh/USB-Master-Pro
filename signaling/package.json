@@ -1,0 +1,12 @@
+{
+  "name": "usb-master-pro-signaling",
+  "version": "1.0.0",
+  "description": "AnyDesk-style P2P Rendezvous Broker & Signaling Server for USB Master Pro",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

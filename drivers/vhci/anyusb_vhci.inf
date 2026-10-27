@@ -1,0 +1,54 @@
+;
+; USB Master Pro — Virtual USB Host Controller & Bus Driver INF
+;
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGUID={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%ProviderName%
+DriverVer=10/27/2026,1.0.0.1
+CatalogFile=anyusb_vhci.cat
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+anyusb_vhci.sys = 1,,
+
+[Manufacturer]
+%MfgName% = AnyUsb_Device,NTamd64,NTarm64
+
+[AnyUsb_Device.NTamd64]
+%AnyUsbVhci.DeviceDesc% = AnyUsbVhci_Device, root\anyusb_vhci
+
+[AnyUsb_Device.NTarm64]
+%AnyUsbVhci.DeviceDesc% = AnyUsbVhci_Device, root\anyusb_vhci
+
+[AnyUsbVhci_Device.NT]
+CopyFiles = Drivers_Dir
+
+[Drivers_Dir]
+anyusb_vhci.sys
+
+[AnyUsbVhci_Device.NT.Services]
+AddService = anyusb_vhci,%SPSVCINST_ASSOCSERVICE%,AnyUsbVhci_Service_Inst
+
+[AnyUsbVhci_Service_Inst]
+DisplayName    = %AnyUsbVhci.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\anyusb_vhci.sys
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ProviderName           = "BhartX Ecosystems Pvt Ltd"
+MfgName                = "BhartX Ecosystems"
+DiskId1                = "USB Master Pro VHCI Installation Disk"
+AnyUsbVhci.DeviceDesc  = "USB Master Pro Virtual Host Controller & Bus Root"
+AnyUsbVhci.SVCDESC     = "USB Master Pro Virtual USB Bus Service"
+Website                = "https://bhartx.in"
+SupportEmail           = "admin@bhartx.in"
