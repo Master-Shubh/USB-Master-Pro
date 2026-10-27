@@ -14,6 +14,7 @@ pub enum DeviceCategory {
     SmartCard,
     MassStorage,
     GenericUsb,
+    HumanInterface,
 }
 
 impl DeviceCategory {
@@ -27,6 +28,7 @@ impl DeviceCategory {
             DeviceCategory::SmartCard => "🔐",
             DeviceCategory::MassStorage => "💾",
             DeviceCategory::GenericUsb => "⚡",
+            DeviceCategory::HumanInterface => "⌨️",
         }
     }
 
@@ -40,6 +42,7 @@ impl DeviceCategory {
             DeviceCategory::SmartCard => "SmartCard & Security Token",
             DeviceCategory::MassStorage => "USB Mass Storage",
             DeviceCategory::GenericUsb => "USB Peripheral",
+            DeviceCategory::HumanInterface => "Keyboard / Mouse / HID (System)",
         }
     }
 }
@@ -48,6 +51,7 @@ pub const FLAG_RD_SERVICE_OPTIMIZED: u32 = 0x0001; // Enable anticipatory URB po
 pub const FLAG_ISOCH_JITTER_BUFFER: u32  = 0x0002; // Enable microsecond-paced video frame reassembly
 pub const FLAG_BULK_OUT_BURST: u32       = 0x0004; // Fast thermal print bitmap burst streaming
 pub const FLAG_LOW_LATENCY_SERIAL: u32   = 0x0008; // Sub-1ms COM port baud synchronization
+pub const FLAG_SYSTEM_DEVICE: u32        = 0x0010; // Primary system input device (keyboard/mouse) - excluded by default
 
 #[derive(Debug, Clone)]
 pub struct OemDeviceRule {
@@ -261,6 +265,9 @@ impl HardwareClassifier {
         }
         if lower.contains("storage") || lower.contains("flash") || lower.contains("drive") {
             return (DeviceCategory::MassStorage, reported_desc.to_string(), 0);
+        }
+        if lower.contains("keyboard") || lower.contains("mouse") || lower.contains("touchpad") || lower.contains("trackball") || lower.contains("pointing") {
+            return (DeviceCategory::HumanInterface, reported_desc.to_string(), FLAG_SYSTEM_DEVICE);
         }
 
         (DeviceCategory::GenericUsb, if reported_desc.is_empty() { format!("USB Device [VID:{:04X} PID:{:04X}]", vid, pid) } else { reported_desc.to_string() }, 0)

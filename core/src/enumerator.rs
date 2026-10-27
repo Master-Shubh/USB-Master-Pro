@@ -1,7 +1,8 @@
 //! PnP Hardware Device Discovery & State Enumerator
 //! Discovers all connected USB devices, hubs, printers, biometrics, and serial ports.
+//! Features physical hardware sysfs/SetupAPI querying and primary system device exclusion.
 
-use crate::hardware_db::{DeviceCategory, HardwareClassifier};
+use crate::hardware_db::{DeviceCategory, HardwareClassifier, FLAG_SYSTEM_DEVICE};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -25,12 +26,21 @@ pub struct UsbDeviceInfo {
     pub is_mounted: bool,            // Forwarded to and active on remote peer
     pub remote_peer_id: Option<String>,
     pub flags: u32,
+    #[serde(default)]
+    pub is_system_device: bool,      // Flagged if primary system keyboard/mouse/HID
+    #[serde(default = "default_can_forward")]
+    pub can_forward: bool,           // Non-forwardable by default if system device unless forced
+}
+
+fn default_can_forward() -> bool {
+    true
 }
 
 pub struct HardwareEnumerator;
 
 impl HardwareEnumerator {
-    /// Scans the machine's USB subsystem and returns a structured list of classified devices
+    /// Scans the machine's USB subsystem and returns a structured list of classified devices.
+    /// Strictly returns real physical devices. Never injects fake or sample devices.
     pub fn scan_devices() -> Vec<UsbDeviceInfo> {
         let mut devices = Vec::new();
 
@@ -39,21 +49,16 @@ impl HardwareEnumerator {
             devices.extend(Self::scan_sysfs());
         }
 
-        // 2. If running on Windows, native SetupAPI and CfgMgr32 would be called here
+        // 2. If running on Windows, native SetupAPI is called
         #[cfg(target_os = "windows")]
         {
             devices.extend(Self::scan_windows_setupapi());
         }
 
-        // If no devices found (e.g. headless VM or Docker container without USB pass-through),
-        // supply verified default device entries for demonstration and UI staging.
-        if devices.is_empty() {
-            devices.extend(Self::get_sample_devices());
-        }
-
         devices
     }
 
+    /// Scans Linux sysfs for connected USB peripherals
     fn scan_sysfs() -> Vec<UsbDeviceInfo> {
         let mut list = Vec::new();
         let path = Path::new("/sys/bus/usb/devices");
@@ -65,6 +70,12 @@ impl HardwareEnumerator {
 
                 // Skip root hubs like "usb1", "usb2" and interface subdirs like "1-1:1.0"
                 if dirname.starts_with("usb") || dirname.contains(':') {
+                    continue;
+                }
+
+                // Check device class: skip USB Hubs (Class 09)
+                let b_dev_class = fs::read_to_string(dev_path.join("bDeviceClass")).unwrap_or_default().trim().to_string();
+                if b_dev_class == "09" {
                     continue;
                 }
 
@@ -101,7 +112,59 @@ impl HardwareEnumerator {
                     format!("USB Device [{:04X}:{:04X}]", vid, pid)
                 };
 
-                let (category, friendly_name, flags) = HardwareClassifier::classify(vid, pid, &desc);
+                let (mut category, friendly_name, mut flags) = HardwareClassifier::classify(vid, pid, &desc);
+
+                // --- DEVICE EXCLUSION & SYSTEM DEVICE DETECTION ---
+                // Detect primary system keyboard, mouse, or touchpad to prevent locking user out
+                let mut is_system_device = (flags & FLAG_SYSTEM_DEVICE) != 0;
+                let mut is_mouse_or_keyboard = false;
+
+                // Inspect interface descriptors under device (e.g., 2-1:1.0/bInterfaceClass)
+                if let Ok(subentries) = fs::read_dir(&dev_path) {
+                    for subentry in subentries.flatten() {
+                        let sub_name = subentry.file_name().to_string_lossy().to_string();
+                        if sub_name.starts_with(&format!("{}:", dirname)) {
+                            let if_class = fs::read_to_string(subentry.path().join("bInterfaceClass"))
+                                .unwrap_or_default().trim().to_string();
+                            let if_proto = fs::read_to_string(subentry.path().join("bInterfaceProtocol"))
+                                .unwrap_or_default().trim().to_string();
+
+                            // HID class = 03, protocol 01 = keyboard, 02 = mouse
+                            if if_class == "03" {
+                                is_system_device = true;
+                                if if_proto == "01" || if_proto == "02" {
+                                    is_mouse_or_keyboard = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let desc_lower = desc.to_lowercase();
+                if desc_lower.contains("keyboard")
+                    || desc_lower.contains("mouse")
+                    || desc_lower.contains("touchpad")
+                    || desc_lower.contains("trackpoint")
+                    || desc_lower.contains("trackball")
+                    || desc_lower.contains("pointing")
+                {
+                    is_system_device = true;
+                    is_mouse_or_keyboard = true;
+                }
+
+                if is_system_device {
+                    flags |= FLAG_SYSTEM_DEVICE;
+                    if category == DeviceCategory::GenericUsb {
+                        category = DeviceCategory::HumanInterface;
+                    }
+                }
+
+                let can_forward = !is_system_device;
+                let category_icon = if is_mouse_or_keyboard {
+                    if desc_lower.contains("mouse") { "🖱️".to_string() } else { "⌨️".to_string() }
+                } else {
+                    category.icon().to_string()
+                };
 
                 list.push(UsbDeviceInfo {
                     id: dirname.clone(),
@@ -115,12 +178,14 @@ impl HardwareEnumerator {
                     product_name: if product.is_empty() { format!("Device {:04X}:{:04X}", vid, pid) } else { product },
                     serial_number: if serial.is_empty() { "N/A".to_string() } else { serial },
                     category,
-                    category_icon: category.icon().to_string(),
+                    category_icon,
                     speed,
                     is_shared: false,
                     is_mounted: false,
                     remote_peer_id: None,
                     flags,
+                    is_system_device,
+                    can_forward,
                 });
             }
         }
@@ -128,123 +193,239 @@ impl HardwareEnumerator {
         list
     }
 
-    /// Sample verified devices for staging environments
-    pub fn get_sample_devices() -> Vec<UsbDeviceInfo> {
-        vec![
-            UsbDeviceInfo {
-                id: "1-4".to_string(),
-                vid: 0x27D0,
-                pid: 0x0041,
-                bus_num: 1,
-                dev_num: 4,
-                port_path: "Port 1-4".to_string(),
-                friendly_name: "Mantra Softech MFS100 Optical Fingerprint Scanner".to_string(),
-                vendor_name: "Mantra Softech India".to_string(),
-                product_name: "MFS100 Optical Sensor".to_string(),
-                serial_number: "MFS100_749219".to_string(),
-                category: DeviceCategory::FingerprintScanner,
-                category_icon: "🪪".to_string(),
-                speed: "USB 2.0 (High-Speed 480 Mbps)".to_string(),
-                is_shared: false,
-                is_mounted: false,
-                remote_peer_id: None,
-                flags: crate::hardware_db::FLAG_RD_SERVICE_OPTIMIZED,
-            },
-            UsbDeviceInfo {
-                id: "1-2".to_string(),
-                vid: 0x079B,
-                pid: 0x0047,
-                bus_num: 1,
-                dev_num: 2,
-                port_path: "Port 1-2".to_string(),
-                friendly_name: "IDEMIA / Morpho MorphoSmart MSO 1300 E3".to_string(),
-                vendor_name: "IDEMIA Safran".to_string(),
-                product_name: "MSO 1300 E3".to_string(),
-                serial_number: "1932E00418".to_string(),
-                category: DeviceCategory::FingerprintScanner,
-                category_icon: "🪪".to_string(),
-                speed: "USB 2.0 (High-Speed 480 Mbps)".to_string(),
-                is_shared: false,
-                is_mounted: false,
-                remote_peer_id: None,
-                flags: crate::hardware_db::FLAG_RD_SERVICE_OPTIMIZED,
-            },
-            UsbDeviceInfo {
-                id: "2-1".to_string(),
-                vid: 0x27D0,
-                pid: 0x0042,
-                bus_num: 2,
-                dev_num: 3,
-                port_path: "Port 2-1".to_string(),
-                friendly_name: "Mantra Softech MIS100V2 Dual Iris Scanner".to_string(),
-                vendor_name: "Mantra Softech".to_string(),
-                product_name: "MIS100V2 Dual Iris Sensor".to_string(),
-                serial_number: "MIS100_901124".to_string(),
-                category: DeviceCategory::IrisScanner,
-                category_icon: "👁️".to_string(),
-                speed: "USB 2.0 (High-Speed 480 Mbps)".to_string(),
-                is_shared: false,
-                is_mounted: false,
-                remote_peer_id: None,
-                flags: crate::hardware_db::FLAG_RD_SERVICE_OPTIMIZED | crate::hardware_db::FLAG_ISOCH_JITTER_BUFFER,
-            },
-            UsbDeviceInfo {
-                id: "1-1".to_string(),
-                vid: 0x046D,
-                pid: 0x082D,
-                bus_num: 1,
-                dev_num: 5,
-                port_path: "Port 1-1".to_string(),
-                friendly_name: "Logitech HD Pro Webcam C920".to_string(),
-                vendor_name: "Logitech Inc.".to_string(),
-                product_name: "HD Pro Webcam C920".to_string(),
-                serial_number: "4D6C920A".to_string(),
-                category: DeviceCategory::Webcam,
-                category_icon: "📷".to_string(),
-                speed: "USB 2.0 (High-Speed 480 Mbps)".to_string(),
-                is_shared: false,
-                is_mounted: false,
-                remote_peer_id: None,
-                flags: crate::hardware_db::FLAG_ISOCH_JITTER_BUFFER,
-            },
-            UsbDeviceInfo {
-                id: "1-3".to_string(),
-                vid: 0x0FE6,
-                pid: 0x811E,
-                bus_num: 1,
-                dev_num: 6,
-                port_path: "Port 1-3".to_string(),
-                friendly_name: "TVS Electronics RP3200 Plus Thermal Receipt Printer".to_string(),
-                vendor_name: "TVS Electronics".to_string(),
-                product_name: "RP3200 Plus POS Printer".to_string(),
-                serial_number: "TVS_881920".to_string(),
-                category: DeviceCategory::Printer,
-                category_icon: "🖨️".to_string(),
-                speed: "USB 1.1 (Full-Speed 12 Mbps)".to_string(),
-                is_shared: false,
-                is_mounted: false,
-                remote_peer_id: None,
-                flags: crate::hardware_db::FLAG_BULK_OUT_BURST,
-            },
-            UsbDeviceInfo {
-                id: "1-5".to_string(),
-                vid: 0x0403,
-                pid: 0x6001,
-                bus_num: 1,
-                dev_num: 7,
-                port_path: "Port 1-5 (COM3)".to_string(),
-                friendly_name: "FTDI FT232R USB-to-UART Serial Converter".to_string(),
-                vendor_name: "FTDI Chip".to_string(),
-                product_name: "FT232R USB UART".to_string(),
-                serial_number: "A50285BI".to_string(),
-                category: DeviceCategory::SerialPort,
-                category_icon: "🔌".to_string(),
-                speed: "USB 1.1 (Full-Speed 12 Mbps)".to_string(),
-                is_shared: false,
-                is_mounted: false,
-                remote_peer_id: None,
-                flags: crate::hardware_db::FLAG_LOW_LATENCY_SERIAL,
-            },
-        ]
+    /// Windows SetupAPI native device enumeration
+    #[cfg(target_os = "windows")]
+    pub fn scan_windows_setupapi() -> Vec<UsbDeviceInfo> {
+        let mut list = Vec::new();
+
+        unsafe {
+            let enumerator: Vec<u16> = "USB\0".encode_utf16().collect();
+            let dev_info = win_setupapi::SetupDiGetClassDevsW(
+                std::ptr::null(),
+                enumerator.as_ptr(),
+                std::ptr::null_mut(),
+                win_setupapi::DIGCF_PRESENT | win_setupapi::DIGCF_ALLCLASSES,
+            );
+
+            if dev_info == win_setupapi::INVALID_HANDLE_VALUE {
+                return list;
+            }
+
+            let mut dev_data = win_setupapi::SP_DEVINFO_DATA {
+                cb_size: std::mem::size_of::<win_setupapi::SP_DEVINFO_DATA>() as u32,
+                class_guid: [0u8; 16],
+                dev_inst: 0,
+                reserved: 0,
+            };
+
+            let mut idx = 0u32;
+            while win_setupapi::SetupDiEnumDeviceInfo(dev_info, idx, &mut dev_data) != 0 {
+                idx += 1;
+
+                let hw_id = win_setupapi::get_device_property(dev_info, &mut dev_data, win_setupapi::SPDRP_HARDWAREID);
+                let friendly_name_raw = win_setupapi::get_device_property(dev_info, &mut dev_data, win_setupapi::SPDRP_FRIENDLYNAME);
+                let device_desc = win_setupapi::get_device_property(dev_info, &mut dev_data, win_setupapi::SPDRP_DEVICEDESC);
+                let mfg = win_setupapi::get_device_property(dev_info, &mut dev_data, win_setupapi::SPDRP_MFG);
+                let dev_class = win_setupapi::get_device_property(dev_info, &mut dev_data, win_setupapi::SPDRP_CLASS);
+
+                // Parse VID and PID from HardwareID (e.g. "USB\VID_27D0&PID_0041...")
+                let mut vid = 0u16;
+                let mut pid = 0u16;
+                let upper_hw = hw_id.to_uppercase();
+                if let Some(vid_pos) = upper_hw.find("VID_") {
+                    if upper_hw.len() >= vid_pos + 8 {
+                        vid = u16::from_str_radix(&upper_hw[vid_pos + 4..vid_pos + 8], 16).unwrap_or(0);
+                    }
+                }
+                if let Some(pid_pos) = upper_hw.find("PID_") {
+                    if upper_hw.len() >= pid_pos + 8 {
+                        pid = u16::from_str_radix(&upper_hw[pid_pos + 4..pid_pos + 8], 16).unwrap_or(0);
+                    }
+                }
+
+                if vid == 0 && pid == 0 {
+                    continue;
+                }
+
+                let desc = if !friendly_name_raw.is_empty() {
+                    friendly_name_raw.clone()
+                } else if !device_desc.is_empty() {
+                    device_desc.clone()
+                } else {
+                    format!("USB Device [{:04X}:{:04X}]", vid, pid)
+                };
+
+                let (mut category, classified_name, mut flags) = HardwareClassifier::classify(vid, pid, &desc);
+
+                let friendly_name = if !friendly_name_raw.is_empty() {
+                    friendly_name_raw
+                } else {
+                    classified_name
+                };
+
+                let class_lower = dev_class.to_lowercase();
+                let desc_lower = desc.to_lowercase();
+                let is_mouse = desc_lower.contains("mouse") || class_lower.contains("mouse");
+                let is_keyboard = desc_lower.contains("keyboard") || class_lower.contains("keyboard");
+                let is_system_device = is_mouse || is_keyboard || class_lower == "hidclass" || (flags & FLAG_SYSTEM_DEVICE) != 0;
+
+                if is_system_device {
+                    flags |= FLAG_SYSTEM_DEVICE;
+                    if category == DeviceCategory::GenericUsb {
+                        category = DeviceCategory::HumanInterface;
+                    }
+                }
+
+                let category_icon = if is_mouse {
+                    "🖱️".to_string()
+                } else if is_keyboard {
+                    "⌨️".to_string()
+                } else {
+                    category.icon().to_string()
+                };
+
+                list.push(UsbDeviceInfo {
+                    id: format!("win-usb-{}", idx),
+                    vid,
+                    pid,
+                    bus_num: 1,
+                    dev_num: idx as u8,
+                    port_path: format!("Bus 1 Port {}", idx),
+                    friendly_name,
+                    vendor_name: if mfg.is_empty() { "OEM Vendor".to_string() } else { mfg },
+                    product_name: desc,
+                    serial_number: "N/A".to_string(),
+                    category,
+                    category_icon,
+                    speed: "USB 2.0 (High-Speed)".to_string(),
+                    is_shared: false,
+                    is_mounted: false,
+                    remote_peer_id: None,
+                    flags,
+                    is_system_device,
+                    can_forward: !is_system_device,
+                });
+            }
+
+            win_setupapi::SetupDiDestroyDeviceInfoList(dev_info);
+        }
+
+        list
+    }
+
+    /// Non-Windows stub ensuring scan_windows_setupapi is always present without E0599
+    #[cfg(not(target_os = "windows"))]
+    pub fn scan_windows_setupapi() -> Vec<UsbDeviceInfo> {
+        Vec::new()
     }
 }
+
+#[cfg(target_os = "windows")]
+mod win_setupapi {
+    use std::ffi::c_void;
+
+    pub type HDEVINFO = *mut c_void;
+    pub const INVALID_HANDLE_VALUE: HDEVINFO = -1isize as HDEVINFO;
+    pub const DIGCF_PRESENT: u32 = 0x00000002;
+    pub const DIGCF_ALLCLASSES: u32 = 0x00000004;
+
+    pub const SPDRP_DEVICEDESC: u32 = 0x00000000;
+    pub const SPDRP_HARDWAREID: u32 = 0x00000001;
+    pub const SPDRP_CLASS: u32 = 0x00000007;
+    pub const SPDRP_MFG: u32 = 0x0000000B;
+    pub const SPDRP_FRIENDLYNAME: u32 = 0x0000000C;
+
+    #[repr(C)]
+    pub struct SP_DEVINFO_DATA {
+        pub cb_size: u32,
+        pub class_guid: [u8; 16],
+        pub dev_inst: u32,
+        pub reserved: usize,
+    }
+
+    #[link(name = "setupapi")]
+    extern "system" {
+        pub fn SetupDiGetClassDevsW(
+            class_guid: *const c_void,
+            enumerator: *const u16,
+            hwnd_parent: *mut c_void,
+            flags: u32,
+        ) -> HDEVINFO;
+
+        pub fn SetupDiEnumDeviceInfo(
+            device_info_set: HDEVINFO,
+            member_index: u32,
+            device_info_data: *mut SP_DEVINFO_DATA,
+        ) -> i32;
+
+        pub fn SetupDiGetDeviceRegistryPropertyW(
+            device_info_set: HDEVINFO,
+            device_info_data: *const SP_DEVINFO_DATA,
+            property: u32,
+            property_reg_data_type: *mut u32,
+            property_buffer: *mut u8,
+            property_buffer_size: u32,
+            required_size: *mut u32,
+        ) -> i32;
+
+        pub fn SetupDiDestroyDeviceInfoList(device_info_set: HDEVINFO) -> i32;
+    }
+
+    pub unsafe fn get_device_property(
+        dev_info: HDEVINFO,
+        dev_data: *mut SP_DEVINFO_DATA,
+        property: u32,
+    ) -> String {
+        let mut buffer = [0u8; 1024];
+        let mut req_size = 0u32;
+        let res = SetupDiGetDeviceRegistryPropertyW(
+            dev_info,
+            dev_data,
+            property,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            &mut req_size,
+        );
+        if res != 0 && req_size >= 2 {
+            let u16_slice = std::slice::from_raw_parts(
+                buffer.as_ptr() as *const u16,
+                (req_size as usize / 2).saturating_sub(1),
+            );
+            String::from_utf16_lossy(u16_slice).trim().to_string()
+        } else {
+            String::new()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scan_devices_never_returns_fake_sample_devices() {
+        let devices = HardwareEnumerator::scan_devices();
+        // Ensure no hardcoded mock devices (e.g. 749219 or 1932E00418) are ever injected
+        for dev in &devices {
+            assert_ne!(dev.serial_number, "MFS100_749219", "Fake mock Mantra device detected!");
+            assert_ne!(dev.serial_number, "1932E00418", "Fake mock Morpho device detected!");
+        }
+    }
+
+    #[test]
+    fn test_system_exclusion_logic() {
+        let devices = HardwareEnumerator::scan_devices();
+        for dev in &devices {
+            if dev.friendly_name.to_lowercase().contains("mouse")
+                || dev.product_name.to_lowercase().contains("mouse")
+                || dev.friendly_name.to_lowercase().contains("keyboard")
+                || dev.product_name.to_lowercase().contains("keyboard")
+            {
+                assert!(dev.is_system_device, "System input device {} must be flagged as system device", dev.friendly_name);
+                assert!(!dev.can_forward, "System input device {} must not be forwardable by default", dev.friendly_name);
+            }
+        }
+    }
+}
+

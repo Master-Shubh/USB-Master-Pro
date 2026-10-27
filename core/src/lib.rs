@@ -3,6 +3,7 @@
 
 pub mod buffer_pool;
 pub mod compression;
+pub mod daemon;
 pub mod enumerator;
 pub mod hardware_db;
 pub mod identity;
@@ -14,6 +15,7 @@ pub mod usb_descriptors;
 
 pub use buffer_pool::BufferPool;
 pub use compression::TurboCompressor;
+pub use daemon::DaemonServer;
 pub use device_reset::{DeviceOperationalState, DeviceResetController, ResetMethod};
 pub use enumerator::{HardwareEnumerator, UsbDeviceInfo};
 pub use hardware_db::{DeviceCategory, HardwareClassifier};

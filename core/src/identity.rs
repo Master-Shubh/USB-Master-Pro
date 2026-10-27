@@ -1,9 +1,11 @@
 //! Hardware Identity & 9-Digit AnyDesk-Style ID Generator
 //! Generates an immutable, human-readable 9-digit ID anchored to platform hardware.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeIdentity {
     pub raw_id: u32,       // e.g. 482190334
     pub formatted_id: String, // e.g. "482 190 334"

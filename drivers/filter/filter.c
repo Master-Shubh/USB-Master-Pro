@@ -22,6 +22,7 @@
 typedef struct _FILTER_DEVICE_DATA {
     WDFDEVICE               WdfDevice;
     WDFIOTARGET             IoTarget;
+    WDFQUEUE                IoctlQueue;
     BOOLEAN                 IsCaptured;
     ULONG                   SessionId;
 } FILTER_DEVICE_DATA, *PFILTER_DEVICE_DATA;
@@ -30,6 +31,7 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FILTER_DEVICE_DATA, GetFilterData)
 
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD AnyUsbFilter_EvtDeviceAdd;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL AnyUsbFilter_EvtIoDeviceControl;
 EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL AnyUsbFilter_EvtIoInternalDeviceControl;
 
 NTSTATUS
@@ -60,6 +62,7 @@ AnyUsbFilter_EvtDeviceAdd(
     WDF_OBJECT_ATTRIBUTES deviceAttributes;
     WDFDEVICE wdfDevice;
     PFILTER_DEVICE_DATA filterData;
+    WDF_IO_QUEUE_CONFIG queueConfig;
 
     // Configure as an Upper Filter Device
     WdfFdoInitSetFilter(DeviceInit);
@@ -77,8 +80,97 @@ AnyUsbFilter_EvtDeviceAdd(
     filterData->IsCaptured = FALSE;
     filterData->SessionId = 0;
 
+    // Self-exclusion check: Avoid hooking virtual USB devices created by LOGOS_VUSB / AnyUSB VHCI
+    WDF_DEVICE_PROPERTY_DATA propData;
+    DEVPROPTYPE propType;
+    WCHAR enumeratorBuffer[64] = {0};
+    ULONG requiredSize = 0;
+
+    WDF_DEVICE_PROPERTY_DATA_INIT(&propData, &DEVPKEY_Device_EnumeratorName);
+    status = WdfDeviceQueryPropertyEx(
+        wdfDevice,
+        &propData,
+        sizeof(enumeratorBuffer),
+        enumeratorBuffer,
+        &requiredSize,
+        &propType
+    );
+    if (NT_SUCCESS(status)) {
+        UNICODE_STRING enumeratorStr;
+        RtlInitUnicodeString(&enumeratorStr, enumeratorBuffer);
+        UNICODE_STRING logosVusb;
+        RtlInitUnicodeString(&logosVusb, L"LOGOS_VUSB");
+        UNICODE_STRING anyusb;
+        RtlInitUnicodeString(&anyusb, L"ANYUSB");
+
+        if (RtlCompareUnicodeString(&enumeratorStr, &logosVusb, TRUE) == 0 ||
+            RtlCompareUnicodeString(&enumeratorStr, &anyusb, TRUE) == 0) {
+            KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                "USB Master Pro Filter: Self-exclusion matched for virtual device [%wZ]. Skipping capture hook.\n",
+                &enumeratorStr));
+            return STATUS_SUCCESS;
+        }
+    }
+
+    // Configure default I/O queue for standard IOCTLs and internal USB URB interception
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
+    queueConfig.EvtIoDeviceControl = AnyUsbFilter_EvtIoDeviceControl;
+    queueConfig.EvtIoInternalDeviceControl = AnyUsbFilter_EvtIoInternalDeviceControl;
+
+    status = WdfIoQueueCreate(wdfDevice, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &filterData->IoctlQueue);
+    if (!NT_SUCCESS(status)) {
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "USB Master Pro: WdfIoQueueCreate failed with status 0x%08X\n", status));
+        return status;
+    }
+
     KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "USB Master Pro: Filter attached to target physical USB stack.\n"));
     return STATUS_SUCCESS;
+}
+
+VOID
+AnyUsbFilter_EvtIoDeviceControl(
+    _In_ WDFQUEUE   Queue,
+    _In_ WDFREQUEST Request,
+    _In_ size_t     OutputBufferLength,
+    _In_ size_t     InputBufferLength,
+    _In_ ULONG      IoControlCode
+)
+{
+    UNREFERENCED_PARAMETER(OutputBufferLength);
+    UNREFERENCED_PARAMETER(InputBufferLength);
+
+    WDFDEVICE device = WdfIoQueueGetDevice(Queue);
+    PFILTER_DEVICE_DATA filterData = GetFilterData(device);
+    NTSTATUS status = STATUS_SUCCESS;
+    size_t bytesReturned = 0;
+
+    switch (IoControlCode) {
+        case IOCTL_ANYUSB_FILTER_START_CAPTURE:
+            filterData->IsCaptured = TRUE;
+            KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "USB Master Pro: Physical USB device capture STARTED.\n"));
+            status = STATUS_SUCCESS;
+            break;
+
+        case IOCTL_ANYUSB_FILTER_STOP_CAPTURE:
+            filterData->IsCaptured = FALSE;
+            KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "USB Master Pro: Physical USB device capture STOPPED.\n"));
+            status = STATUS_SUCCESS;
+            break;
+
+        default: {
+            // Forward unhandled IOCTLs downstream to physical hardware
+            WDF_REQUEST_SEND_OPTIONS options;
+            WDF_REQUEST_SEND_OPTIONS_INIT(&options, WDF_REQUEST_SEND_OPTION_SEND_AND_FORGET);
+            if (!WdfRequestSend(Request, filterData->IoTarget, &options)) {
+                status = WdfRequestGetStatus(Request);
+                WdfRequestComplete(Request, status);
+            }
+            return;
+        }
+    }
+
+    WdfRequestCompleteWithInformation(Request, status, bytesReturned);
 }
 
 VOID
@@ -107,13 +199,17 @@ AnyUsbFilter_EvtIoInternalDeviceControl(
         }
 
         if (urb != NULL) {
-            // Forward raw URB to user-mode daemon via Turbo-URB pipeline
-            // Complete or forward to lower target
+            // Raw URB intercepted for Turbo-URB packetization
+            KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                "USB Master Pro Filter: Intercepted URB function 0x%04X on captured device\n",
+                urb->UrbHeader.Function));
         }
     }
 
-    // Default: Passthrough downstream to physical hardware
+    // Passthrough downstream to physical hardware
     WDF_REQUEST_SEND_OPTIONS options;
     WDF_REQUEST_SEND_OPTIONS_INIT(&options, WDF_REQUEST_SEND_OPTION_SEND_AND_FORGET);
-    WdfRequestSend(Request, filterData->IoTarget, &options);
+    if (!WdfRequestSend(Request, filterData->IoTarget, &options)) {
+        WdfRequestComplete(Request, WdfRequestGetStatus(Request));
+    }
 }

@@ -54,6 +54,11 @@ typedef struct _ANYUSB_ATTACH_REQUEST {
     UCHAR       RawDescriptors[1024];
 } ANYUSB_ATTACH_REQUEST, *PANYUSB_ATTACH_REQUEST;
 
+// Payload for detaching a remote USB device
+typedef struct _ANYUSB_DETACH_REQUEST {
+    ULONG       DeviceId;            // Session device ID to detach
+} ANYUSB_DETACH_REQUEST, *PANYUSB_DETACH_REQUEST;
+
 // Payload for completing a URB returned from remote peer
 typedef struct _ANYUSB_COMPLETE_REQUEST {
     ULONG       DeviceId;
@@ -62,7 +67,20 @@ typedef struct _ANYUSB_COMPLETE_REQUEST {
     ULONG       ActualLength;
 } ANYUSB_COMPLETE_REQUEST, *PANYUSB_COMPLETE_REQUEST;
 
+// Payload for fetching a pending URB to daemon
+typedef struct _ANYUSB_URB_MESSAGE {
+    ULONG       DeviceId;
+    ULONG64     SequenceId;
+    UCHAR       EndpointAddress;
+    UCHAR       TransferType; // 0=Control, 1=Isoch, 2=Bulk, 3=Interrupt
+    ULONG       TransferBufferLength;
+    UCHAR       SetupPacket[8];
+    UCHAR       Data[4096];
+} ANYUSB_URB_MESSAGE, *PANYUSB_URB_MESSAGE;
+
 #pragma pack(pop)
+
+#define ANYUSB_MAX_PENDING_URBS 256
 
 // Bus FDO Device Context
 typedef struct _FDO_DEVICE_DATA {
@@ -72,6 +90,8 @@ typedef struct _FDO_DEVICE_DATA {
     ULONG                   AttachedDeviceCount;
     WDFSPINLOCK             DeviceListLock;
     LIST_ENTRY              ChildPdoList;
+    WDFSPINLOCK             PendingUrbLock;  // Protects the pending requests sequence table
+    WDFREQUEST              PendingRequests[ANYUSB_MAX_PENDING_URBS];
 } FDO_DEVICE_DATA, *PFDO_DEVICE_DATA;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FDO_DEVICE_DATA, GetFdoData)
@@ -79,6 +99,7 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FDO_DEVICE_DATA, GetFdoData)
 // Child PDO (Virtual Device) Context
 typedef struct _PDO_DEVICE_DATA {
     WDFDEVICE               WdfDevice;
+    WDFDEVICE               ParentFdo;
     ULONG                   DeviceId;
     USHORT                  VendorId;
     USHORT                  ProductId;
