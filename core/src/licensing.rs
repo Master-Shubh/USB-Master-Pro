@@ -13,7 +13,10 @@ pub const BHARTX_ROOT_LICENSE_PUBKEY: [u8; 32] = [
     127, 184, 229, 40, 73, 63, 123, 180, 10, 122, 206, 177, 229, 14, 26, 157,
 ];
 
-/// BhartX Root CA Master Seed (for signing tests and server-side issuance)
+/// BhartX Root CA Master Seed (STRICTLY FOR IN-TREE TEST HARNESS AND SYNTHETIC TOKEN GENERATION ONLY).
+/// SECURITY INVARIANT: Must NEVER be embedded in release client binaries or treated as a real production CA.
+/// Production token issuance is performed strictly on an isolated HSM / server-side signing authority.
+#[doc(hidden)]
 pub const BHARTX_ROOT_SEED: [u8; 32] = *b"BHARTX_MOCK_TEST_HARNESS_KEY_001";
 
 /// Claims embedded within a cryptographic license payload.

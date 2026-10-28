@@ -1,11 +1,12 @@
 //! Session State Machine & Deterministic Lifecycle Transitions
-//! Implements the 12+ canonical session states and transition rules from the Master Blueprint (Section 5.4).
+//! Implements the 13 canonical session states and deterministic transition rules from the Master Blueprint (Section 5.4).
+//! Note: Reconciled from earlier 12-state drafts to explicitly include `PreparingDevice` alongside `Failed`.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::{Duration, Instant};
 
-/// The canonical session states for peer-to-peer USB virtualization
+/// The 13 canonical session states for peer-to-peer USB virtualization
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SessionState {
     Offline,
