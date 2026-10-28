@@ -1,8 +1,29 @@
 use std::time::Instant;
 use usb_master_core::{
-    BufferPool, HardwareEnumerator, NodeIdentity, TurboCompressor, TurboUrbHeader, TransferType,
+    BufferPool, DaemonServer, HardwareEnumerator, NodeIdentity, TurboCompressor, TurboUrbHeader, TransferType,
     CMD_SUBMIT_URB,
 };
+
+fn open_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", url])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg(url)
+            .spawn();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn();
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -19,10 +40,54 @@ async fn main() {
     println!("================================================================================\n");
 
     let args: Vec<String> = std::env::args().collect();
-    let command = args.get(1).map(|s| s.as_str()).unwrap_or("list");
+    let command = args.get(1).map(|s| s.as_str()).unwrap_or("");
 
     match command {
-        "list" | "scan" => {
+        "" | "gui" | "--gui" | "start" | "--start" | "run" | "--run" => {
+            let port = std::env::var("DAEMON_PORT")
+                .ok()
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(19842);
+
+            let broker_url = std::env::var("SIGNALING_URL")
+                .unwrap_or_else(|_| "ws://127.0.0.1:8443".to_string());
+
+            tokio::spawn(async move {
+                if let Err(e) = DaemonServer::run(port, broker_url).await {
+                    eprintln!("❌ Daemon server error: {}", e);
+                }
+            });
+
+            // Wait 150ms for the server to listen
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+            let url = format!("http://127.0.0.1:{}/", port);
+            open_browser(&url);
+
+            println!("  ⚡ USB Master Pro is running!");
+            println!("  🌐 Dashboard URL: {}", url);
+            println!("  ⌨️  Press Ctrl+C to stop.\n");
+
+            let _ = tokio::signal::ctrl_c().await;
+            println!("\n  Shutting down USB Master Pro...");
+        }
+
+        "daemon" | "--daemon" => {
+            println!("⚡ Running USB Master Pro Daemon in headless mode...\n");
+            let port = std::env::var("DAEMON_PORT")
+                .ok()
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(19842);
+
+            let broker_url = std::env::var("SIGNALING_URL")
+                .unwrap_or_else(|_| "ws://127.0.0.1:8443".to_string());
+
+            if let Err(e) = DaemonServer::run(port, broker_url).await {
+                eprintln!("❌ Daemon server error: {}", e);
+            }
+        }
+
+        "list" | "--list" | "scan" | "--scan" => {
             println!("🔍 Scanning physical hardware & connected USB ports (<30ms)...");
             let devices = HardwareEnumerator::scan_devices();
             println!("\n  Found {} device(s) ready for hardware passthrough:\n", devices.len());
@@ -52,7 +117,7 @@ async fn main() {
             }
         }
 
-        "benchmark" | "test" => {
+        "benchmark" | "--benchmark" | "test" | "--test" => {
             println!("🚀 Running Turbo-URB In-Memory Throughput & Compression Benchmark...\n");
             let pool = BufferPool::default_pool();
             let raw_size = 512 * 1024; // 512 KB biometric high-res scan frame
@@ -110,7 +175,7 @@ async fn main() {
         }
 
         _ => {
-            println!("Usage: usb_master_cli [list | scan | benchmark | connect <target_id> <dev_id>]");
+            println!("Usage: usb_master_cli [gui | list | benchmark | daemon | connect <target_id> <dev_id>]");
         }
     }
 }

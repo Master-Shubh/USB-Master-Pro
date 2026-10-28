@@ -9,11 +9,18 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
+
+// Embedded UI and static assets for single-binary distribution
+const EMBEDDED_INDEX_HTML: &str = include_str!("../../ui/index.html");
+const EMBEDDED_LOGO_PNG: &[u8] = include_bytes!("../../ui/assets/logo.png");
+const EMBEDDED_FAVICON_ICO: &[u8] = include_bytes!("../../ui/assets/favicon.ico");
+const EMBEDDED_ICON_64: &[u8] = include_bytes!("../../ui/assets/icon_64.png");
+const EMBEDDED_ICON_256: &[u8] = include_bytes!("../../ui/assets/icon_256.png");
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -121,6 +128,13 @@ impl DaemonServer {
 
         // 3. Build HTTP + WS Router
         let app = Router::new()
+            .route("/", get(handle_serve_index))
+            .route("/ui", get(handle_serve_index))
+            .route("/index.html", get(handle_serve_index))
+            .route("/assets/logo.png", get(handle_serve_logo))
+            .route("/assets/favicon.ico", get(handle_serve_favicon))
+            .route("/assets/icon_64.png", get(handle_serve_icon_64))
+            .route("/assets/icon_256.png", get(handle_serve_icon_256))
             .route("/api/identity", get(handle_get_identity))
             .route("/api/devices", get(handle_get_devices))
             .route("/api/forward", post(handle_post_forward))
@@ -140,6 +154,28 @@ impl DaemonServer {
 
         Ok(())
     }
+}
+
+// --- STATIC ASSET HANDLERS ---
+
+async fn handle_serve_index() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], EMBEDDED_INDEX_HTML)
+}
+
+async fn handle_serve_logo() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], EMBEDDED_LOGO_PNG)
+}
+
+async fn handle_serve_favicon() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/x-icon")], EMBEDDED_FAVICON_ICO)
+}
+
+async fn handle_serve_icon_64() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], EMBEDDED_ICON_64)
+}
+
+async fn handle_serve_icon_256() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "image/png")], EMBEDDED_ICON_256)
 }
 
 // --- HTTP ENDPOINT HANDLERS ---

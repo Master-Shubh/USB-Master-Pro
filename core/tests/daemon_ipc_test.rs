@@ -37,6 +37,37 @@ async fn test_daemon_endpoints_lifecycle() {
     let status_resp = reqwest_like_get(port, "/api/status").await;
     assert!(status_resp.contains("active"), "Status endpoint must report active");
     assert!(status_resp.contains("turbo_urb_throughput_mb_s"), "Telemetry must report throughput");
+
+    // 4. Test Embedded WebUI root route "/"
+    let index_resp = reqwest_like_get(port, "/").await;
+    assert!(index_resp.contains("HTTP/1.1 200 OK"), "Root should return 200 OK");
+    assert!(index_resp.contains("text/html"), "Root should return text/html");
+    assert!(index_resp.contains("USB Master Pro"), "Root should contain USB Master Pro");
+
+    // 5. Test Embedded WebUI aliases "/ui" and "/index.html"
+    let ui_resp = reqwest_like_get(port, "/ui").await;
+    assert!(ui_resp.contains("HTTP/1.1 200 OK"), "/ui should return 200 OK");
+    assert!(ui_resp.contains("text/html"), "/ui should return text/html");
+
+    let index_html_resp = reqwest_like_get(port, "/index.html").await;
+    assert!(index_html_resp.contains("HTTP/1.1 200 OK"), "/index.html should return 200 OK");
+
+    // 6. Test Embedded Static Assets: logo, favicon, icons
+    let logo_resp = reqwest_like_get(port, "/assets/logo.png").await;
+    assert!(logo_resp.contains("HTTP/1.1 200 OK"), "Logo should return 200 OK");
+    assert!(logo_resp.contains("image/png"), "Logo should return image/png");
+
+    let favicon_resp = reqwest_like_get(port, "/assets/favicon.ico").await;
+    assert!(favicon_resp.contains("HTTP/1.1 200 OK"), "Favicon should return 200 OK");
+    assert!(favicon_resp.contains("image/x-icon"), "Favicon should return image/x-icon");
+
+    let icon64_resp = reqwest_like_get(port, "/assets/icon_64.png").await;
+    assert!(icon64_resp.contains("HTTP/1.1 200 OK"), "Icon 64 should return 200 OK");
+    assert!(icon64_resp.contains("image/png"), "Icon 64 should return image/png");
+
+    let icon256_resp = reqwest_like_get(port, "/assets/icon_256.png").await;
+    assert!(icon256_resp.contains("HTTP/1.1 200 OK"), "Icon 256 should return 200 OK");
+    assert!(icon256_resp.contains("image/png"), "Icon 256 should return image/png");
 }
 
 async fn reqwest_like_get(port: u16, path: &str) -> String {

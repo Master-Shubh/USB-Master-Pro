@@ -377,8 +377,10 @@
 
   <!-- SCRIPT LOGIC -->
   <script>
-    const API_BASE = 'http://127.0.0.1:19842';
-    const WS_BASE = 'ws://127.0.0.1:19842/api/events';
+    const API_BASE = window.location.origin.startsWith('http') ? window.location.origin : 'http://127.0.0.1:19842';
+    const WS_BASE = window.location.origin.startsWith('http') 
+      ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/api/events`
+      : 'ws://127.0.0.1:19842/api/events';
 
     // Live State
     let localDevices = [];

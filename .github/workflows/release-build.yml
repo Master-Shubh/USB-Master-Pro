@@ -70,10 +70,15 @@ jobs:
         run: |
           cargo build --release --target x86_64-pc-windows-msvc -p usb-master-core
 
+      - name: Install Inno Setup Compiler
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+
       - name: Package USB Master Pro Portable Artifact
         shell: bash
         run: |
-          mkdir -p dist/bin
+          mkdir -p dist/bin dist/installer
           cp target/x86_64-pc-windows-msvc/release/usb_master_cli.exe dist/bin/USBMasterPro.exe || cp target/release/usb_master_cli.exe dist/bin/USBMasterPro.exe || cp core/target/x86_64-pc-windows-msvc/release/usb_master_cli.exe dist/bin/USBMasterPro.exe
           cp target/x86_64-pc-windows-msvc/release/usb_master_daemon.exe dist/bin/USBMasterDaemon.exe || cp target/release/usb_master_daemon.exe dist/bin/USBMasterDaemon.exe || cp core/target/x86_64-pc-windows-msvc/release/usb_master_daemon.exe dist/bin/USBMasterDaemon.exe
           test -f dist/bin/USBMasterPro.exe || { echo "FATAL: USBMasterPro.exe missing!"; exit 1; }
@@ -84,7 +89,20 @@ jobs:
           echo "Packaging complete in dist/:"
           ls -la dist/bin/
 
-      - name: Upload Build Artifacts
+      - name: Compile 1-Click Windows Setup Wizard
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\usb_master_pro.iss
+          Write-Host "Setup Wizard compiled successfully in dist/installer/"
+          ls dist\installer\
+
+      - name: Upload 1-Click Windows Setup Wizard Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: USB-Master-Pro-v1.0.0-Setup-Wizard
+          path: dist/installer/USBMasterPro-Setup-v1.0.0.exe
+
+      - name: Upload Full Distribution Package
         uses: actions/upload-artifact@v4
         with:
           name: USB-Master-Pro-v1.0.0-Windows-x64
