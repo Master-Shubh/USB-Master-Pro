@@ -11,6 +11,8 @@
 #include <wdf.h>
 #include <usb.h>
 #include <usbioctl.h>
+#include <usbbusif.h>
+#include <ntstrsafe.h>
 
 #define ANYUSB_VHCI_POOL_TAG 'ICHV' // 'VHCI'
 
@@ -65,6 +67,7 @@ typedef struct _ANYUSB_COMPLETE_REQUEST {
     ULONG64     SequenceId;
     NTSTATUS    Status;
     ULONG       ActualLength;
+    UCHAR       Data[4096];
 } ANYUSB_COMPLETE_REQUEST, *PANYUSB_COMPLETE_REQUEST;
 
 // Payload for fetching a pending URB to daemon
@@ -109,6 +112,7 @@ typedef struct _PDO_DEVICE_DATA {
     WCHAR                   CompatibleIds[256];
     WCHAR                   DeviceDescription[128];
     LIST_ENTRY              Link;
+    USB_BUS_INTERFACE_USBDI_V2 BusInterface;
 } PDO_DEVICE_DATA, *PPDO_DEVICE_DATA;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(PDO_DEVICE_DATA, GetPdoData)

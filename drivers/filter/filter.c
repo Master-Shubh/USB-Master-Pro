@@ -33,6 +33,7 @@ DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD AnyUsbFilter_EvtDeviceAdd;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL AnyUsbFilter_EvtIoDeviceControl;
 EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL AnyUsbFilter_EvtIoInternalDeviceControl;
+EVT_WDF_REQUEST_COMPLETION_ROUTINE AnyUsbFilter_EvtUrbComplete;
 
 NTSTATUS
 DriverEntry(
@@ -174,6 +175,44 @@ AnyUsbFilter_EvtIoDeviceControl(
 }
 
 VOID
+AnyUsbFilter_EvtUrbComplete(
+    _In_ WDFREQUEST                     Request,
+    _In_ WDFIOTARGET                    Target,
+    _In_ PWDF_REQUEST_COMPLETION_PARAMS Params,
+    _In_ WDFCONTEXT                     Context
+)
+{
+    UNREFERENCED_PARAMETER(Target);
+    UNREFERENCED_PARAMETER(Context);
+
+    NTSTATUS status = Params->IoStatus.Status;
+    ULONG_PTR information = Params->IoStatus.Information;
+
+    // Retrieve the guest WDM IRP and URB
+    PIRP irp = WdfRequestWdmGetIrp(Request);
+    PURB urb = NULL;
+    if (irp != NULL) {
+        PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
+        if (irpSp != NULL) {
+            urb = (PURB)irpSp->Parameters.Others.Argument1;
+        }
+    }
+
+    if (urb != NULL) {
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "USB Master Pro Filter: URB function 0x%04X completed (Status: 0x%08X, UrbStatus: 0x%08X, Info: %lu)\n",
+            urb->UrbHeader.Function, status, urb->UrbHeader.Status, (ULONG)information));
+    } else {
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+            "USB Master Pro Filter: Request completed (Status: 0x%08X, Info: %lu)\n",
+            status, (ULONG)information));
+    }
+
+    // Complete the request to the upstream caller with status and returned bytes
+    WdfRequestCompleteWithInformation(Request, status, information);
+}
+
+VOID
 AnyUsbFilter_EvtIoInternalDeviceControl(
     _In_ WDFQUEUE   Queue,
     _In_ WDFREQUEST Request,
@@ -190,20 +229,32 @@ AnyUsbFilter_EvtIoInternalDeviceControl(
 
     // If device is actively captured for remote redirection, intercept URBs
     if (filterData->IsCaptured && IoControlCode == IOCTL_INTERNAL_USB_SUBMIT_URB) {
+        PIRP irp = WdfRequestWdmGetIrp(Request);
         PURB urb = NULL;
-        WDFMEMORY urbMemory;
-
-        // Retrieve the URB pointer from the IRP stack
-        if (NT_SUCCESS(WdfRequestRetrieveInputMemory(Request, &urbMemory))) {
-            urb = (PURB)WdfMemoryGetBuffer(urbMemory, NULL);
+        if (irp != NULL) {
+            PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
+            if (irpSp != NULL) {
+                urb = (PURB)irpSp->Parameters.Others.Argument1;
+            }
         }
 
         if (urb != NULL) {
-            // Raw URB intercepted for Turbo-URB packetization
             KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                "USB Master Pro Filter: Intercepted URB function 0x%04X on captured device\n",
+                "USB Master Pro Filter: Intercepted outgoing URB function 0x%04X on captured device\n",
                 urb->UrbHeader.Function));
         }
+
+        // Format request using current type and hook completion routine
+        WdfRequestFormatRequestUsingCurrentType(Request);
+        WdfRequestSetCompletionRoutine(Request, AnyUsbFilter_EvtUrbComplete, filterData);
+
+        if (!WdfRequestSend(Request, filterData->IoTarget, NULL)) {
+            NTSTATUS sendStatus = WdfRequestGetStatus(Request);
+            KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                "USB Master Pro Filter: WdfRequestSend failed: 0x%08X\n", sendStatus));
+            WdfRequestComplete(Request, sendStatus);
+        }
+        return;
     }
 
     // Passthrough downstream to physical hardware
