@@ -57,25 +57,26 @@ jobs:
       - name: Test Core Turbo-URB Engine
         shell: bash
         run: |
-          cd core
-          cargo test --release
+          cargo test --release -p usb-master-core
 
       - name: Build Core CLI & Daemon
         shell: bash
         run: |
-          cd core
-          cargo build --release --target x86_64-pc-windows-msvc
+          cargo build --release --target x86_64-pc-windows-msvc -p usb-master-core
 
       - name: Package USB Master Pro Portable Artifact
         shell: bash
         run: |
           mkdir -p dist/bin
-          cp core/target/x86_64-pc-windows-msvc/release/usb_master_cli.exe dist/bin/USBMasterPro.exe || cp core/target/release/usb_master_cli.exe dist/bin/USBMasterPro.exe || cp core/target/release/usb_master_cli dist/bin/USBMasterPro || true
-          cp core/target/x86_64-pc-windows-msvc/release/usb_master_daemon.exe dist/bin/USBMasterDaemon.exe || cp core/target/release/usb_master_daemon.exe dist/bin/USBMasterDaemon.exe || true
+          cp target/x86_64-pc-windows-msvc/release/usb_master_cli.exe dist/bin/USBMasterPro.exe || cp target/release/usb_master_cli.exe dist/bin/USBMasterPro.exe || cp core/target/x86_64-pc-windows-msvc/release/usb_master_cli.exe dist/bin/USBMasterPro.exe
+          cp target/x86_64-pc-windows-msvc/release/usb_master_daemon.exe dist/bin/USBMasterDaemon.exe || cp target/release/usb_master_daemon.exe dist/bin/USBMasterDaemon.exe || cp core/target/x86_64-pc-windows-msvc/release/usb_master_daemon.exe dist/bin/USBMasterDaemon.exe
+          test -f dist/bin/USBMasterPro.exe || { echo "FATAL: USBMasterPro.exe missing!"; exit 1; }
+          test -f dist/bin/USBMasterDaemon.exe || { echo "FATAL: USBMasterDaemon.exe missing!"; exit 1; }
           cp -r ui dist/
           cp -r scripts dist/
           cp -r drivers dist/
-          echo "Packaging complete in dist/"
+          echo "Packaging complete in dist/:"
+          ls -la dist/bin/
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
