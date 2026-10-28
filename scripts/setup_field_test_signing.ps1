@@ -24,7 +24,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $false)]
-    [string]$DriverRootPath = "$PSScriptRoot\..\drivers",
+    [string]$DriverRootPath = "",
 
     [Parameter(Mandatory = $false)]
     [string]$CertSubject = "CN=BhartX Ecosystems Field Testing CA, O=BhartX Ecosystems Pvt Ltd, C=IN",
@@ -38,6 +38,19 @@ param(
     [Parameter(Mandatory = $false)]
     [switch]$ForceRegenerateCert = $false
 )
+
+if ([string]::IsNullOrWhiteSpace($DriverRootPath)) {
+    if (Test-Path "$PSScriptRoot\drivers") {
+        $DriverRootPath = "$PSScriptRoot\drivers"
+    } elseif (Test-Path "$PSScriptRoot\..\drivers") {
+        $DriverRootPath = "$PSScriptRoot\..\drivers"
+    } else {
+        $DriverRootPath = "$PSScriptRoot\drivers"
+    }
+}
+if (Test-Path $DriverRootPath) {
+    $DriverRootPath = (Resolve-Path $DriverRootPath).Path
+}
 
 $ErrorActionPreference = "Stop"
 
@@ -173,6 +186,17 @@ if ($existingCert -and -not $ForceRegenerateCert) {
     $pubStore.Add($signingCert)
     $pubStore.Close()
     Write-Success "Installed into Cert:\LocalMachine\TrustedPublisher."
+}
+
+# Export public CA certificate (.cer) for client installations
+if (Test-Path $DriverRootPath) {
+    $certExportPath = Join-Path $DriverRootPath "bhartx_test_ca.cer"
+    try {
+        Export-Certificate -Cert $signingCert -FilePath $certExportPath -Type CERT -Force | Out-Null
+        Write-Success "Exported public CA certificate to: $certExportPath"
+    } catch {
+        Write-Warn "Could not export certificate: $_"
+    }
 }
 
 # -----------------------------------------------------------------------------

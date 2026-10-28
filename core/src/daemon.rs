@@ -183,9 +183,338 @@ pub struct DaemonState {
     pub start_time: Instant,
     pub broker_url: String,
     pub active_license: RwLock<Option<LicenseClaims>>,
+    pub local_api_token: std::sync::RwLock<String>,
+}
+
+/// Generates a 256-bit cryptographically secure local API authorization token from the OS CSPRNG.
+pub fn generate_secure_api_token() -> String {
+    let mut bytes = [0u8; 32];
+    let mut filled = false;
+
+    #[cfg(unix)]
+    {
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            use std::io::Read;
+            if f.read_exact(&mut bytes).is_ok() {
+                filled = true;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        #[link(name = "advapi32")]
+        extern "system" {
+            #[link_name = "SystemFunction036"]
+            fn rtl_gen_random(buffer: *mut u8, length: u32) -> u8;
+        }
+        unsafe {
+            if rtl_gen_random(bytes.as_mut_ptr(), bytes.len() as u32) != 0 {
+                filled = true;
+            }
+        }
+    }
+
+    if !filled {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"USB_MASTER_SECURE_TOKEN_CSPRNG_FALLBACK");
+        hasher.update(std::process::id().to_le_bytes());
+        hasher.update(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .to_le_bytes(),
+        );
+        let res = hasher.finalize();
+        bytes.copy_from_slice(&res[..32]);
+    }
+
+    hex::encode(bytes)
+}
+
+/// Resolves the filesystem path for the daemon authentication token (~/.usb-master-pro/daemon.token)
+pub fn get_daemon_token_path() -> Option<std::path::PathBuf> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .map(|home| std::path::PathBuf::from(home).join(".usb-master-pro").join("daemon.token"))
+}
+
+/// Saves the authorization token to disk with restricted permissions (0600 on Unix)
+pub fn save_secure_token_to_disk(token: &str) -> std::io::Result<()> {
+    if let Some(token_path) = get_daemon_token_path() {
+        if let Some(parent) = token_path.parent() {
+            std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        std::fs::write(&token_path, token)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    Ok(())
+}
+
+/// Reads the persisted daemon token from disk if available
+pub fn read_secure_token_from_disk() -> Option<String> {
+    if let Some(token_path) = get_daemon_token_path() {
+        if token_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(token_path) {
+                let trimmed = content.trim().to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Validates whether an incoming HTTP Host header belongs to a permitted local loopback endpoint.
+/// Defends against DNS rebinding attacks.
+pub fn is_authorized_host(host_str: &str) -> bool {
+    let host_clean = host_str.trim();
+    if host_clean.is_empty() {
+        return false;
+    }
+
+    let (host, port_str) = if host_clean.starts_with('[') {
+        match host_clean.find(']') {
+            Some(end_idx) => {
+                let host_part = &host_clean[..=end_idx];
+                let after = &host_clean[end_idx + 1..];
+                if after.is_empty() {
+                    (host_part, None)
+                } else if let Some(p) = after.strip_prefix(':') {
+                    (host_part, Some(p))
+                } else {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    } else {
+        let mut parts = host_clean.splitn(2, ':');
+        let host_part = parts.next().unwrap_or("");
+        let port_part = parts.next();
+        (host_part, port_part)
+    };
+
+    if let Some(port_s) = port_str {
+        if port_s.is_empty() {
+            return false;
+        }
+        match port_s.parse::<u16>() {
+            Ok(p) if p > 0 => {}
+            _ => return false,
+        }
+    }
+
+    let host_lower = host.to_ascii_lowercase();
+    host_lower == "127.0.0.1" || host_lower == "localhost" || host_lower == "[::1]"
+}
+
+/// Validates whether an incoming HTTP Origin header represents an authorized local origin.
+/// Strictly parses scheme, exact host, and port bounds to reject malicious origins
+/// like `http://localhost.evil.com`, `http://127.0.0.1.evil.com`, unexpected ports, or malformed URIs.
+pub fn is_authorized_origin(origin_str: &str) -> bool {
+    let origin_clean = origin_str.trim();
+    if origin_clean.is_empty() {
+        return false;
+    }
+    if origin_clean == "null" {
+        return true;
+    }
+
+    // Native app container schemes
+    if origin_clean == "tauri://localhost" || origin_clean.starts_with("tauri://") {
+        return true;
+    }
+    if origin_clean == "app://localhost" || origin_clean.starts_with("app://") {
+        return true;
+    }
+    if origin_clean.starts_with("vscode-webview://") {
+        return true;
+    }
+
+    let rest = if let Some(stripped) = origin_clean.strip_prefix("http://") {
+        stripped
+    } else if let Some(stripped) = origin_clean.strip_prefix("https://") {
+        stripped
+    } else {
+        return false;
+    };
+
+    // RFC 6454: An Origin must NOT contain userinfo, path, query, or fragment
+    if rest.contains('@') || rest.contains('/') || rest.contains('?') || rest.contains('#') {
+        return false;
+    }
+
+    let (host, port_str) = if rest.starts_with('[') {
+        match rest.find(']') {
+            Some(end_idx) => {
+                let host_part = &rest[..=end_idx];
+                let after_bracket = &rest[end_idx + 1..];
+                if after_bracket.is_empty() {
+                    (host_part, None)
+                } else if let Some(p) = after_bracket.strip_prefix(':') {
+                    (host_part, Some(p))
+                } else {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    } else {
+        let mut parts = rest.splitn(2, ':');
+        let host_part = parts.next().unwrap_or("");
+        let port_part = parts.next();
+        (host_part, port_part)
+    };
+
+    if let Some(port_s) = port_str {
+        if port_s.is_empty() {
+            return false;
+        }
+        match port_s.parse::<u16>() {
+            Ok(p) if p > 0 => {}
+            _ => return false,
+        }
+    }
+
+    let host_lower = host.to_ascii_lowercase();
+    host_lower == "127.0.0.1"
+        || host_lower == "localhost"
+        || host_lower == "[::1]"
+        || host_lower == "tauri.localhost"
+}
+
+/// Compares two strings in constant time to prevent side-channel timing attacks
+fn constant_time_eq_str(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.len() != b_bytes.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a_bytes.iter().zip(b_bytes.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Validates that an incoming HTTP request originates from an authorized local context
+/// (localhost/127.0.0.1, local desktop webview/app, or direct CLI/IPC), preventing
+/// DNS rebinding and Cross-Site Request Forgery (CSRF) attacks against mutating endpoints.
+fn validate_request_origin_and_host(headers: &axum::http::HeaderMap) -> Result<(), (StatusCode, String)> {
+    // 1. Validate Host header against DNS rebinding
+    if let Some(host_val) = headers.get(axum::http::header::HOST) {
+        if let Ok(host_str) = host_val.to_str() {
+            if !is_authorized_host(host_str) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("Access forbidden: unauthorized Host header '{}'", host_str),
+                ));
+            }
+        }
+    }
+
+    // 2. Reject cross-site requests via Sec-Fetch-Site
+    if let Some(sec_site) = headers.get("sec-fetch-site") {
+        if let Ok(s) = sec_site.to_str() {
+            if s.eq_ignore_ascii_case("cross-site") {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Access forbidden: cross-site requests are rejected".to_string(),
+                ));
+            }
+        }
+    }
+
+    // 3. Strict Origin header validation
+    if let Some(origin_val) = headers.get(axum::http::header::ORIGIN) {
+        if let Ok(origin_str) = origin_val.to_str() {
+            if !is_authorized_origin(origin_str) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("Access forbidden: origin '{}' is not authorized to execute mutating operations", origin_str),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validates that an incoming HTTP request originates from an authorized local context
+/// AND presents a valid high-entropy local API authorization token.
+fn validate_request_origin_and_auth(
+    headers: &axum::http::HeaderMap,
+    state: &DaemonState,
+) -> Result<(), (StatusCode, String)> {
+    // 1. Origin and Host checks against CSRF and DNS rebinding
+    validate_request_origin_and_host(headers)?;
+
+    // 2. Strict Authentication Token validation (Authorization: Bearer <token> or X-Daemon-Token: <token>)
+    let token_from_auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            if let Some(stripped) = s.strip_prefix("Bearer ") {
+                Some(stripped.trim())
+            } else {
+                Some(s.trim())
+            }
+        });
+
+    let token_from_header = headers
+        .get("x-daemon-token")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim());
+
+    let client_token = token_from_auth.or(token_from_header);
+    let expected_token = state.local_api_token.read().unwrap();
+
+    match client_token {
+        Some(token) if !token.is_empty() && constant_time_eq_str(token, &expected_token) => {
+            Ok(())
+        }
+        Some(_) => Err((
+            StatusCode::UNAUTHORIZED,
+            "Access unauthorized: invalid daemon API token".to_string(),
+        )),
+        None => Err((
+            StatusCode::UNAUTHORIZED,
+            "Access unauthorized: mutating operations require 'Authorization: Bearer <token>' or 'X-Daemon-Token'".to_string(),
+        )),
+    }
 }
 
 pub fn create_router(state: Arc<DaemonState>) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _| {
+            if let Ok(s) = origin.to_str() {
+                is_authorized_origin(s)
+            } else {
+                false
+            }
+        }))
+        .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::OPTIONS])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::ORIGIN,
+            axum::http::header::HeaderName::from_static("x-daemon-token"),
+        ]);
+
     Router::new()
         .route("/", get(handle_serve_index))
         .route("/ui", get(handle_serve_index))
@@ -202,11 +531,12 @@ pub fn create_router(state: Arc<DaemonState>) -> Router {
         .route("/api/respond", post(handle_post_respond))
         .route("/api/disconnect", post(handle_post_disconnect))
         .route("/api/status", get(handle_get_status))
+        .route("/api/auth/rotate", post(handle_post_auth_rotate))
         .route("/api/license/activate", post(handle_post_license_activate))
         .route("/api/license/status", get(handle_get_license_status))
         .route("/api/system/drivers", get(handle_get_system_drivers))
         .route("/api/events", get(handle_ws_events))
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .with_state(state)
 }
 
@@ -219,6 +549,18 @@ pub struct DaemonServer;
 
 impl DaemonServer {
     pub async fn run(bind_port: u16, broker_url: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Self::run_internal(bind_port, broker_url, None).await
+    }
+
+    pub async fn run_with_token(bind_port: u16, broker_url: String, explicit_token: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Self::run_internal(bind_port, broker_url, Some(explicit_token)).await
+    }
+
+    async fn run_internal(
+        bind_port: u16,
+        broker_url: String,
+        explicit_token: Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let identity = NodeIdentity::load_or_generate();
         let (broker_tx, broker_rx) = mpsc::channel::<serde_json::Value>(64);
         let (ui_events_tx, _) = broadcast::channel::<serde_json::Value>(128);
@@ -226,6 +568,17 @@ impl DaemonServer {
         // Pre-scan physical hardware
         let initial_devices = HardwareEnumerator::scan_devices();
         let initial_license = load_persisted_license(&identity.hardware_hash);
+
+        let local_api_token = explicit_token.unwrap_or_else(|| {
+            std::env::var("USB_MASTER_DAEMON_TOKEN").unwrap_or_else(|_| {
+                let token = generate_secure_api_token();
+                let _ = save_secure_token_to_disk(&token);
+                token
+            })
+        });
+
+        // Ensure token is stored in ~/.usb-master-pro/daemon.token with owner-only access (0600 on Unix)
+        let _ = save_secure_token_to_disk(&local_api_token);
 
         let state = Arc::new(DaemonState {
             identity,
@@ -238,6 +591,7 @@ impl DaemonServer {
             start_time: Instant::now(),
             broker_url: broker_url.clone(),
             active_license: RwLock::new(initial_license),
+            local_api_token: std::sync::RwLock::new(local_api_token),
         });
 
         // 1. Spawn Outbound Signaling Client task
@@ -259,6 +613,7 @@ impl DaemonServer {
         let addr = SocketAddr::from(([127, 0, 0, 1], bind_port));
         println!("  🌐 Embedded IPC Daemon listening on http://{}", addr);
         println!("  📡 Signaling Broker target: {}", broker_url);
+        println!("  🔒 Local API authorization token secured at ~/.usb-master-pro/daemon.token (mode 0600)");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
@@ -296,7 +651,35 @@ async fn handle_serve_icon_256() -> impl IntoResponse {
 // --- HTTP ENDPOINT HANDLERS ---
 
 async fn handle_get_identity(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
-    Json(state.identity.clone())
+    // SECURITY INVARIANT: Identity endpoint is a local public query and MUST NEVER
+    // expose the local_api_token. Token is stored securely in ~/.usb-master-pro/daemon.token.
+    Json(serde_json::to_value(&state.identity).unwrap_or_default())
+}
+
+/// Rotates the local daemon API authorization token, persisting the fresh 256-bit CSPRNG token to disk
+async fn handle_post_auth_rotate(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_request_origin_and_auth(&headers, &state)?;
+
+    let new_token = generate_secure_api_token();
+    if let Err(e) = save_secure_token_to_disk(&new_token) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to persist rotated token to secure storage: {}", e),
+        ));
+    }
+
+    {
+        let mut lock = state.local_api_token.write().unwrap();
+        *lock = new_token;
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Daemon local API authorization token successfully rotated and persisted to ~/.usb-master-pro/daemon.token (mode 0600)"
+    })))
 }
 
 async fn handle_get_devices(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
@@ -351,9 +734,12 @@ async fn handle_get_sessions(State(state): State<Arc<DaemonState>>) -> impl Into
 }
 
 async fn handle_post_forward(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(payload): Json<ForwardRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_request_origin_and_auth(&headers, &state)?;
+
     let mut dev_lock = state.devices.write().await;
     let dev = dev_lock.iter_mut().find(|d| d.id == payload.device_id);
 
@@ -423,9 +809,12 @@ async fn handle_post_forward(
 }
 
 async fn handle_post_connect(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(payload): Json<ConnectRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_request_origin_and_auth(&headers, &state)?;
+
     let clean_target_id = payload.target_id.replace(' ', "");
     if clean_target_id.len() != 9 {
         return Err((
@@ -491,9 +880,12 @@ async fn handle_post_connect(
 }
 
 async fn handle_post_respond(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(payload): Json<RespondRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_request_origin_and_auth(&headers, &state)?;
+
     let clean_from_id = payload.from_id.replace(' ', "");
 
     if payload.accepted {
@@ -583,9 +975,12 @@ async fn handle_post_respond(
 }
 
 async fn handle_post_disconnect(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(payload): Json<DisconnectRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_request_origin_and_auth(&headers, &state)?;
+
     let clean_peer_id = payload.peer_id.replace(' ', "");
     let mut sessions = state.active_sessions.write().await;
     let mut found = false;
@@ -731,9 +1126,20 @@ fn persist_license(claims: &LicenseClaims, _token: &str) {
 }
 
 async fn handle_post_license_activate(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(payload): Json<LicenseActivateRequest>,
 ) -> impl IntoResponse {
+    if let Err((status, msg)) = validate_request_origin_and_auth(&headers, &state) {
+        return (
+            status,
+            Json(serde_json::json!({
+                "success": false,
+                "error": msg
+            })),
+        ).into_response();
+    }
+
     match LicenseEngine::verify_token(&payload.token, &state.identity.hardware_hash) {
         Ok(claims) => {
             {
@@ -1167,5 +1573,73 @@ async fn run_hotplug_monitor(state: Arc<DaemonState>) {
                 })).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_authorized_host_exact_matching() {
+        assert!(is_authorized_host("127.0.0.1"));
+        assert!(is_authorized_host("127.0.0.1:19842"));
+        assert!(is_authorized_host("localhost"));
+        assert!(is_authorized_host("localhost:19842"));
+        assert!(is_authorized_host("[::1]"));
+        assert!(is_authorized_host("[::1]:19842"));
+
+        // Host header attacks & bypass attempts
+        assert!(!is_authorized_host("localhost.evil.com"));
+        assert!(!is_authorized_host("localhost.evil.com:19842"));
+        assert!(!is_authorized_host("127.0.0.1.evil.com"));
+        assert!(!is_authorized_host("attacker.com"));
+        assert!(!is_authorized_host("attacker.com:19842"));
+        assert!(!is_authorized_host("localhost:99999"));
+        assert!(!is_authorized_host("localhost:abc"));
+        assert!(!is_authorized_host(""));
+        assert!(!is_authorized_host("   "));
+    }
+
+    #[test]
+    fn test_is_authorized_origin_exact_matching() {
+        // Allowed local origins
+        assert!(is_authorized_origin("http://127.0.0.1:19842"));
+        assert!(is_authorized_origin("http://127.0.0.1"));
+        assert!(is_authorized_origin("http://localhost:19842"));
+        assert!(is_authorized_origin("http://localhost"));
+        assert!(is_authorized_origin("https://localhost"));
+        assert!(is_authorized_origin("http://[::1]:19842"));
+        assert!(is_authorized_origin("http://[::1]"));
+        assert!(is_authorized_origin("tauri://localhost"));
+        assert!(is_authorized_origin("http://tauri.localhost"));
+        assert!(is_authorized_origin("app://localhost"));
+        assert!(is_authorized_origin("null"));
+
+        // Disallowed / Malicious origins
+        assert!(!is_authorized_origin("http://localhost.evil.com"));
+        assert!(!is_authorized_origin("http://localhost.evil.com:19842"));
+        assert!(!is_authorized_origin("http://127.0.0.1.evil.com"));
+        assert!(!is_authorized_origin("http://127.0.0.1.evil.com:19842"));
+        assert!(!is_authorized_origin("http://evil.com"));
+        assert!(!is_authorized_origin("http://evil.com/localhost"));
+        assert!(!is_authorized_origin("http://localhost:99999")); // Out-of-bounds port (>65535)
+        assert!(!is_authorized_origin("http://localhost:0"));     // Port 0 invalid
+        assert!(!is_authorized_origin("http://localhost:abc"));   // Non-numeric port
+        assert!(!is_authorized_origin("javascript:alert(1)"));
+        assert!(!is_authorized_origin("data:text/html,evil"));
+        assert!(!is_authorized_origin("http://@evil.com"));
+        assert!(!is_authorized_origin("http://[::1"));            // Malformed unclosed bracket
+        assert!(!is_authorized_origin(""));
+        assert!(!is_authorized_origin("   "));
+    }
+
+    #[test]
+    fn test_generate_secure_api_token_entropy() {
+        let t1 = generate_secure_api_token();
+        let t2 = generate_secure_api_token();
+        assert_eq!(t1.len(), 64);
+        assert_eq!(t2.len(), 64);
+        assert_ne!(t1, t2, "Successive CSPRNG tokens must be cryptographically distinct");
     }
 }

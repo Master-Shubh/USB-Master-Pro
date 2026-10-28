@@ -7,6 +7,13 @@ homepage = "https://bhartx.in"
 repository = "https://github.com/bhartx/usb-master-pro"
 description = "High-performance Turbo-URB USB-over-IP core engine for USB Master Pro — Owned & Developed by BhartX Ecosystems Pvt Ltd"
 
+[features]
+default = []
+test-utils = []
+
+[dev-dependencies]
+usb-master-core = { path = ".", features = ["test-utils"] }
+
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }

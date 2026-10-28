@@ -142,7 +142,7 @@ async fn http_get(port: u16, path: &str) -> Result<HttpResponse, String> {
 }
 
 /// Performs a raw HTTP POST request with a JSON payload over Tokio TcpStream.
-async fn http_post_json(port: u16, path: &str, body: &serde_json::Value) -> Result<HttpResponse, String> {
+async fn http_post_json(port: u16, path: &str, body: &serde_json::Value, token: &str) -> Result<HttpResponse, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -152,8 +152,8 @@ async fn http_post_json(port: u16, path: &str, body: &serde_json::Value) -> Resu
         .map_err(|e| format!("Connect to 127.0.0.1:{} failed: {}", port, e))?;
 
     let req = format!(
-        "POST {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path, port, body_str.len(), body_str
+        "POST {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Daemon-Token: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path, port, token, body_str.len(), body_str
     );
     stream
         .write_all(req.as_bytes())
@@ -268,12 +268,15 @@ async fn test_end_to_end_multi_node_passthrough() {
     // 3. Spawn Node A (Sender) and Node B (Receiver) daemon processes
     let daemon_bin = get_daemon_binary_path();
     let broker_ws_url = format!("ws://127.0.0.1:{}", broker_port);
+    const TOKEN_A: &str = "token_alpha_e2e_node_a_1234567890abcdef";
+    const TOKEN_B: &str = "token_beta_e2e_node_b_1234567890abcdef";
 
     println!("  🚀 Spawning Node A daemon on port {} (HOSTNAME=node-alpha-sender)...", port_a);
     let daemon_a_child = Command::new(&daemon_bin)
         .env("DAEMON_PORT", port_a.to_string())
         .env("SIGNALING_URL", &broker_ws_url)
         .env("HOSTNAME", "node-alpha-sender")
+        .env("USB_MASTER_DAEMON_TOKEN", TOKEN_A)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -285,6 +288,7 @@ async fn test_end_to_end_multi_node_passthrough() {
         .env("DAEMON_PORT", port_b.to_string())
         .env("SIGNALING_URL", &broker_ws_url)
         .env("HOSTNAME", "node-beta-receiver")
+        .env("USB_MASTER_DAEMON_TOKEN", TOKEN_B)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -363,7 +367,7 @@ async fn test_end_to_end_multi_node_passthrough() {
                     "share": true,
                     "force": false
                 });
-                let unforced_resp = http_post_json(port_a, "/api/forward", &unforced_payload).await.expect("POST /api/forward failed");
+                let unforced_resp = http_post_json(port_a, "/api/forward", &unforced_payload, TOKEN_A).await.expect("POST /api/forward failed");
                 assert_eq!(unforced_resp.status, 403, "Unforced forward of system device must be rejected with 403 Forbidden");
                 assert!(
                     unforced_resp.body.contains("primary system input device"),
@@ -381,7 +385,7 @@ async fn test_end_to_end_multi_node_passthrough() {
                     "share": true,
                     "force": true
                 });
-                let forced_resp = http_post_json(port_a, "/api/forward", &forced_payload).await.expect("POST /api/forward forced failed");
+                let forced_resp = http_post_json(port_a, "/api/forward", &forced_payload, TOKEN_A).await.expect("POST /api/forward forced failed");
                 assert_eq!(forced_resp.status, 200, "Forced forward of system device must return 200 OK");
                 let forced_json = forced_resp.json();
                 assert_eq!(forced_json["success"].as_bool(), Some(true));
@@ -397,7 +401,7 @@ async fn test_end_to_end_multi_node_passthrough() {
                     "share": true,
                     "force": false
                 });
-                let share_resp = http_post_json(port_a, "/api/forward", &share_payload).await.expect("POST /api/forward non-system failed");
+                let share_resp = http_post_json(port_a, "/api/forward", &share_payload, TOKEN_A).await.expect("POST /api/forward non-system failed");
                 assert_eq!(share_resp.status, 200);
                 let share_json = share_resp.json();
                 assert_eq!(share_json["success"].as_bool(), Some(true));
@@ -424,7 +428,7 @@ async fn test_end_to_end_multi_node_passthrough() {
             "pin": pin_a
         });
 
-        let connect_resp = http_post_json(port_b, "/api/connect", &connect_payload).await.expect("POST /api/connect on Node B failed");
+        let connect_resp = http_post_json(port_b, "/api/connect", &connect_payload, TOKEN_B).await.expect("POST /api/connect on Node B failed");
         assert_eq!(connect_resp.status, 200, "Node B connect request must succeed with 200 OK");
         let connect_json = connect_resp.json();
         assert_eq!(connect_json["success"].as_bool(), Some(true));
@@ -442,7 +446,7 @@ async fn test_end_to_end_multi_node_passthrough() {
             "reason": "Accepted by automated E2E test harness"
         });
 
-        let respond_resp = http_post_json(port_a, "/api/respond", &respond_payload).await.expect("POST /api/respond on Node A failed");
+        let respond_resp = http_post_json(port_a, "/api/respond", &respond_payload, TOKEN_A).await.expect("POST /api/respond on Node A failed");
         assert_eq!(respond_resp.status, 200, "Node A respond must succeed with 200 OK");
         let respond_json = respond_resp.json();
         assert_eq!(respond_json["success"].as_bool(), Some(true));
@@ -506,7 +510,7 @@ async fn test_end_to_end_multi_node_passthrough() {
     let invalid_connect_payload = serde_json::json!({
         "target_id": "12345678" // 8 digits
     });
-    let invalid_connect_resp = http_post_json(port_b, "/api/connect", &invalid_connect_payload).await.unwrap();
+    let invalid_connect_resp = http_post_json(port_b, "/api/connect", &invalid_connect_payload, TOKEN_B).await.unwrap();
     assert_eq!(invalid_connect_resp.status, 400, "Connect request with <9 digits must return HTTP 400 Bad Request");
     println!("     🛡️ Target ID boundary validated: 8-digit ID rejected with 400");
 
@@ -515,7 +519,7 @@ async fn test_end_to_end_multi_node_passthrough() {
         "device_id": "non-existent-device-9999",
         "share": true
     });
-    let bogus_resp = http_post_json(port_a, "/api/forward", &bogus_dev_payload).await.unwrap();
+    let bogus_resp = http_post_json(port_a, "/api/forward", &bogus_dev_payload, TOKEN_A).await.unwrap();
     assert_eq!(bogus_resp.status, 404, "Forwarding non-existent device must return HTTP 404 Not Found");
     println!("     🛡️ Hardware ID boundary validated: non-existent device returns 404");
 

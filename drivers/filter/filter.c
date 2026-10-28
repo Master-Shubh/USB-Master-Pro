@@ -68,6 +68,15 @@ AnyUsbFilter_EvtDeviceAdd(
     // Configure as an Upper Filter Device
     WdfFdoInitSetFilter(DeviceInit);
 
+    // Security Hardening: Restrict IOCTL access strictly to SYSTEM and Administrators (SDDL_DEVOBJ_SYS_ALL_ADM_ALL)
+    DECLARE_CONST_UNICODE_STRING(sddlString, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+    status = WdfDeviceInitAssignSDDLString(DeviceInit, &sddlString);
+    if (!NT_SUCCESS(status)) {
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "USB Master Pro Filter: WdfDeviceInitAssignSDDLString failed: 0x%08X\n", status));
+        return status;
+    }
+
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttributes, FILTER_DEVICE_DATA);
 
     status = WdfDeviceCreate(&DeviceInit, &deviceAttributes, &wdfDevice);

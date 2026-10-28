@@ -14,6 +14,8 @@ if %errorLevel% neq 0 (
 )
 
 echo [USB Master Pro] Gracefully stopping active processes to prevent file lock reboots...
+taskkill /F /IM usb_master_daemon.exe >nul 2>&1
+taskkill /F /IM usb_master_cli.exe >nul 2>&1
 taskkill /F /IM USBMasterDaemon.exe >nul 2>&1
 taskkill /F /IM USBMasterPro.exe >nul 2>&1
 timeout /t 2 /nobreak >nul
@@ -29,6 +31,7 @@ pnputil.exe /delete-driver anyusb_filter.inf /uninstall /force >nul 2>&1
 
 echo [USB Master Pro] Cleaning up Windows Firewall rules...
 netsh advfirewall firewall delete rule name="USB Master Pro Daemon" >nul 2>&1
+netsh advfirewall firewall delete rule name="USB Master Pro CLI" >nul 2>&1
 netsh advfirewall firewall delete rule name="USB Master Pro" >nul 2>&1
 
 echo ==============================================================================

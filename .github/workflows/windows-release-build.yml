@@ -1,0 +1,235 @@
+name: USB Master Pro — Windows Release Build & Driver Signing Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows-release:
+    name: Build & Package Windows x64 Release Bundle
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Stable MSVC Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup Windows 11 SDK (22621)
+        uses: GuillaumeFalourd/setup-windows10-sdk-action@v1
+        with:
+          sdk-version: 22621
+
+      - name: Install & Configure Windows Driver Kit (WDK 11)
+        run: |
+          Write-Host "=================================================================="
+          Write-Host "Installing Windows Driver Kit (WDK) 11 via Chocolatey..."
+          Write-Host "=================================================================="
+          choco install windowsdriverkit11 -y --no-progress
+
+          $wdkInclude = Test-Path "C:\Program Files (x86)\Windows Kits\10\Include\*\km"
+          if (-not $wdkInclude) {
+              Write-Host "WDK include path not found after choco. Invoking official Microsoft WDK installer directly..."
+              $wdkSetupUrl = "https://download.microsoft.com/download/c/6/4/c64e8e90-4143-4e86-93d7-0209b0b30626/wdk/wdksetup.exe"
+              Invoke-WebRequest -Uri $wdkSetupUrl -OutFile "$env:TEMP\wdksetup.exe"
+              Start-Process -FilePath "$env:TEMP\wdksetup.exe" -ArgumentList "/q /norestart" -Wait
+          }
+
+          $vsixCandidates = @(
+              "C:\Program Files (x86)\Windows Kits\10\Vsix\VS2022\WDK.vsix",
+              "C:\Program Files\Windows Kits\10\Vsix\VS2022\WDK.vsix"
+          )
+          $vsixPath = $vsixCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if ($vsixPath) {
+              Write-Host "Found WDK VSIX at: $vsixPath"
+              $vsixInstaller = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\VSIXInstaller.exe"
+              if (Test-Path $vsixInstaller) {
+                  Write-Host "Running VSIXInstaller in quiet admin mode..."
+                  Start-Process -FilePath $vsixInstaller -ArgumentList "/quiet /admin `"$vsixPath`"" -Wait
+              }
+          }
+
+          # Ensure WindowsKernelModeDriver10.0 platform toolset is present in VS2022 MSBuild
+          $vsMsbuildToolsetDir = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VC\v170\Platforms\x64\PlatformToolsets\WindowsKernelModeDriver10.0"
+          if (-not (Test-Path $vsMsbuildToolsetDir) -and $vsixPath) {
+              Write-Host "Extracting WindowsKernelModeDriver10.0 toolsets from VSIX directly..."
+              $extractDir = "$env:TEMP\wdk_vsix_extracted"
+              $zipFile = "$env:TEMP\wdk_vsix.zip"
+              Copy-Item $vsixPath $zipFile -Force
+              Expand-Archive -Path $zipFile -DestinationPath $extractDir -Force
+
+              $foundToolsets = Get-ChildItem -Path $extractDir -Recurse -Directory -Filter "WindowsKernelModeDriver10.0"
+              foreach ($ts in $foundToolsets) {
+                  $parentDir = Split-Path $vsMsbuildToolsetDir -Parent
+                  New-Item -ItemType Directory -Path $parentDir -Force | Out-Null
+                  Copy-Item -Path $ts.FullName -Destination $vsMsbuildToolsetDir -Recurse -Force
+                  Write-Host "Copied toolset from $($ts.FullName) to $vsMsbuildToolsetDir"
+              }
+          }
+          Write-Host "WDK 11 toolchain configuration completed successfully."
+
+      - name: Compile KMDF Drivers (anyusb_vhci & anyusb_filter)
+        run: |
+          Write-Host "=================================================================="
+          Write-Host "Compiling anyusb_vhci.vcxproj (Release | x64)..."
+          Write-Host "=================================================================="
+          msbuild drivers/vhci/anyusb_vhci.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /v:m
+
+          $vhciSys = Get-ChildItem -Path . -Recurse -Filter "anyusb_vhci.sys" | Select-Object -First 1
+          if ($vhciSys) {
+              Copy-Item $vhciSys.FullName "drivers/vhci/anyusb_vhci.sys" -Force
+              Write-Host "Successfully staged drivers/vhci/anyusb_vhci.sys ($($vhciSys.Length) bytes)"
+          } else {
+              Write-Error "anyusb_vhci.sys was not produced by MSBuild!"
+              exit 1
+          }
+
+          Write-Host "=================================================================="
+          Write-Host "Compiling anyusb_filter.vcxproj (Release | x64)..."
+          Write-Host "=================================================================="
+          msbuild drivers/filter/anyusb_filter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /v:m
+
+          $filterSys = Get-ChildItem -Path . -Recurse -Filter "anyusb_filter.sys" | Select-Object -First 1
+          if ($filterSys) {
+              Copy-Item $filterSys.FullName "drivers/filter/anyusb_filter.sys" -Force
+              Write-Host "Successfully staged drivers/filter/anyusb_filter.sys ($($filterSys.Length) bytes)"
+          } else {
+              Write-Error "anyusb_filter.sys was not produced by MSBuild!"
+              exit 1
+          }
+
+      - name: Generate Catalogs (Inf2Cat) & Test-Sign Drivers
+        run: |
+          Write-Host "=================================================================="
+          Write-Host "Executing automated field-test signing via setup_field_test_signing.ps1..."
+          Write-Host "=================================================================="
+          & ".\scripts\setup_field_test_signing.ps1" -DriverRootPath "$PWD\drivers" -ForceRegenerateCert
+
+          $expectedDriverFiles = @(
+              "drivers/vhci/anyusb_vhci.sys",
+              "drivers/vhci/anyusb_vhci.inf",
+              "drivers/vhci/anyusb_vhci.cat",
+              "drivers/filter/anyusb_filter.sys",
+              "drivers/filter/anyusb_filter.inf",
+              "drivers/filter/anyusb_filter.cat",
+              "drivers/bhartx_test_ca.cer"
+          )
+          foreach ($file in $expectedDriverFiles) {
+              if (-not (Test-Path $file)) {
+                  Write-Error "Missing expected driver package artifact: $file"
+                  exit 1
+              }
+              Write-Host "Verified driver file: $file ($((Get-Item $file).Length) bytes)"
+          }
+
+      - name: Compile Rust Turbo-URB Engine (usb_master_daemon & usb_master_cli)
+        run: |
+          Write-Host "=================================================================="
+          Write-Host "Compiling Rust workspace for x86_64-pc-windows-msvc (Release)..."
+          Write-Host "=================================================================="
+          cargo build --release --target x86_64-pc-windows-msvc -p usb-master-core --bin usb_master_daemon --bin usb_master_cli
+
+          $daemonPath = "target/x86_64-pc-windows-msvc/release/usb_master_daemon.exe"
+          $cliPath = "target/x86_64-pc-windows-msvc/release/usb_master_cli.exe"
+
+          if (-not (Test-Path $daemonPath)) {
+              Write-Error "FATAL: $daemonPath was not found!"
+              exit 1
+          }
+          if (-not (Test-Path $cliPath)) {
+              Write-Error "FATAL: $cliPath was not found!"
+              exit 1
+          }
+          Write-Host "Rust binaries built successfully:"
+          Write-Host "  Daemon: $daemonPath ($((Get-Item $daemonPath).Length) bytes)"
+          Write-Host "  CLI:    $cliPath ($((Get-Item $cliPath).Length) bytes)"
+
+      - name: Verify Release Artifacts for Secret & Root Seed Leaks
+        run: |
+          Write-Host "=================================================================="
+          Write-Host "Running release secret leak gate (scripts/verify_no_leaks.ps1)..."
+          Write-Host "=================================================================="
+          & ".\scripts\verify_no_leaks.ps1" -TargetDir "target/x86_64-pc-windows-msvc/release" -DriversDir "drivers"
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Security leak gate failed!"
+              exit 1
+          }
+
+      - name: Package USB Master Pro Windows Release Bundle (.zip)
+        run: |
+          Write-Host "=================================================================="
+          Write-Host "Packaging usb-master-pro-windows-x64.zip release bundle..."
+          Write-Host "=================================================================="
+          $bundleDir = "$PWD\dist\usb-master-pro-windows-x64"
+          if (Test-Path $bundleDir) { Remove-Item $bundleDir -Recurse -Force }
+
+          New-Item -ItemType Directory -Path "$bundleDir\drivers\vhci" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$bundleDir\drivers\filter" -Force | Out-Null
+
+          # 1. User-mode binaries
+          Copy-Item "target/x86_64-pc-windows-msvc/release/usb_master_daemon.exe" "$bundleDir\" -Force
+          Copy-Item "target/x86_64-pc-windows-msvc/release/usb_master_cli.exe" "$bundleDir\" -Force
+
+          # 2. Kernel drivers, manifests, catalogs & certificate
+          Copy-Item "drivers/vhci/anyusb_vhci.sys" "$bundleDir\drivers\vhci\" -Force
+          Copy-Item "drivers/vhci/anyusb_vhci.inf" "$bundleDir\drivers\vhci\" -Force
+          Copy-Item "drivers/vhci/anyusb_vhci.cat" "$bundleDir\drivers\vhci\" -Force
+          Copy-Item "drivers/filter/anyusb_filter.sys" "$bundleDir\drivers\filter\" -Force
+          Copy-Item "drivers/filter/anyusb_filter.inf" "$bundleDir\drivers\filter\" -Force
+          Copy-Item "drivers/filter/anyusb_filter.cat" "$bundleDir\drivers\filter\" -Force
+          Copy-Item "drivers/bhartx_test_ca.cer" "$bundleDir\drivers\" -Force
+
+          # 3. Scripts and Documentation
+          Copy-Item "scripts/install_zero_reboot.bat" "$bundleDir\" -Force
+          Copy-Item "scripts/uninstall_zero_reboot.bat" "$bundleDir\" -Force
+          Copy-Item "scripts/setup_field_test_signing.ps1" "$bundleDir\" -Force
+          Copy-Item "README_INSTALL.md" "$bundleDir\" -Force
+
+          # 4. Generate Zip Archive
+          $zipPath = "$PWD\dist\usb-master-pro-windows-x64.zip"
+          Compress-Archive -Path "$bundleDir\*" -DestinationPath $zipPath -Force
+          Write-Host "Release bundle generated: $zipPath ($([math]::Round((Get-Item $zipPath).Length / 1MB, 2)) MB)"
+
+          Get-ChildItem -Path $bundleDir -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+
+      - name: Compile 1-Click Windows Setup Wizard (Inno Setup)
+        run: |
+          Write-Host "=================================================================="
+          Write-Host "Compiling Inno Setup 1-Click Windows Setup Wizard..."
+          Write-Host "=================================================================="
+          New-Item -ItemType Directory -Path "dist\bin" -Force | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/usb_master_cli.exe" "dist\bin\USBMasterPro.exe" -Force
+          Copy-Item "target/x86_64-pc-windows-msvc/release/usb_master_daemon.exe" "dist\bin\USBMasterDaemon.exe" -Force
+
+          choco install innosetup --no-progress -y
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\usb_master_pro.iss
+          Write-Host "Setup Wizard compiled successfully in dist/installer/"
+
+      - name: Upload Release Bundle (usb-master-pro-windows-x64.zip)
+        uses: actions/upload-artifact@v4
+        with:
+          name: usb-master-pro-windows-x64
+          path: dist/usb-master-pro-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Upload 1-Click Setup Wizard Installer (USBMasterPro-Setup-v1.0.0.exe)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: USB-Master-Pro-v1.0.0-Setup-Wizard
+          path: dist/installer/USBMasterPro-Setup-v1.0.0.exe
+          if-no-files-found: warn

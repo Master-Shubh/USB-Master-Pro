@@ -5,6 +5,7 @@ pub mod adapters;
 pub mod buffer_pool;
 pub mod compression;
 pub mod daemon;
+pub mod driver_client;
 pub mod enumerator;
 pub mod hardware_db;
 pub mod identity;
@@ -26,6 +27,10 @@ pub use buffer_pool::BufferPool;
 pub use compression::TurboCompressor;
 pub use daemon::{start_daemon, DaemonServer};
 pub use device_reset::{DeviceOperationalState, DeviceResetController, ResetMethod};
+pub use driver_client::{
+    AnyUsbAttachRequest, AnyUsbCompleteRequest, AnyUsbDetachRequest, AnyUsbUrbMessage,
+    DriverClientError, VhciDriverClient, ANYUSB_MAX_URB_BUFFER_SIZE,
+};
 pub use enumerator::{HardwareEnumerator, UsbDeviceInfo};
 pub use hardware_db::{DeviceCategory, HardwareClassifier};
 pub use identity::{
@@ -33,8 +38,10 @@ pub use identity::{
     NodeIdentity,
 };
 pub use licensing::{
-    LicenseClaims, LicenseEngine, LicenseError, BHARTX_ROOT_LICENSE_PUBKEY, BHARTX_ROOT_SEED,
+    LicenseClaims, LicenseEngine, LicenseError, BHARTX_ROOT_LICENSE_PUBKEY,
 };
+#[cfg(any(test, feature = "test-utils"))]
+pub use licensing::BHARTX_ROOT_SEED;
 pub use security::{
     KeyStorageProvider, PortableFileKeyStorage, SecurityError, WindowsDpapiKeyStorage,
 };

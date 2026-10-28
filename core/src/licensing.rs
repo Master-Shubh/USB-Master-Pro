@@ -16,7 +16,7 @@ pub const BHARTX_ROOT_LICENSE_PUBKEY: [u8; 32] = [
 /// BhartX Root CA Master Seed (STRICTLY FOR IN-TREE TEST HARNESS AND SYNTHETIC TOKEN GENERATION ONLY).
 /// SECURITY INVARIANT: Must NEVER be embedded in release client binaries or treated as a real production CA.
 /// Production token issuance is performed strictly on an isolated HSM / server-side signing authority.
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-utils"))]
 pub const BHARTX_ROOT_SEED: [u8; 32] = *b"BHARTX_MOCK_TEST_HARNESS_KEY_001";
 
 /// Claims embedded within a cryptographic license payload.
@@ -85,7 +85,9 @@ pub enum LicenseError {
 pub struct LicenseEngine;
 
 impl LicenseEngine {
-    /// Obtains the BhartX Root CA keypair (derived deterministically from root seed)
+    /// Obtains the BhartX Root CA keypair (derived deterministically from root seed).
+    /// Gated exclusively to test harness and test-utils feature; physically absent in production client builds.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn root_ca_keypair() -> InstallationKeypair {
         InstallationKeypair::from_seed(&BHARTX_ROOT_SEED)
     }

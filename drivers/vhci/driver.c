@@ -12,6 +12,7 @@ EVT_WDF_DRIVER_DEVICE_ADD AnyUsbVhci_EvtDeviceAdd;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL AnyUsbVhci_EvtIoDeviceControl;
 EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL AnyUsbVhci_EvtIoInternalDeviceControl;
 EVT_WDF_DEVICE_PROCESS_QUERY_INTERFACE_REQUEST AnyUsb_EvtDeviceProcessQueryInterfaceRequest;
+EVT_WDF_REQUEST_CANCEL AnyUsbVhci_EvtPendingUrbCancel;
 
 NTSTATUS
 DriverEntry(
@@ -47,11 +48,37 @@ AnyUsbVhci_EvtDeviceAdd(
     WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_BUS_EXTENDER);
     WdfDeviceInitSetExclusive(DeviceInit, FALSE);
 
+    // Security Hardening: Restrict IOCTL access strictly to SYSTEM and Administrators (SDDL_DEVOBJ_SYS_ALL_ADM_ALL)
+    DECLARE_CONST_UNICODE_STRING(sddlString, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+    status = WdfDeviceInitAssignSDDLString(DeviceInit, &sddlString);
+    if (!NT_SUCCESS(status)) {
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "USB Master Pro: WdfDeviceInitAssignSDDLString failed: 0x%08X\n", status));
+        return status;
+    }
+
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttributes, FDO_DEVICE_DATA);
 
     status = WdfDeviceCreate(&DeviceInit, &deviceAttributes, &wdfDevice);
     if (!NT_SUCCESS(status)) {
         return status;
+    }
+
+    // Create Symbolic Link so user-mode service/daemon can open \\.\AnyUsbVhci
+    DECLARE_CONST_UNICODE_STRING(symbolicLinkName, L"\\DosDevices\\AnyUsbVhci");
+    status = WdfDeviceCreateSymbolicLink(wdfDevice, &symbolicLinkName);
+    if (!NT_SUCCESS(status)) {
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+            "USB Master Pro: WdfDeviceCreateSymbolicLink failed: 0x%08X\n", status));
+        return status;
+    }
+
+    // Register standard PnP Device Interface GUID for bus enumerators
+    status = WdfDeviceCreateDeviceInterface(wdfDevice, &GUID_DEVINTERFACE_ANYUSB_VHCI, NULL);
+    if (!NT_SUCCESS(status)) {
+        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+            "USB Master Pro: WdfDeviceCreateDeviceInterface failed: 0x%08X\n", status));
+        // Non-fatal if symbolic link succeeded
     }
 
     fdoData = GetFdoData(wdfDevice);
@@ -315,6 +342,37 @@ AnyUsb_EvtDeviceProcessQueryInterfaceRequest(
 }
 
 VOID
+AnyUsbVhci_EvtPendingUrbCancel(
+    _In_ WDFREQUEST Request
+)
+{
+    WDFDEVICE dev = WdfRequestGetDevice(Request);
+    PFDO_DEVICE_DATA fdoData = NULL;
+
+    if (dev != NULL) {
+        PPDO_DEVICE_DATA pdoData = GetPdoData(dev);
+        if (pdoData != NULL && pdoData->ParentFdo != NULL) {
+            fdoData = GetFdoData(pdoData->ParentFdo);
+        }
+    }
+
+    if (fdoData != NULL) {
+        WdfSpinLockAcquire(fdoData->PendingUrbLock);
+        for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
+            if (fdoData->PendingRequests[i] == Request) {
+                fdoData->PendingRequests[i] = NULL;
+                break;
+            }
+        }
+        WdfSpinLockRelease(fdoData->PendingUrbLock);
+    }
+
+    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "USB Master Pro: Pending guest URB request %p cancelled\n", Request));
+    WdfRequestComplete(Request, STATUS_CANCELLED);
+}
+
+VOID
 AnyUsbVhci_EvtIoDeviceControl(
     _In_ WDFQUEUE   Queue,
     _In_ WDFREQUEST Request,
@@ -532,10 +590,12 @@ AnyUsbVhci_EvtIoDeviceControl(
                 for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
                     WDFREQUEST pendingReq = fdoData->PendingRequests[i];
                     if (pendingReq != NULL) {
-                        WDFQUEUE reqQ = WdfRequestGetIoQueue(pendingReq);
-                        if (reqQ != NULL && WdfIoQueueGetDevice(reqQ) == targetChildDevice) {
+                        WDFDEVICE reqDev = WdfRequestGetDevice(pendingReq);
+                        if (reqDev == targetChildDevice) {
                             fdoData->PendingRequests[i] = NULL;
-                            WdfRequestComplete(pendingReq, STATUS_CANCELLED);
+                            if (NT_SUCCESS(WdfRequestUnmarkCancelable(pendingReq))) {
+                                WdfRequestComplete(pendingReq, STATUS_CANCELLED);
+                            }
                         }
                     }
                 }
@@ -612,6 +672,20 @@ AnyUsbVhci_EvtIoDeviceControl(
                     break;
                 }
 
+                // Mark the pending guest request as cancelable so caller or OS can cancel it without deadlock
+                NTSTATUS markStatus = WdfRequestMarkCancelableEx(pendingGuestRequest, AnyUsbVhci_EvtPendingUrbCancel);
+                if (!NT_SUCCESS(markStatus)) {
+                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                        "USB Master Pro: WdfRequestMarkCancelableEx returned 0x%08X (already cancelled)\n", markStatus));
+                    WdfSpinLockAcquire(fdoData->PendingUrbLock);
+                    fdoData->PendingRequests[assignedSlot] = NULL;
+                    WdfSpinLockRelease(fdoData->PendingUrbLock);
+                    WdfRequestComplete(pendingGuestRequest, STATUS_CANCELLED);
+                    bytesReturned = 0;
+                    status = STATUS_CANCELLED;
+                    break;
+                }
+
                 PANYUSB_URB_MESSAGE msg = (PANYUSB_URB_MESSAGE)outputBuffer;
                 RtlZeroMemory(msg, sizeof(ANYUSB_URB_MESSAGE));
                 // Safe 1-based bounded sequence ID (never leaks raw kernel pointer)
@@ -637,18 +711,27 @@ AnyUsbVhci_EvtIoDeviceControl(
                     RtlCopyMemory(msg->SetupPacket, urb->UrbControlTransfer.SetupPacket, sizeof(msg->SetupPacket));
                     msg->TransferBufferLength = urb->UrbControlTransfer.TransferBufferLength;
 
+                    // Reject if requested buffer exceeds single-URB maximum (64 KB)
+                    if (msg->TransferBufferLength > sizeof(msg->Data)) {
+                        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                            "USB Master Pro VHCI: Control transfer size %lu exceeds 64 KB limit. Request rejected.\n",
+                            msg->TransferBufferLength));
+                        WdfRequestUnmarkCancelable(pendingGuestRequest);
+                        WdfSpinLockAcquire(fdoData->PendingUrbLock);
+                        fdoData->PendingRequests[assignedSlot] = NULL;
+                        WdfSpinLockRelease(fdoData->PendingUrbLock);
+                        WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
+                        bytesReturned = 0;
+                        status = STATUS_BUFFER_OVERFLOW;
+                        break;
+                    }
+
                     // If OUT transfer, copy guest payload into msg->Data
-                    if (!(msg->SetupPacket[0] & 0x80)) {
-                        ULONG copyLen = msg->TransferBufferLength;
-                        if (copyLen > sizeof(msg->Data)) {
-                            copyLen = sizeof(msg->Data);
-                        }
-                        if (copyLen > 0) {
-                            PVOID buf = AnyUsb_GetTransferBuffer(urb->UrbControlTransfer.TransferBuffer,
-                                                                 urb->UrbControlTransfer.TransferBufferMDL);
-                            if (buf != NULL) {
-                                RtlCopyMemory(msg->Data, buf, copyLen);
-                            }
+                    if (!(msg->SetupPacket[0] & 0x80) && msg->TransferBufferLength > 0) {
+                        PVOID buf = AnyUsb_GetTransferBuffer(urb->UrbControlTransfer.TransferBuffer,
+                                                             urb->UrbControlTransfer.TransferBufferMDL);
+                        if (buf != NULL) {
+                            RtlCopyMemory(msg->Data, buf, msg->TransferBufferLength);
                         }
                     }
                 } else if (urbFunc == URB_FUNCTION_CONTROL_TRANSFER_EX) {
@@ -657,18 +740,27 @@ AnyUsbVhci_EvtIoDeviceControl(
                     RtlCopyMemory(msg->SetupPacket, urb->UrbControlTransferEx.SetupPacket, sizeof(msg->SetupPacket));
                     msg->TransferBufferLength = urb->UrbControlTransferEx.TransferBufferLength;
 
+                    // Reject if requested buffer exceeds single-URB maximum (64 KB)
+                    if (msg->TransferBufferLength > sizeof(msg->Data)) {
+                        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                            "USB Master Pro VHCI: Control Ex transfer size %lu exceeds 64 KB limit. Request rejected.\n",
+                            msg->TransferBufferLength));
+                        WdfRequestUnmarkCancelable(pendingGuestRequest);
+                        WdfSpinLockAcquire(fdoData->PendingUrbLock);
+                        fdoData->PendingRequests[assignedSlot] = NULL;
+                        WdfSpinLockRelease(fdoData->PendingUrbLock);
+                        WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
+                        bytesReturned = 0;
+                        status = STATUS_BUFFER_OVERFLOW;
+                        break;
+                    }
+
                     // If OUT transfer, copy guest payload into msg->Data
-                    if (!(msg->SetupPacket[0] & 0x80)) {
-                        ULONG copyLen = msg->TransferBufferLength;
-                        if (copyLen > sizeof(msg->Data)) {
-                            copyLen = sizeof(msg->Data);
-                        }
-                        if (copyLen > 0) {
-                            PVOID buf = AnyUsb_GetTransferBuffer(urb->UrbControlTransferEx.TransferBuffer,
-                                                                 urb->UrbControlTransferEx.TransferBufferMDL);
-                            if (buf != NULL) {
-                                RtlCopyMemory(msg->Data, buf, copyLen);
-                            }
+                    if (!(msg->SetupPacket[0] & 0x80) && msg->TransferBufferLength > 0) {
+                        PVOID buf = AnyUsb_GetTransferBuffer(urb->UrbControlTransferEx.TransferBuffer,
+                                                             urb->UrbControlTransferEx.TransferBufferMDL);
+                        if (buf != NULL) {
+                            RtlCopyMemory(msg->Data, buf, msg->TransferBufferLength);
                         }
                     }
                 } else if (urbFunc == URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER) {
@@ -676,18 +768,27 @@ AnyUsbVhci_EvtIoDeviceControl(
                     msg->EndpointAddress = (UCHAR)((ULONG_PTR)urb->UrbBulkOrInterruptTransfer.PipeHandle & 0xFF);
                     msg->TransferBufferLength = urb->UrbBulkOrInterruptTransfer.TransferBufferLength;
 
+                    // Reject if requested buffer exceeds single-URB maximum (64 KB) to prevent silent truncation
+                    if (msg->TransferBufferLength > sizeof(msg->Data)) {
+                        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                            "USB Master Pro VHCI: Bulk transfer size %lu exceeds 64 KB limit. Rejecting without truncation.\n",
+                            msg->TransferBufferLength));
+                        WdfRequestUnmarkCancelable(pendingGuestRequest);
+                        WdfSpinLockAcquire(fdoData->PendingUrbLock);
+                        fdoData->PendingRequests[assignedSlot] = NULL;
+                        WdfSpinLockRelease(fdoData->PendingUrbLock);
+                        WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
+                        bytesReturned = 0;
+                        status = STATUS_BUFFER_OVERFLOW;
+                        break;
+                    }
+
                     // If OUT transfer, copy guest payload into msg->Data
-                    if (!(urb->UrbBulkOrInterruptTransfer.TransferFlags & USBD_TRANSFER_DIRECTION_IN)) {
-                        ULONG copyLen = msg->TransferBufferLength;
-                        if (copyLen > sizeof(msg->Data)) {
-                            copyLen = sizeof(msg->Data);
-                        }
-                        if (copyLen > 0) {
-                            PVOID buf = AnyUsb_GetTransferBuffer(urb->UrbBulkOrInterruptTransfer.TransferBuffer,
-                                                                 urb->UrbBulkOrInterruptTransfer.TransferBufferMDL);
-                            if (buf != NULL) {
-                                RtlCopyMemory(msg->Data, buf, copyLen);
-                            }
+                    if (!(urb->UrbBulkOrInterruptTransfer.TransferFlags & USBD_TRANSFER_DIRECTION_IN) && msg->TransferBufferLength > 0) {
+                        PVOID buf = AnyUsb_GetTransferBuffer(urb->UrbBulkOrInterruptTransfer.TransferBuffer,
+                                                             urb->UrbBulkOrInterruptTransfer.TransferBufferMDL);
+                        if (buf != NULL) {
+                            RtlCopyMemory(msg->Data, buf, msg->TransferBufferLength);
                         }
                     }
                 } else if (urbFunc == URB_FUNCTION_ISOCH_TRANSFER) {
@@ -695,17 +796,26 @@ AnyUsbVhci_EvtIoDeviceControl(
                     msg->EndpointAddress = (UCHAR)((ULONG_PTR)urb->UrbIsochronousTransfer.PipeHandle & 0xFF);
                     msg->TransferBufferLength = urb->UrbIsochronousTransfer.TransferBufferLength;
 
-                    if (!(urb->UrbIsochronousTransfer.TransferFlags & USBD_TRANSFER_DIRECTION_IN)) {
-                        ULONG copyLen = msg->TransferBufferLength;
-                        if (copyLen > sizeof(msg->Data)) {
-                            copyLen = sizeof(msg->Data);
-                        }
-                        if (copyLen > 0) {
-                            PVOID buf = AnyUsb_GetTransferBuffer(urb->UrbIsochronousTransfer.TransferBuffer,
-                                                                 urb->UrbIsochronousTransfer.TransferBufferMDL);
-                            if (buf != NULL) {
-                                RtlCopyMemory(msg->Data, buf, copyLen);
-                            }
+                    // Reject if requested buffer exceeds single-URB maximum (64 KB)
+                    if (msg->TransferBufferLength > sizeof(msg->Data)) {
+                        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                            "USB Master Pro VHCI: Isochronous transfer size %lu exceeds 64 KB limit. Rejecting.\n",
+                            msg->TransferBufferLength));
+                        WdfRequestUnmarkCancelable(pendingGuestRequest);
+                        WdfSpinLockAcquire(fdoData->PendingUrbLock);
+                        fdoData->PendingRequests[assignedSlot] = NULL;
+                        WdfSpinLockRelease(fdoData->PendingUrbLock);
+                        WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
+                        bytesReturned = 0;
+                        status = STATUS_BUFFER_OVERFLOW;
+                        break;
+                    }
+
+                    if (!(urb->UrbIsochronousTransfer.TransferFlags & USBD_TRANSFER_DIRECTION_IN) && msg->TransferBufferLength > 0) {
+                        PVOID buf = AnyUsb_GetTransferBuffer(urb->UrbIsochronousTransfer.TransferBuffer,
+                                                             urb->UrbIsochronousTransfer.TransferBufferMDL);
+                        if (buf != NULL) {
+                            RtlCopyMemory(msg->Data, buf, msg->TransferBufferLength);
                         }
                     }
                 } else {
@@ -742,12 +852,30 @@ AnyUsbVhci_EvtIoDeviceControl(
                 ULONG slot = (ULONG)(seqId - 1);
                 WDFREQUEST targetRequest = NULL;
 
+                // Explicitly reject completion if ActualLength exceeds buffer capacity to prevent truncation
+                if (compReq->ActualLength > sizeof(compReq->Data)) {
+                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                        "USB Master Pro VHCI: compReq ActualLength %lu exceeds buffer size %lu. Rejecting without truncation.\n",
+                        compReq->ActualLength, (ULONG)sizeof(compReq->Data)));
+                    status = STATUS_BUFFER_OVERFLOW;
+                    break;
+                }
+
                 WdfSpinLockAcquire(fdoData->PendingUrbLock);
                 targetRequest = fdoData->PendingRequests[slot];
                 fdoData->PendingRequests[slot] = NULL;
                 WdfSpinLockRelease(fdoData->PendingUrbLock);
 
                 if (targetRequest != NULL) {
+                    // Unmark cancelability before completing to avoid race with cancel routine
+                    NTSTATUS unmarkStatus = WdfRequestUnmarkCancelable(targetRequest);
+                    if (unmarkStatus == STATUS_CANCELLED) {
+                        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+                            "USB Master Pro: SequenceId %llu was cancelled concurrently\n", seqId));
+                        status = STATUS_CANCELLED;
+                        break;
+                    }
+
                     // Retrieve guest WDM IRP and URB from targetRequest
                     PIRP irp = WdfRequestWdmGetIrp(targetRequest);
                     if (irp != NULL) {

@@ -61,13 +61,23 @@ typedef struct _ANYUSB_DETACH_REQUEST {
     ULONG       DeviceId;            // Session device ID to detach
 } ANYUSB_DETACH_REQUEST, *PANYUSB_DETACH_REQUEST;
 
+// Maximum single-URB buffer transfer size (64 KB).
+// NOTE: Single URBs exceeding this ceiling (e.g. uncompressed 2.5 MB slap biometrics or video frames)
+// are strictly REJECTED with STATUS_BUFFER_OVERFLOW to prevent silent data corruption.
+// Transfers exceeding 64 KB must be chunked across multiple URBs.
+#define ANYUSB_MAX_URB_BUFFER_SIZE (64 * 1024)
+
+// Device Interface GUID for PnP enumeration: {A83F122B-5E09-4E65-B6D1-0428B31289A1}
+DEFINE_GUID(GUID_DEVINTERFACE_ANYUSB_VHCI,
+    0xa83f122b, 0x5e09, 0x4e65, 0xb6, 0xd1, 0x04, 0x28, 0xb3, 0x12, 0x89, 0xa1);
+
 // Payload for completing a URB returned from remote peer
 typedef struct _ANYUSB_COMPLETE_REQUEST {
     ULONG       DeviceId;
     ULONG64     SequenceId;
     NTSTATUS    Status;
     ULONG       ActualLength;
-    UCHAR       Data[4096];
+    UCHAR       Data[ANYUSB_MAX_URB_BUFFER_SIZE];
 } ANYUSB_COMPLETE_REQUEST, *PANYUSB_COMPLETE_REQUEST;
 
 // Payload for fetching a pending URB to daemon
@@ -78,7 +88,7 @@ typedef struct _ANYUSB_URB_MESSAGE {
     UCHAR       TransferType; // 0=Control, 1=Isoch, 2=Bulk, 3=Interrupt
     ULONG       TransferBufferLength;
     UCHAR       SetupPacket[8];
-    UCHAR       Data[4096];
+    UCHAR       Data[ANYUSB_MAX_URB_BUFFER_SIZE];
 } ANYUSB_URB_MESSAGE, *PANYUSB_URB_MESSAGE;
 
 #pragma pack(pop)

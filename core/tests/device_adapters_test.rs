@@ -41,7 +41,13 @@ async fn reqwest_like_get(port: u16, path: &str) -> String {
     String::from_utf8_lossy(&buf).to_string()
 }
 
+#[allow(dead_code)]
 async fn reqwest_like_post(port: u16, path: &str, body: &serde_json::Value) -> String {
+    let token = usb_master_core::daemon::read_secure_token_from_disk().unwrap_or_default();
+    reqwest_like_post_with_token(port, path, body, &token).await
+}
+
+async fn reqwest_like_post_with_token(port: u16, path: &str, body: &serde_json::Value, token: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
@@ -51,8 +57,8 @@ async fn reqwest_like_post(port: u16, path: &str, body: &serde_json::Value) -> S
 
     let payload = serde_json::to_string(body).unwrap();
     let req = format!(
-        "POST {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path, port, payload.len(), payload
+        "POST {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Daemon-Token: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path, port, token, payload.len(), payload
     );
     stream.write_all(req.as_bytes()).await.unwrap();
 
@@ -207,10 +213,12 @@ fn test_urb_optimization_pipelines() {
 #[tokio::test]
 async fn test_daemon_license_and_driver_endpoints() {
     let port = find_free_port();
+    let test_token = format!("test_adapter_token_{}", port);
+    let token_clone = test_token.clone();
     let broker_url = "ws://127.0.0.1:8443".to_string();
 
     tokio::spawn(async move {
-        let _ = DaemonServer::run(port, broker_url).await;
+        let _ = DaemonServer::run_with_token(port, broker_url, token_clone).await;
     });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -240,7 +248,7 @@ async fn test_daemon_license_and_driver_endpoints() {
     let bad_payload = serde_json::json!({
         "token": "invalid.license.token"
     });
-    let bad_activate_resp = reqwest_like_post(port, "/api/license/activate", &bad_payload).await;
+    let bad_activate_resp = reqwest_like_post_with_token(port, "/api/license/activate", &bad_payload, &test_token).await;
     assert!(bad_activate_resp.contains("HTTP/1.1 400 Bad Request"));
     assert!(bad_activate_resp.contains("\"success\":false"));
 
@@ -266,7 +274,7 @@ async fn test_daemon_license_and_driver_endpoints() {
     let good_payload = serde_json::json!({
         "token": token
     });
-    let good_activate_resp = reqwest_like_post(port, "/api/license/activate", &good_payload).await;
+    let good_activate_resp = reqwest_like_post_with_token(port, "/api/license/activate", &good_payload, &test_token).await;
     assert!(good_activate_resp.contains("HTTP/1.1 200 OK"));
     assert!(good_activate_resp.contains("\"success\":true"));
     assert!(good_activate_resp.contains("UIDAI Aadhaar Seva Kendra"));

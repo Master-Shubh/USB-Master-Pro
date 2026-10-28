@@ -1,0 +1,487 @@
+//! USB Master Pro — Windows KMDF VHCI Driver Communication Layer
+//! High-performance user-mode bridge connecting daemon to Windows KMDF Root Bus Driver (`\\.\AnyUsbVhci`).
+//! Strictly gated for Windows target OS with standard zero-regression test stubs for POSIX/Linux.
+//! Owned & Developed by BhartX Ecosystems Pvt Ltd.
+
+pub const FILE_DEVICE_ANYUSB_VHCI: u32 = 0x8900;
+
+/// Win32 CTL_CODE macro equivalent:
+/// `((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method)`
+pub const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
+    (device_type << 16) | (access << 14) | (function << 2) | method
+}
+
+pub const METHOD_BUFFERED: u32 = 0;
+pub const METHOD_IN_DIRECT: u32 = 1;
+pub const METHOD_OUT_DIRECT: u32 = 2;
+pub const FILE_ANY_ACCESS: u32 = 0;
+
+// IOCTL codes matching drivers/vhci/vhci.h exactly
+pub const IOCTL_ANYUSB_VHCI_INIT_BUS: u32 =
+    ctl_code(FILE_DEVICE_ANYUSB_VHCI, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS);
+pub const IOCTL_ANYUSB_VHCI_ATTACH_DEVICE: u32 =
+    ctl_code(FILE_DEVICE_ANYUSB_VHCI, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS);
+pub const IOCTL_ANYUSB_VHCI_DETACH_DEVICE: u32 =
+    ctl_code(FILE_DEVICE_ANYUSB_VHCI, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS);
+pub const IOCTL_ANYUSB_VHCI_FETCH_PENDING_URB: u32 =
+    ctl_code(FILE_DEVICE_ANYUSB_VHCI, 0x804, METHOD_OUT_DIRECT, FILE_ANY_ACCESS);
+pub const IOCTL_ANYUSB_VHCI_COMPLETE_URB: u32 =
+    ctl_code(FILE_DEVICE_ANYUSB_VHCI, 0x805, METHOD_IN_DIRECT, FILE_ANY_ACCESS);
+pub const IOCTL_ANYUSB_VHCI_ABORT_PIPE: u32 =
+    ctl_code(FILE_DEVICE_ANYUSB_VHCI, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS);
+
+/// 64 KB buffer cap to accommodate large fingerprint slaps, iris frames, and high-throughput bulk streams
+pub const ANYUSB_MAX_URB_BUFFER_SIZE: usize = 64 * 1024;
+pub const ANYUSB_MAX_PENDING_URBS: usize = 256;
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct AnyUsbAttachRequest {
+    pub device_id: u32,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    pub bcd_device: u16,
+    pub device_class: u8,
+    pub device_subclass: u8,
+    pub device_protocol: u8,
+    pub speed: u8,
+    pub serial_number: [u16; 64],
+    pub manufacturer: [u16; 64],
+    pub product_description: [u16; 128],
+    pub raw_descriptor_length: u32,
+    pub raw_descriptors: [u8; 1024],
+}
+
+impl Default for AnyUsbAttachRequest {
+    fn default() -> Self {
+        Self {
+            device_id: 0,
+            vendor_id: 0,
+            product_id: 0,
+            bcd_device: 0,
+            device_class: 0,
+            device_subclass: 0,
+            device_protocol: 0,
+            speed: 3, // HighSpeed default (480 Mbps)
+            serial_number: [0u16; 64],
+            manufacturer: [0u16; 64],
+            product_description: [0u16; 128],
+            raw_descriptor_length: 0,
+            raw_descriptors: [0u8; 1024],
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AnyUsbDetachRequest {
+    pub device_id: u32,
+}
+
+#[repr(C, packed)]
+pub struct AnyUsbCompleteRequest {
+    pub device_id: u32,
+    pub sequence_id: u64,
+    pub status: i32,
+    pub actual_length: u32,
+    pub data: [u8; ANYUSB_MAX_URB_BUFFER_SIZE],
+}
+
+impl Default for AnyUsbCompleteRequest {
+    fn default() -> Self {
+        Self {
+            device_id: 0,
+            sequence_id: 0,
+            status: 0,
+            actual_length: 0,
+            data: [0u8; ANYUSB_MAX_URB_BUFFER_SIZE],
+        }
+    }
+}
+
+#[repr(C, packed)]
+pub struct AnyUsbUrbMessage {
+    pub device_id: u32,
+    pub sequence_id: u64,
+    pub endpoint_address: u8,
+    pub transfer_type: u8,
+    pub transfer_buffer_length: u32,
+    pub setup_packet: [u8; 8],
+    pub data: [u8; ANYUSB_MAX_URB_BUFFER_SIZE],
+}
+
+impl Default for AnyUsbUrbMessage {
+    fn default() -> Self {
+        Self {
+            device_id: 0,
+            sequence_id: 0,
+            endpoint_address: 0,
+            transfer_type: 0,
+            transfer_buffer_length: 0,
+            setup_packet: [0u8; 8],
+            data: [0u8; ANYUSB_MAX_URB_BUFFER_SIZE],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DriverClientError {
+    #[error("Driver device not found or access denied: {0}")]
+    DeviceNotFound(String),
+
+    #[error("DeviceIoControl failure: IOCTL 0x{ioctl:08X} returned Windows error {win_error}")]
+    IoControlFailed { ioctl: u32, win_error: u32 },
+
+    #[error("Driver buffer overflow or invalid parameter: {0}")]
+    InvalidParameter(String),
+
+    #[error("No pending URBs available from virtual bus controller")]
+    NoMoreEntries,
+
+    #[error("Driver operation not supported on this platform: {0}")]
+    NotSupported(String),
+}
+
+// ---------------------------------------------------------------------------
+// WINDOWS IMPLEMENTATION: Direct Win32 DeviceIoControl against \\.\AnyUsbVhci
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+pub struct VhciDriverClient {
+    handle: *mut std::ffi::c_void,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for VhciDriverClient {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for VhciDriverClient {}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateFileW(
+        lpFileName: *const u16,
+        dwDesiredAccess: u32,
+        dwShareMode: u32,
+        lpSecurityAttributes: *mut std::ffi::c_void,
+        dwCreationDisposition: u32,
+        dwFlagsAndAttributes: u32,
+        hTemplateFile: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+
+    fn DeviceIoControl(
+        hDevice: *mut std::ffi::c_void,
+        dwIoControlCode: u32,
+        lpInBuffer: *const std::ffi::c_void,
+        nInBufferSize: u32,
+        lpOutBuffer: *mut std::ffi::c_void,
+        nOutBufferSize: u32,
+        lpBytesReturned: *mut u32,
+        lpOverlapped: *mut std::ffi::c_void,
+    ) -> i32;
+
+    fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    fn GetLastError() -> u32;
+}
+
+#[cfg(target_os = "windows")]
+impl VhciDriverClient {
+    pub const DEVICE_PATH: &'static str = "\\\\.\\AnyUsbVhci";
+
+    pub fn open() -> Result<Self, DriverClientError> {
+        let wide_path: Vec<u16> = "\\\\.\\AnyUsbVhci\0".encode_utf16().collect();
+        const GENERIC_READ: u32 = 0x80000000;
+        const GENERIC_WRITE: u32 = 0x40000000;
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
+        const OPEN_EXISTING: u32 = 3;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+        const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            let err = unsafe { GetLastError() };
+            return Err(DriverClientError::DeviceNotFound(format!(
+                "Failed to open '{}' (GetLastError: {})",
+                Self::DEVICE_PATH,
+                err
+            )));
+        }
+
+        Ok(Self { handle })
+    }
+
+    pub fn init_bus(&self) -> Result<(), DriverClientError> {
+        let mut bytes_returned: u32 = 0;
+        let res = unsafe {
+            DeviceIoControl(
+                self.handle,
+                IOCTL_ANYUSB_VHCI_INIT_BUS,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if res == 0 {
+            let err = unsafe { GetLastError() };
+            return Err(DriverClientError::IoControlFailed {
+                ioctl: IOCTL_ANYUSB_VHCI_INIT_BUS,
+                win_error: err,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn attach_device(&self, req: &AnyUsbAttachRequest) -> Result<(), DriverClientError> {
+        let mut bytes_returned: u32 = 0;
+        let res = unsafe {
+            DeviceIoControl(
+                self.handle,
+                IOCTL_ANYUSB_VHCI_ATTACH_DEVICE,
+                req as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<AnyUsbAttachRequest>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if res == 0 {
+            let err = unsafe { GetLastError() };
+            return Err(DriverClientError::IoControlFailed {
+                ioctl: IOCTL_ANYUSB_VHCI_ATTACH_DEVICE,
+                win_error: err,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn detach_device(&self, device_id: u32) -> Result<(), DriverClientError> {
+        let req = AnyUsbDetachRequest { device_id };
+        let mut bytes_returned: u32 = 0;
+        let res = unsafe {
+            DeviceIoControl(
+                self.handle,
+                IOCTL_ANYUSB_VHCI_DETACH_DEVICE,
+                &req as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<AnyUsbDetachRequest>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if res == 0 {
+            let err = unsafe { GetLastError() };
+            return Err(DriverClientError::IoControlFailed {
+                ioctl: IOCTL_ANYUSB_VHCI_DETACH_DEVICE,
+                win_error: err,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn fetch_pending_urb(&self) -> Result<Option<Box<AnyUsbUrbMessage>>, DriverClientError> {
+        let mut msg = Box::new(AnyUsbUrbMessage::default());
+        let mut bytes_returned: u32 = 0;
+        let res = unsafe {
+            DeviceIoControl(
+                self.handle,
+                IOCTL_ANYUSB_VHCI_FETCH_PENDING_URB,
+                std::ptr::null(),
+                0,
+                msg.as_mut() as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<AnyUsbUrbMessage>() as u32,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if res == 0 {
+            let err = unsafe { GetLastError() };
+            if err == 259 {
+                // ERROR_NO_MORE_ITEMS (STATUS_NO_MORE_ENTRIES)
+                return Ok(None);
+            }
+            return Err(DriverClientError::IoControlFailed {
+                ioctl: IOCTL_ANYUSB_VHCI_FETCH_PENDING_URB,
+                win_error: err,
+            });
+        }
+        Ok(Some(msg))
+    }
+
+    pub fn complete_urb(&self, req: &AnyUsbCompleteRequest) -> Result<(), DriverClientError> {
+        let actual_len = req.actual_length;
+        if actual_len as usize > ANYUSB_MAX_URB_BUFFER_SIZE {
+            return Err(DriverClientError::InvalidParameter(format!(
+                "Transfer length ({} B) exceeds maximum single-URB buffer limit ({} B). Transfers >64 KB require chunking.",
+                actual_len, ANYUSB_MAX_URB_BUFFER_SIZE
+            )));
+        }
+
+        let mut bytes_returned: u32 = 0;
+        let res = unsafe {
+            DeviceIoControl(
+                self.handle,
+                IOCTL_ANYUSB_VHCI_COMPLETE_URB,
+                req as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<AnyUsbCompleteRequest>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if res == 0 {
+            let err = unsafe { GetLastError() };
+            return Err(DriverClientError::IoControlFailed {
+                ioctl: IOCTL_ANYUSB_VHCI_COMPLETE_URB,
+                win_error: err,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for VhciDriverClient {
+    fn drop(&mut self) {
+        const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+        if !self.handle.is_null() && self.handle != INVALID_HANDLE_VALUE {
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POSIX / LINUX IMPLEMENTATION: Test & cross-platform emulation stub
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_os = "windows"))]
+pub struct VhciDriverClient {
+    pub simulated_device_count: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl VhciDriverClient {
+    pub const DEVICE_PATH: &'static str = "/dev/anyusb_vhci";
+
+    pub fn open() -> Result<Self, DriverClientError> {
+        Ok(Self {
+            simulated_device_count: std::sync::atomic::AtomicU32::new(0),
+        })
+    }
+
+    pub fn init_bus(&self) -> Result<(), DriverClientError> {
+        Ok(())
+    }
+
+    pub fn attach_device(&self, _req: &AnyUsbAttachRequest) -> Result<(), DriverClientError> {
+        self.simulated_device_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn detach_device(&self, _device_id: u32) -> Result<(), DriverClientError> {
+        let prev = self.simulated_device_count.load(std::sync::atomic::Ordering::SeqCst);
+        if prev > 0 {
+            self.simulated_device_count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    pub fn fetch_pending_urb(&self) -> Result<Option<Box<AnyUsbUrbMessage>>, DriverClientError> {
+        Ok(None)
+    }
+
+    pub fn complete_urb(&self, req: &AnyUsbCompleteRequest) -> Result<(), DriverClientError> {
+        let actual_len = req.actual_length;
+        if actual_len as usize > ANYUSB_MAX_URB_BUFFER_SIZE {
+            return Err(DriverClientError::InvalidParameter(format!(
+                "Transfer length ({} B) exceeds maximum single-URB buffer limit ({} B). Transfers >64 KB require chunking.",
+                actual_len, ANYUSB_MAX_URB_BUFFER_SIZE
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ioctl_codes_match_driver_vhci_header() {
+        assert_eq!(IOCTL_ANYUSB_VHCI_INIT_BUS, 0x89002004);
+        assert_eq!(IOCTL_ANYUSB_VHCI_ATTACH_DEVICE, 0x89002008);
+        assert_eq!(IOCTL_ANYUSB_VHCI_DETACH_DEVICE, 0x8900200C);
+        assert_eq!(IOCTL_ANYUSB_VHCI_FETCH_PENDING_URB, 0x89002012);
+        assert_eq!(IOCTL_ANYUSB_VHCI_COMPLETE_URB, 0x89002015);
+        assert_eq!(IOCTL_ANYUSB_VHCI_ABORT_PIPE, 0x89002018);
+    }
+
+    #[test]
+    fn test_driver_struct_sizes_and_alignments() {
+        assert_eq!(std::mem::size_of::<AnyUsbDetachRequest>(), 4);
+        assert_eq!(std::mem::size_of::<AnyUsbAttachRequest>(), 1554);
+        assert_eq!(std::mem::size_of::<AnyUsbCompleteRequest>(), 65556);
+        assert_eq!(std::mem::size_of::<AnyUsbUrbMessage>(), 65562);
+    }
+
+    #[test]
+    fn test_driver_client_lifecycle_stub() {
+        let client = VhciDriverClient::open().expect("Failed to open driver client");
+        client.init_bus().expect("Init bus failed");
+
+        let attach_req = AnyUsbAttachRequest {
+            device_id: 101,
+            vendor_id: 0x27D0, // Mantra MFS100
+            product_id: 0x0041,
+            ..Default::default()
+        };
+        client.attach_device(&attach_req).expect("Attach device failed");
+        assert_eq!(client.simulated_device_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let pending = client.fetch_pending_urb().expect("Fetch pending URB failed");
+        assert!(pending.is_none());
+
+        client.detach_device(101).expect("Detach device failed");
+        assert_eq!(client.simulated_device_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_oversized_transfer_rejected_without_truncation() {
+        let client = VhciDriverClient::open().expect("Failed to open driver client");
+
+        // Attempting to complete a 2.5 MB slap scanner buffer in a single URB without multi-buffer chunking
+        let req = AnyUsbCompleteRequest {
+            device_id: 1,
+            sequence_id: 42,
+            status: 0,
+            actual_length: 2_500_000, // 2.5 MB slap frame
+            data: [0u8; ANYUSB_MAX_URB_BUFFER_SIZE],
+        };
+
+        let result = client.complete_urb(&req);
+        assert!(result.is_err(), "Oversized transfer must NOT be accepted or silently truncated");
+        match result.unwrap_err() {
+            DriverClientError::InvalidParameter(msg) => {
+                assert!(msg.contains("exceeds maximum single-URB buffer limit"));
+            }
+            other => panic!("Expected InvalidParameter error, got {:?}", other),
+        }
+    }
+}
