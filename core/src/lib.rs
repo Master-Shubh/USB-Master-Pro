@@ -10,6 +10,7 @@ pub mod identity;
 pub mod device_reset;
 pub mod loopback_test;
 pub mod protocol;
+pub mod state;
 pub mod urb_engine;
 pub mod usb_descriptors;
 
@@ -19,9 +20,14 @@ pub use daemon::DaemonServer;
 pub use device_reset::{DeviceOperationalState, DeviceResetController, ResetMethod};
 pub use enumerator::{HardwareEnumerator, UsbDeviceInfo};
 pub use hardware_db::{DeviceCategory, HardwareClassifier};
-pub use identity::NodeIdentity;
+pub use identity::{validate_connection_id_format, Ed25519Keypair, InstallationKeypair, NodeIdentity};
 pub use loopback_test::{SimulatedBiometricDevice, VirtualLoopbackPipeline};
-pub use protocol::{TurboUrbHeader, TransferType, CMD_SUBMIT_URB, CMD_COMPLETE_URB};
+pub use protocol::{
+    classify_operation, OperationSafety, TransferType, TurboUrbHeader, CMD_ATTACH_DEVICE,
+    CMD_COMPLETE_URB, CMD_DETACH_DEVICE, CMD_PING, CMD_PONG, CMD_RESET_DEVICE, CMD_SUBMIT_URB,
+    CMD_UNLINK_URB, MAX_PAYLOAD_LENGTH,
+};
+pub use state::{can_transition, transitory_timeout, SessionState, SessionStateMachine, StateTransitionError};
 pub use urb_engine::{
     PipeState, UrbCompletion, UrbEngine, UrbIsoPacket, UrbPayload, UrbPipe, UrbRequest,
     UsbSetupPacket, USBD_STATUS_CANCELED, USBD_STATUS_STALL_PID, USBD_STATUS_SUCCESS,

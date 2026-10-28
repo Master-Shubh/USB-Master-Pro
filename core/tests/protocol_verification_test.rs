@@ -91,10 +91,10 @@ fn test_buffer_truncation_detection() {
 #[test]
 fn test_boundary_conditions() {
     let test_cases = vec![
-        // Extreme sequence IDs
+        // Extreme sequence IDs within valid MAX_PAYLOAD_LENGTH bounds
         (0u64, 0u32, 0x00u8, TransferType::Control, 0u32, 0i32),
         (1u64, 1u32, 0x01u8, TransferType::Isochronous, 1u32, 1i32),
-        (u64::MAX, u32::MAX, 0xFFu8, TransferType::Bulk, u32::MAX, -1i32),
+        (u64::MAX, u32::MAX, 0xFFu8, TransferType::Bulk, MAX_PAYLOAD_LENGTH, -1i32),
         (u64::MAX - 1, u32::MAX - 1, 0x8Fu8, TransferType::Interrupt, 1024 * 1024, i32::MIN),
         (123456789012345u64, 999999u32, 0x81u8, TransferType::Bulk, 65536, i32::MAX),
     ];
@@ -116,6 +116,14 @@ fn test_boundary_conditions() {
         assert_eq!(parsed.status, status);
         assert_eq!(parsed.actual_length, buf_len.min(16384));
     }
+
+    // Verify boundary violation for u32::MAX
+    let oversize_hdr = TurboUrbHeader::new(CMD_COMPLETE_URB, 1, 1, 0x81, TransferType::Bulk, u32::MAX);
+    let oversize_bytes = oversize_hdr.serialize();
+    assert_eq!(
+        TurboUrbHeader::deserialize(&oversize_bytes).unwrap_err(),
+        "Frame length exceeds maximum allowed ceiling (16 MB)"
+    );
 }
 
 #[test]

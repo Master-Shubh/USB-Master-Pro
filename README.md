@@ -38,21 +38,49 @@
 
 ---
 
-## 📁 Repository Structure
+## 📁 Repository & Architectural Documentation Suite
+
+USB Master Pro v1.0 strictly adheres to the **Universal USB Connect (UUC) Master Product Plan & Technical Architecture Blueprint**:
 
 ```
 USB Master Pro/
+├── docs/                              # Authoritative Architecture & Specification Suite
+│   ├── ARCHITECTURE.md                # System topology, control vs data plane, 12-state FSM, driver boundaries
+│   ├── THREAT_MODEL.md                # STRIDE threat matrix, DREAD scoring, UIDAI biometric zero-retention
+│   ├── DEVICE_COMPATIBILITY.md        # 4 compatibility tiers, certified hardware matrix (Mantra, Morpho, etc.)
+│   ├── PROTOCOL_SPEC.md               # 36-byte packed TurboUrbHeader (0x54555242), command codes, retry safety
+│   ├── API_SPEC.md                    # Local IPC REST & WebSocket API, signaling broker protocol
+│   ├── TEST_PLAN.md                   # Acceptance test matrix, 6 test suites, release gate checklist
+│   ├── RELEASE_RUNBOOK.md             # Cloud CI/CD, zero-reboot driver staging, emergency rollback playbook
+│   ├── AGENT_GUIDELINES.md            # The Seven Sacred Invariants for all engineering agents
+│   ├── microsoft_whql_compliance_playbook.md
+│   └── adr/                           # 10 Architecture Decision Records (ADR-001 to ADR-010)
 ├── core/                              # High-performance Rust Turbo-URB Core Engine
 │   ├── Cargo.toml
-│   └── src/
-│       ├── bin/cli.rs                 # AnyDesk-style CLI client with live benchmark
-│       ├── buffer_pool.rs             # Zero-allocation slab memory pool
-│       ├── compression.rs             # Adaptive Zstandard streaming compression
-│       ├── enumerator.rs              # SetupAPI / CfgMgr32 hardware scanner
-│       ├── hardware_db.rs             # OEM Biometric, UVC, & Printer heuristic database
-│       ├── identity.rs                # 9-digit AnyDesk-style ID generator
-│       ├── lib.rs
-│       └── protocol.rs                # 36-byte Turbo-URB binary packet framing
+│   ├── src/
+│   │   ├── bin/cli.rs                 # AnyDesk-style CLI client with live benchmark
+│   │   ├── bin/daemon.rs              # Background Turbo-URB hardware daemon
+│   │   ├── buffer_pool.rs             # Zero-allocation slab memory pool
+│   │   ├── compression.rs             # Adaptive Zstandard streaming compression
+│   │   ├── daemon.rs                  # Axum embedded IPC server & WebUI host
+│   │   ├── device_reset.rs            # Hardware reset & surprise-removal state machine
+│   │   ├── enumerator.rs              # SetupAPI / CfgMgr32 hardware scanner
+│   │   ├── hardware_db.rs             # OEM Biometric, UVC, & Printer heuristic database
+│   │   ├── identity.rs                # 9-digit AnyUSB ID & Ed25519 installation keypair
+│   │   ├── lib.rs
+│   │   ├── loopback_test.rs           # In-memory virtual hardware pipeline
+│   │   ├── protocol.rs                # 36-byte Turbo-URB framing (16 MB cap, retry safety)
+│   │   ├── state.rs                   # Canonical 12-state session finite automaton
+│   │   ├── urb_engine.rs              # USBD URB state machine & speculative read ring
+│   │   └── usb_descriptors.rs         # Zero-copy USB descriptor parser
+│   └── tests/                         # Automated End-to-End & Stress Test Suite (55 tests)
+│       ├── biometric_simulation_test.rs
+│       ├── concurrency_race_test.rs
+│       ├── daemon_ipc_test.rs
+│       ├── device_reset_test.rs
+│       ├── e2e_integration_test.rs
+│       ├── protocol_verification_test.rs
+│       └── synthetic_session_test.rs  # Milestone P0 synthetic session verification
 ├── drivers/                           # Windows KMDF 1.33 Kernel Drivers
 │   ├── vhci/                          # Virtual Host Controller Driver (anyusb_vhci.sys)
 │   │   ├── driver.c
