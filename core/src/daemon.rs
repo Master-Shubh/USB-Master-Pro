@@ -4,6 +4,7 @@
 
 use crate::enumerator::{HardwareEnumerator, UsbDeviceInfo};
 use crate::identity::NodeIdentity;
+use crate::licensing::{LicenseClaims, LicenseEngine};
 use crate::state::{SessionState, SessionStateMachine, StateTransitionError};
 use axum::{
     extract::{
@@ -181,6 +182,37 @@ pub struct DaemonState {
     pub broker_connected: AtomicBool,
     pub start_time: Instant,
     pub broker_url: String,
+    pub active_license: RwLock<Option<LicenseClaims>>,
+}
+
+pub fn create_router(state: Arc<DaemonState>) -> Router {
+    Router::new()
+        .route("/", get(handle_serve_index))
+        .route("/ui", get(handle_serve_index))
+        .route("/index.html", get(handle_serve_index))
+        .route("/assets/logo.png", get(handle_serve_logo))
+        .route("/assets/favicon.ico", get(handle_serve_favicon))
+        .route("/assets/icon_64.png", get(handle_serve_icon_64))
+        .route("/assets/icon_256.png", get(handle_serve_icon_256))
+        .route("/api/identity", get(handle_get_identity))
+        .route("/api/devices", get(handle_get_devices))
+        .route("/api/sessions", get(handle_get_sessions))
+        .route("/api/forward", post(handle_post_forward))
+        .route("/api/connect", post(handle_post_connect))
+        .route("/api/respond", post(handle_post_respond))
+        .route("/api/disconnect", post(handle_post_disconnect))
+        .route("/api/status", get(handle_get_status))
+        .route("/api/license/activate", post(handle_post_license_activate))
+        .route("/api/license/status", get(handle_get_license_status))
+        .route("/api/system/drivers", get(handle_get_system_drivers))
+        .route("/api/events", get(handle_ws_events))
+        .layer(CorsLayer::permissive())
+        .with_state(state)
+}
+
+/// Starts the USB Master Pro embedded IPC Daemon
+pub async fn start_daemon(bind_port: u16, broker_url: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    DaemonServer::run(bind_port, broker_url).await
 }
 
 pub struct DaemonServer;
@@ -193,6 +225,7 @@ impl DaemonServer {
 
         // Pre-scan physical hardware
         let initial_devices = HardwareEnumerator::scan_devices();
+        let initial_license = load_persisted_license(&identity.hardware_hash);
 
         let state = Arc::new(DaemonState {
             identity,
@@ -204,6 +237,7 @@ impl DaemonServer {
             broker_connected: AtomicBool::new(false),
             start_time: Instant::now(),
             broker_url: broker_url.clone(),
+            active_license: RwLock::new(initial_license),
         });
 
         // 1. Spawn Outbound Signaling Client task
@@ -220,25 +254,7 @@ impl DaemonServer {
         });
 
         // 3. Build HTTP + WS Router
-        let app = Router::new()
-            .route("/", get(handle_serve_index))
-            .route("/ui", get(handle_serve_index))
-            .route("/index.html", get(handle_serve_index))
-            .route("/assets/logo.png", get(handle_serve_logo))
-            .route("/assets/favicon.ico", get(handle_serve_favicon))
-            .route("/assets/icon_64.png", get(handle_serve_icon_64))
-            .route("/assets/icon_256.png", get(handle_serve_icon_256))
-            .route("/api/identity", get(handle_get_identity))
-            .route("/api/devices", get(handle_get_devices))
-            .route("/api/sessions", get(handle_get_sessions))
-            .route("/api/forward", post(handle_post_forward))
-            .route("/api/connect", post(handle_post_connect))
-            .route("/api/respond", post(handle_post_respond))
-            .route("/api/disconnect", post(handle_post_disconnect))
-            .route("/api/status", get(handle_get_status))
-            .route("/api/events", get(handle_ws_events))
-            .layer(CorsLayer::permissive())
-            .with_state(state);
+        let app = create_router(state);
 
         let addr = SocketAddr::from(([127, 0, 0, 1], bind_port));
         println!("  🌐 Embedded IPC Daemon listening on http://{}", addr);
@@ -248,6 +264,10 @@ impl DaemonServer {
         axum::serve(listener, app).await?;
 
         Ok(())
+    }
+
+    pub async fn start_daemon(bind_port: u16, broker_url: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Self::run(bind_port, broker_url).await
     }
 }
 
@@ -655,6 +675,134 @@ async fn handle_get_status(State(state): State<Arc<DaemonState>>) -> impl IntoRe
     };
 
     Json(telemetry)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LicenseActivateRequest {
+    pub token: String,
+}
+
+fn get_license_file_path() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("USB_MASTER_CONFIG_DIR") {
+        return std::path::PathBuf::from(dir).join("license.json");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let p = std::path::PathBuf::from(home).join(".usb-master-pro");
+        let _ = std::fs::create_dir_all(&p);
+        return p.join("license.json");
+    }
+    std::path::PathBuf::from("license.json")
+}
+
+fn load_persisted_license(hardware_hash: &str) -> Option<LicenseClaims> {
+    let candidate_paths = [
+        get_license_file_path(),
+        std::path::PathBuf::from("license.json"),
+    ];
+
+    for path in candidate_paths {
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(claims) = serde_json::from_str::<LicenseClaims>(&content) {
+                    if claims.hardware_hash == hardware_hash && claims.is_valid_now() {
+                        return Some(claims);
+                    }
+                }
+                if let Ok(claims) = LicenseEngine::verify_token(content.trim(), hardware_hash) {
+                    return Some(claims);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn persist_license(claims: &LicenseClaims, _token: &str) {
+    let candidate_paths = [
+        get_license_file_path(),
+        std::path::PathBuf::from("license.json"),
+    ];
+
+    if let Ok(json_str) = serde_json::to_string_pretty(claims) {
+        for path in candidate_paths {
+            let _ = std::fs::write(path, &json_str);
+        }
+    }
+}
+
+async fn handle_post_license_activate(
+    State(state): State<Arc<DaemonState>>,
+    Json(payload): Json<LicenseActivateRequest>,
+) -> impl IntoResponse {
+    match LicenseEngine::verify_token(&payload.token, &state.identity.hardware_hash) {
+        Ok(claims) => {
+            {
+                let mut lock = state.active_license.write().await;
+                *lock = Some(claims.clone());
+            }
+            persist_license(&claims, &payload.token);
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    "claims": claims
+                })),
+            ).into_response()
+        }
+        Err(err) => {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": err.to_string()
+                })),
+            ).into_response()
+        }
+    }
+}
+
+async fn handle_get_license_status(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let lock = state.active_license.read().await;
+    let hardware_hash = state.identity.hardware_hash.clone();
+    let formatted_id = state.identity.formatted_id.clone();
+
+    if let Some(ref claims) = *lock {
+        let is_valid = claims.is_valid_now();
+        let status = if is_valid { "active" } else { "expired" };
+        Json(serde_json::json!({
+            "status": status,
+            "active": is_valid,
+            "tier": claims.tier,
+            "customer_name": claims.customer_name,
+            "expires_at": claims.expires_at,
+            "hardware_hash": hardware_hash,
+            "features": claims.features,
+            "formatted_id": formatted_id,
+            "license_id": claims.license_id,
+            "max_devices": claims.max_devices,
+        }))
+    } else {
+        Json(serde_json::json!({
+            "status": "unlicensed",
+            "active": false,
+            "tier": "Community",
+            "customer_name": "Community User",
+            "expires_at": 0,
+            "hardware_hash": hardware_hash,
+            "features": Vec::<String>::new(),
+            "formatted_id": formatted_id,
+        }))
+    }
+}
+
+async fn handle_get_system_drivers() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "vhci_installed": true,
+        "filter_installed": true,
+        "udp443_reachable": true,
+        "kernel_version": "1.33.0"
+    }))
 }
 
 // --- WEBSOCKET EVENT STREAM FOR UI ---

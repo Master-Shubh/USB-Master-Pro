@@ -2,6 +2,8 @@
 target/
 **/*.rs.bk
 Cargo.lock
+license.json
+**/license.json
 
 # Node.js
 node_modules/

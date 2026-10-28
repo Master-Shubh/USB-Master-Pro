@@ -1,6 +1,7 @@
 //! USB Master Pro Core Library
 //! Next-generation, high-performance, single-binary P2P USB virtualization engine.
 
+pub mod adapters;
 pub mod buffer_pool;
 pub mod compression;
 pub mod daemon;
@@ -16,9 +17,14 @@ pub mod state;
 pub mod urb_engine;
 pub mod usb_descriptors;
 
+pub use adapters::{
+    AdapterError, AdapterRegistry, GpsGnssAdapter, IDeviceAdapter, IrisScannersAdapter,
+    MantraMfs100Adapter, MorphoMso1300Adapter, SlapScannersAdapter, StartekFm220Adapter,
+    UrbWireMessage,
+};
 pub use buffer_pool::BufferPool;
 pub use compression::TurboCompressor;
-pub use daemon::DaemonServer;
+pub use daemon::{start_daemon, DaemonServer};
 pub use device_reset::{DeviceOperationalState, DeviceResetController, ResetMethod};
 pub use enumerator::{HardwareEnumerator, UsbDeviceInfo};
 pub use hardware_db::{DeviceCategory, HardwareClassifier};

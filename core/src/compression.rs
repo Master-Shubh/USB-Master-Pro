@@ -34,6 +34,11 @@ impl TurboCompressor {
         }
     }
 
+    /// Compresses a buffer with Zstandard Level 1.
+    pub fn compress(data: &[u8]) -> Result<Vec<u8>, io::Error> {
+        zstd::encode_all(data, ZSTD_FAST_LEVEL)
+    }
+
     /// Decompresses a Zstandard-compressed payload.
     pub fn decompress(compressed_data: &[u8]) -> Result<Vec<u8>, io::Error> {
         zstd::decode_all(compressed_data)
