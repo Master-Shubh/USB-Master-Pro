@@ -947,8 +947,31 @@ async fn handle_broker_message(state: &Arc<DaemonState>, raw_json: &str) {
                     "reason": msg["reason"]
                 }));
             }
+            "REGISTER_CHALLENGE" => {
+                if let Some(nonce) = msg["nonce"].as_str() {
+                    let proof = state.identity.create_registration_proof(nonce);
+                    let proof_msg = serde_json::json!({
+                        "type": "REGISTER_PROOF",
+                        "id": state.identity.raw_id.to_string(),
+                        "publicKey": state.identity.installation_public_key,
+                        "signature": proof,
+                        "info": {
+                            "hostname": std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")).unwrap_or_else(|_| "Host".to_string()),
+                            "os": std::env::consts::OS,
+                            "devices": *state.devices.read().await,
+                            "version": "1.0.0"
+                        }
+                    });
+                    let _ = state.broker_tx.send(proof_msg).await;
+                }
+            }
             "REGISTER_RESP" => {
-                println!("  ✅ Broker registration acknowledged: ID [{}]", msg["id"]);
+                let verified = msg["verified"].as_bool().unwrap_or(false);
+                if verified {
+                    println!("  🔒 Broker cryptographically verified node: ID [{}]", msg["id"]);
+                } else {
+                    println!("  ✅ Broker registration acknowledged: ID [{}]", msg["id"]);
+                }
             }
             "PONG" => {}
             _ => {

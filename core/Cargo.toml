@@ -20,6 +20,8 @@ axum = { version = "0.7", features = ["ws", "json"] }
 tower-http = { version = "0.5", features = ["cors"] }
 tokio-tungstenite = "0.23"
 futures-util = "0.3"
+base64 = "0.22"
+thiserror = "1.0"
 
 [lib]
 name = "usb_master_core"

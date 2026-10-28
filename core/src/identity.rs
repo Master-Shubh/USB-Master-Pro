@@ -198,8 +198,78 @@ impl NodeIdentity {
 
     /// Returns the installation cryptographic keypair deterministically bound to this node's hardware hash
     pub fn installation_keypair(&self) -> InstallationKeypair {
-        InstallationKeypair::from_hardware_entropy(self.hardware_hash.as_bytes())
+        if let Ok(bytes) = hex::decode(&self.hardware_hash) {
+            InstallationKeypair::from_hardware_entropy(&bytes)
+        } else {
+            InstallationKeypair::from_hardware_entropy(self.hardware_hash.as_bytes())
+        }
     }
+
+    /// Creates an Ed25519 cryptographic registration proof for broker challenge-response authentication.
+    /// Signs "USB_MASTER_REGISTER:<formatted_id>:<nonce>" with the node's Ed25519 private key
+    /// and returns a 128-character hex-encoded signature.
+    pub fn create_registration_proof(&self, nonce: &str) -> String {
+        let message = format!("USB_MASTER_REGISTER:{}:{}", self.formatted_id, nonce);
+        let keypair = self.installation_keypair();
+        let sig = keypair.sign(message.as_bytes());
+        hex::encode(sig)
+    }
+}
+
+/// Verifies an Ed25519 registration proof against a public key, peer ID, and challenge nonce.
+/// Verifies the signature over "USB_MASTER_REGISTER:<id>:<nonce>".
+/// Transparently handles both formatted ("482 190 334") and unformatted ("482190334") IDs.
+pub fn verify_registration_proof(
+    public_key_hex: &str,
+    id: &str,
+    nonce: &str,
+    signature_hex: &str,
+) -> bool {
+    if signature_hex.len() != 128 || public_key_hex.len() != 64 {
+        return false;
+    }
+
+    let pubkey_bytes = match hex::decode(public_key_hex) {
+        Ok(b) if b.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return false,
+    };
+
+    let sig_bytes = match hex::decode(signature_hex) {
+        Ok(b) if b.len() == 64 => {
+            let mut arr = [0u8; 64];
+            arr.copy_from_slice(&b);
+            arr
+        }
+        _ => return false,
+    };
+
+    let msg1 = format!("USB_MASTER_REGISTER:{}:{}", id, nonce);
+    if InstallationKeypair::verify_with_public_key(&pubkey_bytes, msg1.as_bytes(), &sig_bytes) {
+        return true;
+    }
+
+    let clean_id: String = id.chars().filter(|c| !c.is_whitespace()).collect();
+    if clean_id.len() == 9 {
+        let formatted = format!("{} {} {}", &clean_id[0..3], &clean_id[3..6], &clean_id[6..9]);
+        if formatted != id {
+            let msg2 = format!("USB_MASTER_REGISTER:{}:{}", formatted, nonce);
+            if InstallationKeypair::verify_with_public_key(&pubkey_bytes, msg2.as_bytes(), &sig_bytes) {
+                return true;
+            }
+        }
+        if clean_id != id {
+            let msg3 = format!("USB_MASTER_REGISTER:{}:{}", clean_id, nonce);
+            if InstallationKeypair::verify_with_public_key(&pubkey_bytes, msg3.as_bytes(), &sig_bytes) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -267,5 +337,64 @@ mod tests {
         tampered_sig[0] ^= 0xFF;
         assert!(!kp1.verify(message, &tampered_sig));
     }
+
+    #[test]
+    fn test_registration_proof_flow() {
+        let identity = NodeIdentity::load_or_generate();
+        let nonce = "4a9f3b8c2d1e0f9a8b7c6d5e4f3a2b1c";
+
+        let proof = identity.create_registration_proof(nonce);
+        assert_eq!(proof.len(), 128); // 64 bytes = 128 hex chars
+
+        // Verify with formatted ID
+        assert!(verify_registration_proof(
+            &identity.installation_public_key,
+            &identity.formatted_id,
+            nonce,
+            &proof
+        ));
+
+        // Verify with raw 9-digit ID (unformatted)
+        assert!(verify_registration_proof(
+            &identity.installation_public_key,
+            &identity.raw_id.to_string(),
+            nonce,
+            &proof
+        ));
+
+        // Tampered nonce fails
+        assert!(!verify_registration_proof(
+            &identity.installation_public_key,
+            &identity.formatted_id,
+            "tampered_nonce_1234567890abcdef",
+            &proof
+        ));
+
+        // Wrong ID fails
+        assert!(!verify_registration_proof(
+            &identity.installation_public_key,
+            "123 456 789",
+            nonce,
+            &proof
+        ));
+
+        // Wrong public key fails
+        let other_kp = InstallationKeypair::generate();
+        assert!(!verify_registration_proof(
+            other_kp.public_key_hex(),
+            &identity.formatted_id,
+            nonce,
+            &proof
+        ));
+
+        // Invalid signature hex length fails safely
+        assert!(!verify_registration_proof(
+            &identity.installation_public_key,
+            &identity.formatted_id,
+            nonce,
+            "deadbeef"
+        ));
+    }
 }
+
 
