@@ -62,15 +62,28 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\bin\{#MyAppExeName}"; Tasks
 [Run]
 ; Dynamic PnP Driver Registration (Zero-Reboot Invariant)
 Filename: "{sys}\pnputil.exe"; Parameters: "/add-driver ""{app}\drivers\vhci\anyusb_vhci.inf"" /install"; Flags: runhidden; StatusMsg: "Configuring Virtual USB Host Controller (Zero-Reboot)..."
-Filename: "{sys}\powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\configure_firewall.ps1"""; Flags: runhidden; StatusMsg: "Configuring Windows Firewall..."
+Filename: "{sys}\pnputil.exe"; Parameters: "/add-driver ""{app}\drivers\filter\anyusb_filter.inf"" /install"; Flags: runhidden; StatusMsg: "Configuring Hardware Capture Filter Driver (Zero-Reboot)..."
+
+; Native Firewall Rules Configuration (Zero PowerShell Dependency)
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Daemon"""; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro"""; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""USB Master Pro Daemon"" dir=in action=allow program=""{app}\bin\USBMasterDaemon.exe"" enable=yes"; Flags: runhidden; StatusMsg: "Configuring Windows Firewall for USB Master Pro Daemon..."
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""USB Master Pro Daemon"" dir=out action=allow program=""{app}\bin\USBMasterDaemon.exe"" enable=yes"; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""USB Master Pro"" dir=in action=allow program=""{app}\bin\{#MyAppExeName}"" enable=yes"; Flags: runhidden; StatusMsg: "Configuring Windows Firewall for USB Master Pro..."
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""USB Master Pro"" dir=out action=allow program=""{app}\bin\{#MyAppExeName}"" enable=yes"; Flags: runhidden
 
 ; Launch application after setup
 Filename: "{app}\bin\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
 ; Graceful process teardown to prevent locked file reboots
-Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM USBMasterDaemon.exe /IM USBMasterPro.exe"; Flags: runhidden
-; Dynamic PnP Driver Detachment (Zero-Reboot Invariant)
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM USBMasterDaemon.exe /IM {#MyAppExeName}"; Flags: runhidden
+
+; Dynamic PnP Device Node Detachment & Driver Unloading (Zero-Reboot Invariant)
+Filename: "{sys}\pnputil.exe"; Parameters: "/remove-device ""root\anyusb_vhci"""; Flags: runhidden; StatusMsg: "Dynamically detaching Virtual USB Device..."
 Filename: "{sys}\pnputil.exe"; Parameters: "/delete-driver anyusb_vhci.inf /uninstall /force"; Flags: runhidden; StatusMsg: "Dynamically unloading Virtual USB Drivers..."
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Signaling & WebRTC"""; Flags: runhidden
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Daemon IPC"""; Flags: runhidden
+Filename: "{sys}\pnputil.exe"; Parameters: "/delete-driver anyusb_filter.inf /uninstall /force"; Flags: runhidden; StatusMsg: "Dynamically unloading Capture Filter Driver..."
+
+; Clean up Windows Firewall rules
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Daemon"""; Flags: runhidden; StatusMsg: "Cleaning up Windows Firewall rules..."
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro"""; Flags: runhidden

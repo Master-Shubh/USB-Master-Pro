@@ -18,6 +18,9 @@ taskkill /F /IM USBMasterDaemon.exe >nul 2>&1
 taskkill /F /IM USBMasterPro.exe >nul 2>&1
 timeout /t 2 /nobreak >nul
 
+echo [USB Master Pro] Dynamically detaching Virtual USB Device...
+pnputil.exe /remove-device "root\anyusb_vhci" >nul 2>&1
+
 echo [USB Master Pro] Dynamically removing and unloading Virtual USB Host Controller Driver...
 pnputil.exe /delete-driver anyusb_vhci.inf /uninstall /force >nul 2>&1
 
@@ -25,8 +28,8 @@ echo [USB Master Pro] Dynamically removing Hardware Capture Filter Driver...
 pnputil.exe /delete-driver anyusb_filter.inf /uninstall /force >nul 2>&1
 
 echo [USB Master Pro] Cleaning up Windows Firewall rules...
-netsh advfirewall firewall delete rule name="USB Master Pro Signaling & WebRTC" >nul 2>&1
-netsh advfirewall firewall delete rule name="USB Master Pro Daemon IPC" >nul 2>&1
+netsh advfirewall firewall delete rule name="USB Master Pro Daemon" >nul 2>&1
+netsh advfirewall firewall delete rule name="USB Master Pro" >nul 2>&1
 
 echo ==============================================================================
 echo [SUCCESS] USB Master Pro uninstalled cleanly! ZERO REBOOT REQUIRED.

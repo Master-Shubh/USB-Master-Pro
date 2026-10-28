@@ -28,8 +28,13 @@ if %errorLevel% neq 0 (
 echo [USB Master Pro] Dynamically staging Hardware Capture Filter Driver (anyusb_filter)...
 pnputil.exe /add-driver "%~dp0..\drivers\filter\anyusb_filter.inf" /install >nul 2>&1
 
-echo [USB Master Pro] Configuring Firewall Rules for WebRTC and Local IPC (Port 443 / 5123)...
-powershell -ExecutionPolicy Bypass -File "%~dp0configure_firewall.ps1"
+echo [USB Master Pro] Configuring Windows Firewall Rules (Zero PowerShell Dependency)...
+netsh advfirewall firewall delete rule name="USB Master Pro Daemon" >nul 2>&1
+netsh advfirewall firewall delete rule name="USB Master Pro" >nul 2>&1
+netsh advfirewall firewall add rule name="USB Master Pro Daemon" dir=in action=allow program="%~dp0..\bin\USBMasterDaemon.exe" enable=yes >nul 2>&1
+netsh advfirewall firewall add rule name="USB Master Pro Daemon" dir=out action=allow program="%~dp0..\bin\USBMasterDaemon.exe" enable=yes >nul 2>&1
+netsh advfirewall firewall add rule name="USB Master Pro" dir=in action=allow program="%~dp0..\bin\USBMasterPro.exe" enable=yes >nul 2>&1
+netsh advfirewall firewall add rule name="USB Master Pro" dir=out action=allow program="%~dp0..\bin\USBMasterPro.exe" enable=yes >nul 2>&1
 
 echo ==============================================================================
 echo [SUCCESS] USB Master Pro installed smoothly! ZERO REBOOT REQUIRED.
