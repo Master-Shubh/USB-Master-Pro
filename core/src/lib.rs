@@ -29,8 +29,9 @@ pub use protocol::{
 };
 pub use state::{can_transition, transitory_timeout, SessionState, SessionStateMachine, StateTransitionError};
 pub use urb_engine::{
-    PipeState, UrbCompletion, UrbEngine, UrbIsoPacket, UrbPayload, UrbPipe, UrbRequest,
-    UsbSetupPacket, USBD_STATUS_CANCELED, USBD_STATUS_STALL_PID, USBD_STATUS_SUCCESS,
+    BoundedUrbRing, PipeState, UrbCompletion, UrbEngine, UrbEngineError, UrbIsoPacket,
+    UrbPayload, UrbPipe, UrbRequest, UsbSetupPacket, MAX_IN_FLIGHT_URBS, USBD_STATUS_CANCELED,
+    USBD_STATUS_STALL_PID, USBD_STATUS_SUCCESS,
 };
 pub use usb_descriptors::{
     usbd_parse_configuration_descriptor_ex, usbd_parse_descriptors,

@@ -1168,6 +1168,65 @@
       lucide.createIcons();
     }
 
+    // --- Category Resolution Helpers ---
+    function resolveDeviceCategoryIcon(dev) {
+      if (dev.category_icon) return dev.category_icon;
+      if (dev.icon) return dev.icon;
+      const cat = dev.category || '';
+      switch (cat) {
+        case 'GpsDevice':
+        case 'GPS':
+          return '🛰️';
+        case 'SlapScanner':
+        case 'Slap':
+          return '🖐️';
+        case 'FingerprintScanner':
+        case 'Fingerprint':
+          return '🪪';
+        case 'IrisScanner':
+        case 'Iris':
+          return '👁️';
+        case 'Webcam':
+          return '📷';
+        case 'Printer':
+          return '🖨️';
+        case 'SerialPort':
+        case 'Serial':
+          return '🔌';
+        case 'SmartCard':
+          return '🔐';
+        case 'MassStorage':
+          return '💾';
+        case 'HumanInterface':
+          return '⌨️';
+        default:
+          const name = (dev.friendly_name || dev.name || '').toLowerCase();
+          if (name.includes('gps') || name.includes('gnss') || name.includes('bu-353') || name.includes('nmea') || name.includes('geotag')) return '🛰️';
+          if (name.includes('slap') || name.includes('ten-print') || name.includes('mfs600') || name.includes('morphotop') || name.includes('cs500') || name.includes('dactyscan')) return '🖐️';
+          if (name.includes('iris') || name.includes('matisx') || name.includes('mis100') || name.includes('bmt-20') || name.includes('irishield')) return '👁️';
+          if (name.includes('mfs') || name.includes('morpho') || name.includes('fm220') || name.includes('secugen') || name.includes('fingerprint') || name.includes('biometric')) return '🪪';
+          return '⚡';
+      }
+    }
+
+    function resolveDeviceCategoryBadge(dev) {
+      const cat = dev.category || '';
+      const name = (dev.friendly_name || dev.name || '').toLowerCase();
+      if (cat === 'SlapScanner' || cat === '4:4:2 Ten-Print Slap Scanner' || name.includes('slap') || name.includes('ten-print') || name.includes('mfs600') || name.includes('morphotop') || name.includes('cs500')) {
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-500/10 text-blue-300 border border-blue-500/20" title="4:4:2 Ten-Print Slap Scanner">🖐️ 4:4:2 Slap</span>`;
+      }
+      if (cat === 'GpsDevice' || cat === 'GPS / GNSS Geotagging Receiver' || name.includes('gps') || name.includes('gnss') || name.includes('nmea') || name.includes('geotag')) {
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/20" title="GPS / GNSS Geotagging Receiver">🛰️ GPS / GNSS</span>`;
+      }
+      if (cat === 'IrisScanner' || cat === 'Iris Biometric Scanner' || name.includes('iris') || name.includes('matisx') || name.includes('mis100') || name.includes('bmt-20')) {
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-purple-500/10 text-purple-300 border border-purple-500/20" title="Iris Biometric Scanner">👁️ Iris</span>`;
+      }
+      if (cat === 'FingerprintScanner' || cat === 'Biometric Fingerprint Scanner' || name.includes('fingerprint') || name.includes('biometric') || name.includes('mfs100') || name.includes('mfs110') || name.includes('fm220')) {
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-cyan-500/10 text-cyan-300 border border-cyan-500/20" title="Biometric Fingerprint Scanner">🪪 Biometric</span>`;
+      }
+      return '';
+    }
+
     // --- Dynamic Rendering ---
     function renderLocalDevices() {
       const container = document.getElementById('localDeviceList');
@@ -1179,7 +1238,7 @@
           <div class="text-center py-12 text-slate-500 text-xs">
             <i data-lucide="usb" class="w-8 h-8 mx-auto mb-2 text-slate-600"></i>
             <p class="font-semibold text-slate-400">0 physical USB devices detected.</p>
-            <p class="text-slate-500 mt-1">Connect a USB device (biometric sensor, webcam, printer, COM port) to start forwarding.</p>
+            <p class="text-slate-500 mt-1">Connect a USB device (biometric sensor, 4:4:2 slap scanner, iris, GPS receiver, printer, COM port) to start forwarding.</p>
           </div>
         `;
         lucide.createIcons();
@@ -1208,14 +1267,18 @@
           systemBadge = `<span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/20" title="Primary system input device - protected by default">System Device</span>`;
         }
 
+        const catBadge = resolveDeviceCategoryBadge(dev);
+        const iconGlyph = resolveDeviceCategoryIcon(dev);
+
         card.innerHTML = `
           <div class="flex items-center space-x-3 min-w-0 pr-3">
             <div class="w-10 h-10 rounded-lg bg-slate-800 flex items-center justify-center text-xl flex-shrink-0">
-              ${dev.category_icon || '⚡'}
+              ${iconGlyph}
             </div>
             <div class="min-w-0">
               <div class="flex items-center space-x-2">
                 <h4 class="font-bold text-xs text-white truncate group-hover:text-brand-300 transition">${dev.friendly_name}</h4>
+                ${catBadge}
                 ${systemBadge}
               </div>
               <div class="flex items-center space-x-2 text-[11px] text-slate-400 mt-0.5 flex-wrap">
@@ -1261,14 +1324,18 @@
       remoteMountedDevices.forEach((dev, idx) => {
         const card = document.createElement('div');
         card.className = "bg-darkBg p-3.5 rounded-xl border border-darkBorder flex items-center justify-between";
+        const catBadge = resolveDeviceCategoryBadge(dev);
+        const iconGlyph = resolveDeviceCategoryIcon(dev);
+
         card.innerHTML = `
           <div class="flex items-center space-x-3 min-w-0 pr-3">
             <div class="w-10 h-10 rounded-lg bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-xl flex-shrink-0">
-              ${dev.icon || '⚡'}
+              ${iconGlyph}
             </div>
             <div class="min-w-0">
               <div class="flex items-center space-x-2">
                 <h4 class="font-bold text-xs text-white truncate">${dev.name}</h4>
+                ${catBadge}
                 <span class="text-[10px] font-mono bg-indigo-500/20 text-indigo-300 px-1.5 py-0.2 rounded">From: ${dev.remote_peer_id || dev.remotePeerId}</span>
               </div>
               <p class="text-[11px] text-emerald-400 mt-0.5 flex items-center space-x-1">

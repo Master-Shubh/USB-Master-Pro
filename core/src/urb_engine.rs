@@ -294,12 +294,196 @@ pub struct UrbCompletion {
 }
 
 // -----------------------------------------------------------------------------
-// 7. Full URB State Machine & Pipeline Engine
+// 7. Bounded In-Flight Ring Buffer & Pipeline Error Hierarchy
+// -----------------------------------------------------------------------------
+pub const MAX_IN_FLIGHT_URBS: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UrbEngineError {
+    PipelineCongested { max_capacity: usize },
+    UrbNotFound { sequence_id: u64 },
+    PipeNotFound { endpoint_address: u8 },
+    InvalidParameter(String),
+}
+
+impl std::fmt::Display for UrbEngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PipelineCongested { max_capacity } => {
+                write!(
+                    f,
+                    "URB pipeline congested: maximum capacity of {} in-flight requests reached",
+                    max_capacity
+                )
+            }
+            Self::UrbNotFound { sequence_id } => {
+                write!(f, "URB sequence {} not found in in-flight table", sequence_id)
+            }
+            Self::PipeNotFound { endpoint_address } => {
+                write!(f, "Endpoint pipe 0x{:02X} not found", endpoint_address)
+            }
+            Self::InvalidParameter(msg) => {
+                write!(f, "Invalid parameter: {}", msg)
+            }
+        }
+    }
+}
+
+impl std::error::Error for UrbEngineError {}
+
+/// High-performance bounded in-flight ring buffer / tracking table.
+/// Enforces strict hardware backpressure at MAX_IN_FLIGHT_URBS (256).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundedUrbRing {
+    entries: HashMap<u64, UrbRequest>,
+    capacity: usize,
+}
+
+impl Default for BoundedUrbRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BoundedUrbRing {
+    pub fn new() -> Self {
+        Self::with_capacity(MAX_IN_FLIGHT_URBS)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Inserts an URB request into the bounded ring buffer.
+    /// Returns `Err(UrbEngineError::PipelineCongested { max_capacity: 256 })` if capacity is reached.
+    pub fn insert(&mut self, req: UrbRequest) -> Result<(), UrbEngineError> {
+        if self.entries.len() >= self.capacity {
+            return Err(UrbEngineError::PipelineCongested {
+                max_capacity: self.capacity,
+            });
+        }
+        self.entries.insert(req.sequence_id, req);
+        Ok(())
+    }
+
+    /// Inserts an URB request with explicit sequence ID key.
+    /// Returns `Err(UrbEngineError::PipelineCongested { max_capacity: 256 })` if capacity is reached.
+    pub fn insert_with_key(
+        &mut self,
+        sequence_id: u64,
+        req: UrbRequest,
+    ) -> Result<Option<UrbRequest>, UrbEngineError> {
+        if self.entries.len() >= self.capacity && !self.entries.contains_key(&sequence_id) {
+            return Err(UrbEngineError::PipelineCongested {
+                max_capacity: self.capacity,
+            });
+        }
+        Ok(self.entries.insert(sequence_id, req))
+    }
+
+    /// Removes an URB request by sequence ID.
+    pub fn remove(&mut self, sequence_id: u64) -> Option<UrbRequest> {
+        self.entries.remove(&sequence_id)
+    }
+
+    pub fn get(&self, sequence_id: u64) -> Option<&UrbRequest> {
+        self.entries.get(&sequence_id)
+    }
+
+    pub fn get_mut(&mut self, sequence_id: u64) -> Option<&mut UrbRequest> {
+        self.entries.get_mut(&sequence_id)
+    }
+
+    pub fn contains_key(&self, sequence_id: u64) -> bool {
+        self.entries.contains_key(&sequence_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.entries.len() >= self.capacity
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&u64, &mut UrbRequest) -> bool,
+    {
+        self.entries.retain(|k, v| f(k, v));
+    }
+
+    pub fn iter(&self) -> std::collections::hash_map::Iter<'_, u64, UrbRequest> {
+        self.entries.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> std::collections::hash_map::IterMut<'_, u64, UrbRequest> {
+        self.entries.iter_mut()
+    }
+
+    pub fn values(&self) -> std::collections::hash_map::Values<'_, u64, UrbRequest> {
+        self.entries.values()
+    }
+
+    pub fn keys(&self) -> std::collections::hash_map::Keys<'_, u64, UrbRequest> {
+        self.entries.keys()
+    }
+}
+
+impl IntoIterator for BoundedUrbRing {
+    type Item = (u64, UrbRequest);
+    type IntoIter = std::collections::hash_map::IntoIter<u64, UrbRequest>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a BoundedUrbRing {
+    type Item = (&'a u64, &'a UrbRequest);
+    type IntoIter = std::collections::hash_map::Iter<'a, u64, UrbRequest>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
+impl std::ops::Index<u64> for BoundedUrbRing {
+    type Output = UrbRequest;
+    fn index(&self, index: u64) -> &Self::Output {
+        &self.entries[&index]
+    }
+}
+
+impl std::ops::Index<&u64> for BoundedUrbRing {
+    type Output = UrbRequest;
+    fn index(&self, index: &u64) -> &Self::Output {
+        &self.entries[index]
+    }
+}
+
+// -----------------------------------------------------------------------------
+// 8. Full URB State Machine & Pipeline Engine
 // -----------------------------------------------------------------------------
 pub struct UrbEngine {
     pub device_id: u32,
     pub pipes: HashMap<u8, UrbPipe>,
-    pub in_flight: HashMap<u64, UrbRequest>,
+    pub in_flight: BoundedUrbRing,
     pub active_configuration: u8,
     pub active_interface_settings: HashMap<u8, u8>,
     start_time: Instant,
@@ -314,7 +498,7 @@ impl UrbEngine {
         Self {
             device_id,
             pipes,
-            in_flight: HashMap::new(),
+            in_flight: BoundedUrbRing::new(),
             active_configuration: 0,
             active_interface_settings: HashMap::new(),
             start_time: Instant::now(),
@@ -406,6 +590,27 @@ impl UrbEngine {
                 iso_packets: Vec::new(),
             },
         }
+    }
+
+    /// Enqueues an URB request into the bounded in-flight ring buffer.
+    /// Returns `Err(UrbEngineError::PipelineCongested { max_capacity: 256 })` if full.
+    pub fn enqueue_urb(&mut self, req: UrbRequest) -> Result<(), UrbEngineError> {
+        self.in_flight.insert(req)
+    }
+
+    /// Completes an in-flight URB request by sequence ID, executing it through the state machine
+    /// and removing it from the bounded ring buffer.
+    pub fn complete_urb(&mut self, sequence_id: u64) -> Result<UrbCompletion, UrbEngineError> {
+        let req = self
+            .in_flight
+            .remove(sequence_id)
+            .ok_or(UrbEngineError::UrbNotFound { sequence_id })?;
+        Ok(self.submit_urb(req))
+    }
+
+    /// Explicitly aborts an endpoint pipe and cancels all matching in-flight URBs.
+    pub fn abort_pipe(&mut self, endpoint_address: u8) -> UrbCompletion {
+        self.handle_abort_pipe(0, endpoint_address)
     }
 
     // -------------------------------------------------------------------------
@@ -874,5 +1079,146 @@ mod tests {
         let comp = engine.submit_urb(abort_req);
         assert_eq!(comp.usbd_status, USBD_STATUS_SUCCESS);
         assert_eq!(engine.pipes.get(&0x84).unwrap().state, PipeState::Aborted);
+    }
+
+    #[test]
+    fn test_bounded_ring_congestion_at_max_capacity() {
+        let mut engine = UrbEngine::new(5);
+        engine.register_pipe(0x81, TransferType::Bulk, 512);
+
+        // Fill ring buffer to exactly MAX_IN_FLIGHT_URBS (256)
+        for seq in 1..=(MAX_IN_FLIGHT_URBS as u64) {
+            let req = UrbRequest {
+                sequence_id: seq,
+                device_id: 5,
+                endpoint_address: 0x81,
+                function_code: URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER,
+                transfer_flags: 0,
+                payload: UrbPayload::BulkOrInterrupt {
+                    data: vec![0xAA; 64],
+                },
+            };
+            assert!(engine.enqueue_urb(req).is_ok());
+        }
+
+        assert_eq!(engine.in_flight.len(), MAX_IN_FLIGHT_URBS);
+        assert!(engine.in_flight.is_full());
+
+        // 257th insert must be rejected with PipelineCongested error
+        let congested_req = UrbRequest {
+            sequence_id: (MAX_IN_FLIGHT_URBS + 1) as u64,
+            device_id: 5,
+            endpoint_address: 0x81,
+            function_code: URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER,
+            transfer_flags: 0,
+            payload: UrbPayload::BulkOrInterrupt {
+                data: vec![0xEE; 64],
+            },
+        };
+        let err = engine.enqueue_urb(congested_req);
+        assert_eq!(
+            err,
+            Err(UrbEngineError::PipelineCongested {
+                max_capacity: MAX_IN_FLIGHT_URBS
+            })
+        );
+
+        // Retire one URB from the in-flight table
+        let comp = engine.complete_urb(1).expect("Failed to complete in-flight URB 1");
+        assert_eq!(comp.usbd_status, USBD_STATUS_SUCCESS);
+        assert_eq!(engine.in_flight.len(), MAX_IN_FLIGHT_URBS - 1);
+        assert!(!engine.in_flight.is_full());
+
+        // Now an insert succeeds
+        let next_req = UrbRequest {
+            sequence_id: 9999,
+            device_id: 5,
+            endpoint_address: 0x81,
+            function_code: URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER,
+            transfer_flags: 0,
+            payload: UrbPayload::BulkOrInterrupt {
+                data: vec![0xCC; 64],
+            },
+        };
+        assert!(engine.enqueue_urb(next_req).is_ok());
+        assert_eq!(engine.in_flight.len(), MAX_IN_FLIGHT_URBS);
+    }
+
+    #[test]
+    fn test_complete_urb_lifecycle() {
+        let mut engine = UrbEngine::new(6);
+        engine.register_pipe(0x82, TransferType::Bulk, 512);
+
+        let req = UrbRequest {
+            sequence_id: 601,
+            device_id: 6,
+            endpoint_address: 0x82,
+            function_code: URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER,
+            transfer_flags: 0,
+            payload: UrbPayload::BulkOrInterrupt {
+                data: vec![1, 2, 3, 4],
+            },
+        };
+
+        // Enqueue into in-flight table
+        engine.enqueue_urb(req.clone()).unwrap();
+        assert_eq!(engine.in_flight.len(), 1);
+
+        // Completing it succeeds and removes from in-flight
+        let comp = engine.complete_urb(601).unwrap();
+        assert_eq!(comp.sequence_id, 601);
+        assert_eq!(comp.usbd_status, USBD_STATUS_SUCCESS);
+        assert_eq!(comp.data, vec![1, 2, 3, 4]);
+        assert_eq!(engine.in_flight.len(), 0);
+
+        // Attempting to complete already-retired sequence returns UrbNotFound
+        let err = engine.complete_urb(601);
+        assert_eq!(err, Err(UrbEngineError::UrbNotFound { sequence_id: 601 }));
+    }
+
+    #[test]
+    fn test_abort_pipe_drains_in_flight_urbs() {
+        let mut engine = UrbEngine::new(7);
+        engine.register_pipe(0x81, TransferType::Bulk, 512);
+        engine.register_pipe(0x82, TransferType::Bulk, 512);
+
+        // Enqueue 3 on 0x81 and 2 on 0x82
+        for seq in 1..=3 {
+            engine
+                .enqueue_urb(UrbRequest {
+                    sequence_id: seq,
+                    device_id: 7,
+                    endpoint_address: 0x81,
+                    function_code: URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER,
+                    transfer_flags: 0,
+                    payload: UrbPayload::BulkOrInterrupt { data: vec![0] },
+                })
+                .unwrap();
+        }
+        for seq in 4..=5 {
+            engine
+                .enqueue_urb(UrbRequest {
+                    sequence_id: seq,
+                    device_id: 7,
+                    endpoint_address: 0x82,
+                    function_code: URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER,
+                    transfer_flags: 0,
+                    payload: UrbPayload::BulkOrInterrupt { data: vec![0] },
+                })
+                .unwrap();
+        }
+
+        assert_eq!(engine.in_flight.len(), 5);
+
+        // Abort EP 0x81
+        let comp = engine.abort_pipe(0x81);
+        assert_eq!(comp.usbd_status, USBD_STATUS_SUCCESS);
+        assert_eq!(engine.pipes.get(&0x81).unwrap().state, PipeState::Aborted);
+
+        // In-flight should now only have the 2 requests for EP 0x82
+        assert_eq!(engine.in_flight.len(), 2);
+        assert!(engine.in_flight.get(4).is_some());
+        assert!(engine.in_flight.get(5).is_some());
+        assert!(engine.in_flight.get(1).is_none());
     }
 }
