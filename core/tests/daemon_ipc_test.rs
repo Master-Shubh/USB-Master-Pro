@@ -148,10 +148,11 @@ async fn test_daemon_mutating_endpoints_origin_and_host_validation() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // 0. Leak Audit: Confirm that GET /api/identity NEVER leaks the local_api_token
+    // 0. Leak Audit: Confirm that GET /api/identity NEVER leaks the local_api_token or default_pin
     let id_resp = reqwest_like_get(port, "/api/identity").await;
     assert!(id_resp.contains("formatted_id"), "Identity endpoint must contain formatted_id");
     assert!(!id_resp.contains("api_token"), "SECURITY VIOLATION: Identity endpoint MUST NEVER leak api_token!");
+    assert!(!id_resp.contains("default_pin"), "SECURITY VIOLATION: Identity endpoint MUST NEVER leak default_pin!");
 
     let test_body = serde_json::json!({
         "target_id": "123456789",
@@ -365,6 +366,52 @@ async fn test_daemon_mutating_endpoints_origin_and_host_validation() {
         ],
     ).await;
     assert!(new_token_resp.contains("HTTP/1.1 200 OK"), "New rotated token must succeed: {}", new_token_resp);
+
+    // 12. Read-endpoint origin & token verification tests: /api/identity, /api/devices, /api/sessions, /api/status
+    for endpoint in &["/api/identity", "/api/devices", "/api/sessions", "/api/status"] {
+        // Cross-origin attack attempt: Origin: http://evil.com -> 403 Forbidden
+        let evil_origin = reqwest_like_get_with_headers(
+            port,
+            endpoint,
+            &[
+                ("Host", &format!("127.0.0.1:{}", port)),
+                ("Origin", "http://evil.com"),
+            ],
+        ).await;
+        assert!(evil_origin.contains("HTTP/1.1 403 Forbidden"), "Endpoint {} must reject evil.com origin: {}", endpoint, evil_origin);
+
+        // Invalid token attempt -> 401 Unauthorized
+        let bad_token = reqwest_like_get_with_headers(
+            port,
+            endpoint,
+            &[
+                ("Host", &format!("127.0.0.1:{}", port)),
+                ("Authorization", "Bearer invalid_token_12345"),
+            ],
+        ).await;
+        assert!(bad_token.contains("HTTP/1.1 401 Unauthorized"), "Endpoint {} must reject invalid token: {}", endpoint, bad_token);
+    }
+}
+
+async fn reqwest_like_get_with_headers(port: u16, path: &str, headers: &[(&str, &str)]) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .expect("Failed to connect to daemon test server");
+
+    let mut header_lines = String::new();
+    for (k, v) in headers {
+        header_lines.push_str(&format!("{}: {}\r\n", k, v));
+    }
+
+    let req = format!("GET {} HTTP/1.1\r\n{}Connection: close\r\n\r\n", path, header_lines);
+    stream.write_all(req.as_bytes()).await.unwrap();
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf).to_string()
 }
 
 async fn reqwest_like_get(port: u16, path: &str) -> String {

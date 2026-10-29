@@ -120,8 +120,9 @@ if ($EnableBcdTestSigning) {
             }
         }
 
-        # Optional integrity checks toggle for maximum field test compatibility
-        $null = bcdedit.exe /set nointegritychecks on 2>&1
+        # Kernel integrity checks remain strictly enforced.
+        # Production drivers require Microsoft WHQL attestation signing; disabling integrity checks is prohibited.
+        Write-Warn "SECURITY NOTICE: Kernel integrity checks remain enforced. Production drivers require Microsoft WHQL attestation signing."
     } catch {
         Write-Warn "Failed to query or configure BCDEdit: $_"
     }

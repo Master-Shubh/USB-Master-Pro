@@ -222,19 +222,7 @@ pub fn generate_secure_api_token() -> String {
     }
 
     if !filled {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"USB_MASTER_SECURE_TOKEN_CSPRNG_FALLBACK");
-        hasher.update(std::process::id().to_le_bytes());
-        hasher.update(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                .to_le_bytes(),
-        );
-        let res = hasher.finalize();
-        bytes.copy_from_slice(&res[..32]);
+        panic!("FATAL SECURITY ERROR: OS CSPRNG source (/dev/urandom or SystemFunction036) is completely unavailable. Cannot safely generate daemon authentication token.");
     }
 
     hex::encode(bytes)
@@ -504,6 +492,81 @@ fn validate_request_origin_and_auth(
     }
 }
 
+/// Validates that an incoming read request originates from an authorized local context
+/// (localhost / 127.0.0.1 origin or loopback connection) OR presents a valid daemon API token.
+/// Rejects unauthorized Host headers (DNS rebinding), cross-site fetch requests,
+/// unauthorized origins, and invalid authorization tokens.
+fn validate_request_token_or_origin(
+    headers: &axum::http::HeaderMap,
+    state: &DaemonState,
+) -> Result<(), (StatusCode, String)> {
+    // 1. Host header validation against DNS rebinding
+    if let Some(host_val) = headers.get(axum::http::header::HOST) {
+        if let Ok(host_str) = host_val.to_str() {
+            if !is_authorized_host(host_str) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("Access forbidden: unauthorized Host header '{}'", host_str),
+                ));
+            }
+        }
+    }
+
+    // 2. Reject cross-site requests via Sec-Fetch-Site
+    if let Some(sec_site) = headers.get("sec-fetch-site") {
+        if let Ok(s) = sec_site.to_str() {
+            if s.eq_ignore_ascii_case("cross-site") {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    "Access forbidden: cross-site requests are rejected".to_string(),
+                ));
+            }
+        }
+    }
+
+    // 3. Strict Origin header validation if present
+    if let Some(origin_val) = headers.get(axum::http::header::ORIGIN) {
+        if let Ok(origin_str) = origin_val.to_str() {
+            if !is_authorized_origin(origin_str) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("Access forbidden: origin '{}' is not authorized", origin_str),
+                ));
+            }
+        }
+    }
+
+    // 4. Strict token validation: if token is supplied, it must match expected token
+    let token_from_auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            if let Some(stripped) = s.strip_prefix("Bearer ") {
+                Some(stripped.trim())
+            } else {
+                Some(s.trim())
+            }
+        });
+
+    let token_from_header = headers
+        .get("x-daemon-token")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim());
+
+    let client_token = token_from_auth.or(token_from_header);
+    if let Some(token) = client_token {
+        let expected_token = state.local_api_token.read().unwrap();
+        if !constant_time_eq_str(token, &expected_token) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Access unauthorized: invalid daemon API token".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 pub fn create_router(state: Arc<DaemonState>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _| {
@@ -670,10 +733,17 @@ async fn handle_serve_lucide() -> impl IntoResponse {
 
 // --- HTTP ENDPOINT HANDLERS ---
 
-async fn handle_get_identity(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
-    // SECURITY INVARIANT: Identity endpoint is a local public query and MUST NEVER
-    // expose the local_api_token. Token is stored securely in ~/.usb-master-pro/daemon.token.
-    Json(serde_json::to_value(&state.identity).unwrap_or_default())
+async fn handle_get_identity(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_request_token_or_origin(&headers, &state)?;
+    // SECURITY INVARIANT: Identity endpoint MUST NEVER leak default_pin or local_api_token.
+    let mut val = serde_json::to_value(&state.identity).unwrap_or_default();
+    if let Some(obj) = val.as_object_mut() {
+        obj.remove("default_pin");
+    }
+    Ok(Json(val))
 }
 
 /// Rotates the local daemon API authorization token, persisting the fresh 256-bit CSPRNG token to disk
@@ -702,7 +772,11 @@ async fn handle_post_auth_rotate(
     })))
 }
 
-async fn handle_get_devices(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+async fn handle_get_devices(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_request_token_or_origin(&headers, &state)?;
     // Perform fresh hardware scan and update state
     let fresh = HardwareEnumerator::scan_devices();
     let mut current_map = HashMap::new();
@@ -740,17 +814,21 @@ async fn handle_get_devices(State(state): State<Arc<DaemonState>>) -> impl IntoR
     let remote = state.remote_devices.read().await.clone();
     let active_sessions_snapshot = sessions.clone();
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "local": merged,
         "remote": remote,
         "sessions": active_sessions_snapshot,
         "active_sessions": active_sessions_snapshot
-    }))
+    })))
 }
 
-async fn handle_get_sessions(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+async fn handle_get_sessions(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_request_token_or_origin(&headers, &state)?;
     let sessions = state.active_sessions.read().await.clone();
-    Json(sessions)
+    Ok(Json(sessions))
 }
 
 async fn handle_post_forward(
@@ -1099,7 +1177,11 @@ async fn handle_post_disconnect(
     })))
 }
 
-async fn handle_get_status(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+async fn handle_get_status(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_request_token_or_origin(&headers, &state)?;
     let local_count = state.devices.read().await.len();
     let remote_count = state.remote_devices.read().await.len();
 
@@ -1121,19 +1203,22 @@ async fn handle_get_status(State(state): State<Arc<DaemonState>>) -> impl IntoRe
     };
     let throughput = total_throughput;
 
-    let telemetry = DaemonTelemetry {
-        status: "active".to_string(),
-        uptime_secs: state.start_time.elapsed().as_secs(),
-        broker_connected: state.broker_connected.load(Ordering::Relaxed),
-        broker_url: state.broker_url.clone(),
-        identity: state.identity.clone(),
-        local_device_count: local_count,
-        remote_device_count: remote_count,
-        turbo_urb_throughput_mb_s: throughput,
-        rd_service_latency_ms: avg_latency,
-    };
+    let mut id_val = serde_json::to_value(&state.identity).unwrap_or_default();
+    if let Some(obj) = id_val.as_object_mut() {
+        obj.remove("default_pin");
+    }
 
-    Json(telemetry)
+    Ok(Json(serde_json::json!({
+        "status": "active",
+        "uptime_secs": state.start_time.elapsed().as_secs(),
+        "broker_connected": state.broker_connected.load(Ordering::Relaxed),
+        "broker_url": state.broker_url.clone(),
+        "identity": id_val,
+        "local_device_count": local_count,
+        "remote_device_count": remote_count,
+        "turbo_urb_throughput_mb_s": throughput,
+        "rd_service_latency_ms": avg_latency,
+    })))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

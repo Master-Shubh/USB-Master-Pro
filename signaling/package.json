@@ -4,7 +4,8 @@
   "description": "AnyDesk-style P2P Rendezvous Broker & Signaling Server for USB Master Pro",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test_security.js"
   },
   "dependencies": {
     "ws": "^8.18.0"

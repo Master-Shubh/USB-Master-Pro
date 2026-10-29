@@ -36,7 +36,7 @@ async fn main() {
     println!("  Your AnyUSB ID:      \x1b[1;32m{}\x1b[0m", identity.formatted_id);
     println!("  Default Security PIN: \x1b[1;33m{}\x1b[0m", identity.default_pin);
     println!("  Hardware Fingerprint: {}", &identity.hardware_hash[0..16]);
-    println!("  P2P Rendezvous Mesh:  Active (Outbound WebRTC / UDP 443 Firewall Safe)");
+    println!("  P2P Rendezvous Mesh:  Active (Outbound WebSocket / TLS Signaling)");
     println!("================================================================================\n");
 
     let args: Vec<String> = std::env::args().collect();

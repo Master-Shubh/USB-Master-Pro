@@ -320,10 +320,12 @@ async fn test_end_to_end_multi_node_passthrough() {
     let raw_id_b = id_b["raw_id"].as_u64().expect("Node B raw_id must be u64");
     let fmt_id_a = id_a["formatted_id"].as_str().expect("Node A formatted_id must be str");
     let fmt_id_b = id_b["formatted_id"].as_str().expect("Node B formatted_id must be str");
-    let pin_a = id_a["default_pin"].as_str().expect("Node A default_pin must be str");
+    assert!(id_a.get("default_pin").is_none() || id_a["default_pin"].is_null(), "SECURITY INVARIANT: default_pin must not be leaked in identity endpoint");
+    assert!(id_b.get("default_pin").is_none() || id_b["default_pin"].is_null(), "SECURITY INVARIANT: default_pin must not be leaked in identity endpoint");
+    let pin_a = "821 490";
 
-    println!("   Node A Identity: {} (raw: {}) | PIN: {}", fmt_id_a, raw_id_a, pin_a);
-    println!("   Node B Identity: {} (raw: {}) | PIN: {}", fmt_id_b, raw_id_b, id_b["default_pin"]);
+    println!("   Node A Identity: {} (raw: {})", fmt_id_a, raw_id_a);
+    println!("   Node B Identity: {} (raw: {})", fmt_id_b, raw_id_b);
 
     assert!(raw_id_a >= 100_000_000 && raw_id_a <= 999_999_999, "Node A raw_id must be 9 digits");
     assert!(raw_id_b >= 100_000_000 && raw_id_b <= 999_999_999, "Node B raw_id must be 9 digits");

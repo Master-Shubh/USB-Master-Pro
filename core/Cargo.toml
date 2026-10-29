@@ -25,7 +25,7 @@ zstd = "0.13"
 crossbeam-channel = "0.5"
 axum = { version = "0.7", features = ["ws", "json"] }
 tower-http = { version = "0.5", features = ["cors"] }
-tokio-tungstenite = "0.23"
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 base64 = "0.22"
 thiserror = "1.0"

@@ -11,11 +11,13 @@ const WebSocket = require('ws');
 const PORT = process.env.PORT || 8443;
 
 // In-Memory Peer Registry (Mapped to 9-Digit ID)
-const peersById = new Map();         // idString -> { ws, publicKey, verified, info, registeredAt, lastPing }
-const peersByWs = new Map();         // ws -> idString
-const verifiedPeers = new Map();     // idString -> { ws, publicKey, info, registeredAt, lastPing }
-const pendingChallenges = new Map(); // idString -> { nonce, publicKey, timestamp, timer }
-const activeChannels = new Map();    // channelId -> { senderId, receiverId, deviceId }
+const peersById = new Map();              // idString -> { ws, publicKey, verified, info, registeredAt, lastPing }
+const peersByWs = new Map();              // ws -> idString
+const verifiedPeers = new Map();          // idString -> { ws, publicKey, info, registeredAt, lastPing }
+const pendingChallenges = new Map();      // idString -> { nonce, publicKey, timestamp, timer }
+const pendingConnectRequests = new Map(); // reqKey ("fromId:targetId") -> { timestamp, fromId, targetId }
+const connectionsByIp = new Map();        // ip -> Set<ws>
+const activeChannels = new Map();         // channelId -> { senderId, receiverId, deviceId }
 
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -68,10 +70,7 @@ const server = http.createServer((req, res) => {
       formattedId,
       verified: isVerified,
       publicKey: peer.publicKey || null,
-      hostname: peer.info?.hostname || 'Unknown Host',
-      os: peer.info?.os || 'Unknown OS',
       version: peer.info?.version || '1.0.0',
-      devicesCount: (peer.info?.devices || []).length,
       online: peer.ws?.readyState === WebSocket.OPEN,
       registeredAt: peer.registeredAt,
       lastPing: peer.lastPing
@@ -79,34 +78,22 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Section 9.1: GET /v1/presence -> returns count and list of active online peers
+  // Section 9.1: GET /v1/presence -> returns aggregate online and verified peer counts
   if ((req.url === '/v1/presence' || req.url === '/v1/presence/') && req.method === 'GET') {
-    const activePeers = [];
+    let totalOnline = 0;
+    let verifiedCount = 0;
     for (const [id, peer] of peersById.entries()) {
       if (peer.ws && peer.ws.readyState === WebSocket.OPEN) {
-        const cleanId = id.replace(/\s+/g, '');
-        const formattedId = cleanId.length === 9
-          ? `${cleanId.slice(0, 3)} ${cleanId.slice(3, 6)} ${cleanId.slice(6, 9)}`
-          : cleanId;
-        activePeers.push({
-          id: cleanId,
-          formattedId,
-          verified: verifiedPeers.has(cleanId),
-          publicKey: peer.publicKey || null,
-          hostname: peer.info?.hostname || 'Unknown Host',
-          os: peer.info?.os || 'Unknown OS',
-          version: peer.info?.version || '1.0.0',
-          devicesCount: (peer.info?.devices || []).length,
-          registeredAt: peer.registeredAt,
-          lastPing: peer.lastPing
-        });
+        totalOnline++;
+        if (verifiedPeers.has(id)) {
+          verifiedCount++;
+        }
       }
     }
     res.writeHead(200);
     res.end(JSON.stringify({
-      totalOnline: activePeers.length,
-      verifiedCount: activePeers.filter(p => p.verified).length,
-      peers: activePeers,
+      totalOnline,
+      verifiedCount,
       timestamp: Date.now()
     }));
     return;
@@ -121,10 +108,39 @@ const wss = new WebSocket.Server({ server, maxPayload: 1024 * 1024 }); // 1MB fr
 console.log(`[USB Master Pro Broker] Initializing P2P Rendezvous Fabric on port ${PORT}...`);
 
 wss.on('connection', (ws, req) => {
-  const remoteIp = req.socket.remoteAddress;
+  const remoteIp = req.socket.remoteAddress || 'unknown';
+
+  // DoS Hardening: Max 10 concurrent WebSocket connections per remote IP
+  const ipConns = connectionsByIp.get(remoteIp) || new Set();
+  if (ipConns.size >= 10) {
+    console.warn(`[Broker] Connection limit exceeded for IP: ${remoteIp}`);
+    ws.close(1008, 'Connection limit exceeded (max 10 connections per IP)');
+    return;
+  }
+  ipConns.add(ws);
+  connectionsByIp.set(remoteIp, ipConns);
+
   console.log(`[Broker] New peer connection from ${remoteIp}`);
 
+  // Rate Limiting: Max 60 messages per 10s per socket
+  const rateLimit = {
+    count: 0,
+    resetTime: Date.now() + 10000
+  };
+
   ws.on('message', (data) => {
+    const now = Date.now();
+    if (now > rateLimit.resetTime) {
+      rateLimit.count = 0;
+      rateLimit.resetTime = now + 10000;
+    }
+    rateLimit.count++;
+    if (rateLimit.count > 60) {
+      console.warn(`[Broker] Rate limit exceeded for socket from ${remoteIp}`);
+      ws.send(JSON.stringify({ type: 'ERROR', error: 'Rate limit exceeded: max 60 messages per 10s' }));
+      return;
+    }
+
     try {
       const msg = JSON.parse(data.toString());
       handleMessage(ws, msg);
@@ -135,6 +151,15 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', () => {
+    // Release IP connection tracking
+    const conns = connectionsByIp.get(remoteIp);
+    if (conns) {
+      conns.delete(ws);
+      if (conns.size === 0) {
+        connectionsByIp.delete(remoteIp);
+      }
+    }
+
     const peerId = peersByWs.get(ws);
     if (peerId) {
       console.log(`[Broker] Peer disconnected: ${peerId}`);
@@ -144,6 +169,12 @@ wss.on('connection', (ws, req) => {
         const c = pendingChallenges.get(peerId);
         if (c.timer) clearTimeout(c.timer);
         pendingChallenges.delete(peerId);
+      }
+      // Clean up any pending connect requests involving this peer
+      for (const [key, reqObj] of pendingConnectRequests.entries()) {
+        if (reqObj.fromId === peerId || reqObj.targetId === peerId) {
+          pendingConnectRequests.delete(key);
+        }
       }
       peersByWs.delete(ws);
 
@@ -173,34 +204,14 @@ wss.on('connection', (ws, req) => {
 
 /**
  * Cryptographic Ed25519 signature verifier.
- * Checks signature over "USB_MASTER_REGISTER:<id>:<nonce>".
+ * Strictly verifies RFC 8032 Ed25519 signatures using standard Node.js crypto.verify.
+ * The custom SHA-256 fallback bypass is deleted.
  */
 function verifyEd25519Proof(publicKeyHex, messageStr, signatureHex) {
   try {
     if (!publicKeyHex || !signatureHex) return false;
     if (signatureHex.length !== 128 || publicKeyHex.length !== 64) return false;
 
-    const pubKeyBuf = Buffer.from(publicKeyHex, 'hex');
-    const sigBuf = Buffer.from(signatureHex, 'hex');
-    const msgBuf = Buffer.from(messageStr, 'utf8');
-
-    const rPart = sigBuf.subarray(0, 32);
-    const sPart = sigBuf.subarray(32, 64);
-
-    const hash = crypto.createHash('sha256');
-    hash.update('USB_MASTER_ED25519_SIG_RESPONSE_S');
-    hash.update(rPart);
-    hash.update(pubKeyBuf);
-    hash.update(msgBuf);
-    const expectedS = hash.digest();
-
-    if (crypto.timingSafeEqual(sPart, expectedS)) {
-      return true;
-    }
-  } catch (_) {}
-
-  // Standard Ed25519 fallback if standard key format
-  try {
     const rawPubKey = Buffer.from(publicKeyHex, 'hex');
     const spkiKey = crypto.createPublicKey({
       key: Buffer.concat([
@@ -211,9 +222,9 @@ function verifyEd25519Proof(publicKeyHex, messageStr, signatureHex) {
       type: 'spki'
     });
     return crypto.verify(null, Buffer.from(messageStr, 'utf8'), spkiKey, Buffer.from(signatureHex, 'hex'));
-  } catch (_) {}
-
-  return false;
+  } catch (_) {
+    return false;
+  }
 }
 
 function handleMessage(ws, msg) {
@@ -295,9 +306,11 @@ function handleMessage(ws, msg) {
         return;
       }
 
+      // Single-use challenge deletion: immediately clear timer and delete challenge
+      if (challenge.timer) clearTimeout(challenge.timer);
+      pendingChallenges.delete(peerId);
+
       if (Date.now() - challenge.timestamp > 10000) {
-        if (challenge.timer) clearTimeout(challenge.timer);
-        pendingChallenges.delete(peerId);
         ws.send(JSON.stringify({
           type: 'REGISTER_RESP',
           success: false,
@@ -306,7 +319,17 @@ function handleMessage(ws, msg) {
         return;
       }
 
-      const publicKey = (msg.publicKey || challenge.publicKey || '').toLowerCase();
+      // Enforce exact challenge-key binding
+      if (msg.publicKey && msg.publicKey.toLowerCase() !== challenge.publicKey) {
+        ws.send(JSON.stringify({
+          type: 'REGISTER_RESP',
+          success: false,
+          error: 'Public key mismatch: does not match challenge key'
+        }));
+        return;
+      }
+
+      const publicKey = challenge.publicKey;
       const signatureHex = (msg.signature || '').toLowerCase();
       const formattedId = `${peerId.slice(0, 3)} ${peerId.slice(3, 6)} ${peerId.slice(6, 9)}`;
 
@@ -323,9 +346,6 @@ function handleMessage(ws, msg) {
         }));
         return;
       }
-
-      if (challenge.timer) clearTimeout(challenge.timer);
-      pendingChallenges.delete(peerId);
 
       const peerRecord = {
         ws,
@@ -409,11 +429,37 @@ function handleMessage(ws, msg) {
     case 'DEVICE_CATALOG_UPDATE': {
       // msg: { type: 'DEVICE_CATALOG_UPDATE', devices: [...] }
       const peerId = peersByWs.get(ws);
-      if (!peerId) return;
+      if (!peerId) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Unregistered peer cannot update device catalog' }));
+        return;
+      }
+      if (!Array.isArray(msg.devices) || msg.devices.length > 32) {
+        ws.send(JSON.stringify({
+          type: 'ERROR',
+          error: 'Invalid device catalog: must be an array with at most 32 devices'
+        }));
+        return;
+      }
       const peer = peersById.get(peerId);
       if (peer) {
-        peer.info.devices = msg.devices || [];
-        console.log(`[Broker] Node [${peerId}] updated device catalog (${peer.info.devices.length} devices)`);
+        const sanitized = msg.devices.map(dev => {
+          if (!dev || typeof dev !== 'object') return null;
+          const clean = {};
+          for (const [k, v] of Object.entries(dev)) {
+            if (typeof v === 'string') {
+              clean[k] = v.slice(0, 256).replace(/[\x00-\x1f\x7f]/g, '');
+            } else if (typeof v === 'number' || typeof v === 'boolean') {
+              clean[k] = v;
+            } else if (v === null) {
+              clean[k] = null;
+            }
+          }
+          return clean;
+        }).filter(Boolean);
+
+        peer.info = peer.info || {};
+        peer.info.devices = sanitized;
+        console.log(`[Broker] Node [${peerId}] updated device catalog (${sanitized.length} devices)`);
       }
       break;
     }
@@ -434,12 +480,7 @@ function handleMessage(ws, msg) {
           type: 'QUERY_PEER_RESP',
           found: true,
           targetId,
-          info: {
-            hostname: target.info.hostname,
-            os: target.info.os,
-            devices: target.info.devices || [],
-            version: target.info.version
-          }
+          version: target.info?.version || '1.0.0'
         }));
       }
       break;
@@ -449,7 +490,11 @@ function handleMessage(ws, msg) {
       // Machine A requests to mount a device from Machine B
       // msg: { type: 'CONNECT_REQUEST', fromId, targetId, deviceId, deviceName, pin, sdpOffer }
       const fromId = peersByWs.get(ws);
-      const targetId = String(msg.targetId).replace(/\s+/g, '');
+      if (!fromId) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Unregistered peer cannot initiate connections' }));
+        return;
+      }
+      const targetId = String(msg.targetId || '').replace(/\s+/g, '');
       const target = peersById.get(targetId);
 
       if (!target || target.ws.readyState !== WebSocket.OPEN) {
@@ -460,6 +505,14 @@ function handleMessage(ws, msg) {
         }));
         return;
       }
+
+      // Track pending connect request (30s TTL)
+      const reqKey = `${fromId}:${targetId}`;
+      pendingConnectRequests.set(reqKey, {
+        timestamp: Date.now(),
+        fromId,
+        targetId
+      });
 
       console.log(`[Broker] Forwarding connect request: [${fromId}] -> [${targetId}] for device ${msg.deviceName}`);
       target.ws.send(JSON.stringify({
@@ -478,11 +531,36 @@ function handleMessage(ws, msg) {
       // Machine B accepts or rejects Machine A's request
       // msg: { type: 'CONNECT_RESPONSE', toId, accepted: true/false, reason, sdpAnswer }
       const fromId = peersByWs.get(ws);
-      const toId = String(msg.toId).replace(/\s+/g, '');
-      const client = peersById.get(toId);
+      if (!fromId) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Unregistered peer cannot respond to connections' }));
+        return;
+      }
+      const toId = String(msg.toId || '').replace(/\s+/g, '');
 
+      // Validate matching unexpired pending request exists from toId to fromId
+      const reqKey = `${toId}:${fromId}`;
+      const pending = pendingConnectRequests.get(reqKey);
+
+      if (!pending || (Date.now() - pending.timestamp > 30000)) {
+        if (pending) pendingConnectRequests.delete(reqKey);
+        console.warn(`[Broker] Unsolicited or expired CONNECT_RESPONSE rejected from [${fromId}] to [${toId}]`);
+        ws.send(JSON.stringify({
+          type: 'CONNECT_RESPONSE_ERROR',
+          error: 'Unsolicited, replayed, or expired connection response'
+        }));
+        return;
+      }
+
+      // Single-use: delete pending request immediately once handled
+      pendingConnectRequests.delete(reqKey);
+
+      const client = peersById.get(toId);
       if (!client || client.ws.readyState !== WebSocket.OPEN) {
         console.warn(`[Broker] Cannot route answer; requesting peer [${toId}] disconnected`);
+        ws.send(JSON.stringify({
+          type: 'CONNECT_RESPONSE_ERROR',
+          error: `Requesting peer [${toId}] disconnected`
+        }));
         return;
       }
 
@@ -529,7 +607,20 @@ function handleMessage(ws, msg) {
   }
 }
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`[USB Master Pro Broker] Live on http://0.0.0.0:${PORT}`);
-  console.log(`[USB Master Pro Broker] Health check: http://0.0.0.0:${PORT}/health`);
-});
+if (require.main === module) {
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`[USB Master Pro Broker] Live on http://0.0.0.0:${PORT}`);
+    console.log(`[USB Master Pro Broker] Health check: http://0.0.0.0:${PORT}/health`);
+  });
+}
+
+module.exports = {
+  server,
+  wss,
+  verifyEd25519Proof,
+  peersById,
+  verifiedPeers,
+  pendingChallenges,
+  pendingConnectRequests,
+  connectionsByIp
+};
