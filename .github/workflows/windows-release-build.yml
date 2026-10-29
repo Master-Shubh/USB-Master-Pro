@@ -11,7 +11,7 @@ on:
 jobs:
   build-windows-release:
     name: Build & Package Windows x64 Release Bundle
-    runs-on: windows-latest
+    runs-on: windows-2022
     defaults:
       run:
         shell: pwsh
@@ -27,6 +27,8 @@ jobs:
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[17.0,18.0)'
 
       - name: Setup Windows 11 SDK (22621)
         uses: GuillaumeFalourd/setup-windows10-sdk-action@v1
@@ -36,23 +38,47 @@ jobs:
       - name: Install & Configure Windows Driver Kit (WDK 11)
         run: |
           Write-Host "=================================================================="
-          Write-Host "Installing Windows Driver Kit (WDK) 11 via Chocolatey..."
+          Write-Host "Checking for Windows Driver Kit (WDK 11) & MSBuild Toolsets..."
           Write-Host "=================================================================="
-          choco install windowsdriverkit11 -y --no-progress
 
-          $wdkInclude = Test-Path "C:\Program Files (x86)\Windows Kits\10\Include\*\km"
-          if (-not $wdkInclude) {
-              Write-Host "WDK include path not found after choco. Invoking official Microsoft WDK installer directly..."
-              $wdkSetupUrl = "https://download.microsoft.com/download/c/6/4/c64e8e90-4143-4e86-93d7-0209b0b30626/wdk/wdksetup.exe"
-              Invoke-WebRequest -Uri $wdkSetupUrl -OutFile "$env:TEMP\wdksetup.exe"
-              Start-Process -FilePath "$env:TEMP\wdksetup.exe" -ArgumentList "/q /norestart" -Wait
+          $vsMsbuildToolsetDir = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VC\v170\Platforms\x64\PlatformToolsets\WindowsKernelModeDriver10.0"
+
+          function Find-WdkVsix {
+              $searchRoots = @(
+                  "C:\Program Files (x86)\Windows Kits\10\Vsix",
+                  "C:\Program Files\Windows Kits\10\Vsix"
+              )
+              foreach ($root in $searchRoots) {
+                  if (Test-Path $root) {
+                      $match = Get-ChildItem -Path $root -Recurse -Filter "WDK.vsix" -ErrorAction SilentlyContinue | Select-Object -First 1
+                      if ($match) { return $match.FullName }
+                  }
+              }
+              return $null
           }
 
-          $vsixCandidates = @(
-              "C:\Program Files (x86)\Windows Kits\10\Vsix\VS2022\WDK.vsix",
-              "C:\Program Files\Windows Kits\10\Vsix\VS2022\WDK.vsix"
-          )
-          $vsixPath = $vsixCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $vsixPath = Find-WdkVsix
+
+          if (-not (Test-Path $vsMsbuildToolsetDir) -and -not $vsixPath) {
+              Write-Host "WDK toolset not detected. Attempting Chocolatey install..."
+              try {
+                  choco install windowsdriverkit11 -y --no-progress
+              } catch {
+                  Write-Warning "Chocolatey install warning: $_"
+              }
+              $vsixPath = Find-WdkVsix
+          }
+
+          if (-not (Test-Path $vsMsbuildToolsetDir) -and -not $vsixPath) {
+              Write-Host "WDK VSIX still not found. Downloading official Microsoft WDK installer..."
+              $wdkSetupUrl = "https://go.microsoft.com/fwlink/?linkid=2324617"
+              $wdkSetupPath = "$env:TEMP\wdksetup.exe"
+              Invoke-WebRequest -Uri $wdkSetupUrl -OutFile $wdkSetupPath -UseBasicParsing
+              Write-Host "Running wdksetup.exe silently..."
+              $proc = Start-Process -FilePath $wdkSetupPath -ArgumentList "/q /norestart" -Wait -PassThru
+              Write-Host "wdksetup.exe exited with code $($proc.ExitCode)"
+              $vsixPath = Find-WdkVsix
+          }
 
           if ($vsixPath) {
               Write-Host "Found WDK VSIX at: $vsixPath"
@@ -63,26 +89,42 @@ jobs:
               }
           }
 
-          # Ensure WindowsKernelModeDriver10.0 platform toolset is present in VS2022 MSBuild
-          $vsMsbuildToolsetDir = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VC\v170\Platforms\x64\PlatformToolsets\WindowsKernelModeDriver10.0"
+          # Direct extraction fallback: Ensure WindowsKernelModeDriver10.0 is directly deployed to MSBuild VC v170
           if (-not (Test-Path $vsMsbuildToolsetDir) -and $vsixPath) {
               Write-Host "Extracting WindowsKernelModeDriver10.0 toolsets from VSIX directly..."
               $extractDir = "$env:TEMP\wdk_vsix_extracted"
+              if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
               $zipFile = "$env:TEMP\wdk_vsix.zip"
               Copy-Item $vsixPath $zipFile -Force
               Expand-Archive -Path $zipFile -DestinationPath $extractDir -Force
 
+              # Check if full v170 tree exists inside the VSIX
+              $v170Dir = Get-ChildItem -Path $extractDir -Recurse -Directory | Where-Object { $_.Name -ieq "v170" -and $_.Parent.Name -ieq "VC" } | Select-Object -First 1
+              if ($v170Dir) {
+                  Write-Host "Copying full v170 tree from $($v170Dir.FullName)..."
+                  $vcDest = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VC\v170"
+                  Copy-Item -Path "$($v170Dir.FullName)\*" -Destination $vcDest -Recurse -Force
+              }
+
+              # Ensure x64, Win32, and ARM64 platform toolsets are deployed
               $foundToolsets = Get-ChildItem -Path $extractDir -Recurse -Directory -Filter "WindowsKernelModeDriver10.0"
               foreach ($ts in $foundToolsets) {
-                  $parentDir = Split-Path $vsMsbuildToolsetDir -Parent
-                  New-Item -ItemType Directory -Path $parentDir -Force | Out-Null
-                  Copy-Item -Path $ts.FullName -Destination $vsMsbuildToolsetDir -Recurse -Force
-                  Write-Host "Copied toolset from $($ts.FullName) to $vsMsbuildToolsetDir"
+                  $platform = "x64"
+                  if ($ts.FullName -match 'Platforms[\\/](x64|Win32|ARM64|arm64)[\\/]') {
+                      $platform = $Matches[1]
+                  }
+                  $dest = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild\Microsoft\VC\v170\Platforms\$platform\PlatformToolsets\WindowsKernelModeDriver10.0"
+                  $destParent = Split-Path $dest -Parent
+                  if (-not (Test-Path $destParent)) {
+                      New-Item -ItemType Directory -Path $destParent -Force | Out-Null
+                  }
+                  Copy-Item -Path $ts.FullName -Destination $dest -Recurse -Force
+                  Write-Host "Deployed $platform toolset from $($ts.FullName) to $dest"
               }
           }
 
           if (-not (Test-Path $vsMsbuildToolsetDir)) {
-              throw "FATAL: WindowsKernelModeDriver10.0 platform toolset missing"
+              throw "FATAL: WindowsKernelModeDriver10.0 platform toolset missing at $vsMsbuildToolsetDir"
           }
           Write-Host "Verified WDK toolset present at: $vsMsbuildToolsetDir"
           Write-Host "WDK 11 toolchain configuration completed successfully."
@@ -92,7 +134,7 @@ jobs:
           Write-Host "=================================================================="
           Write-Host "Compiling anyusb_vhci.vcxproj (Release | x64)..."
           Write-Host "=================================================================="
-          msbuild drivers/vhci/anyusb_vhci.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /v:m
+          msbuild drivers/vhci/anyusb_vhci.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /p:SignMode=Off /v:m
           if ($LASTEXITCODE -ne 0) {
               throw "FATAL: MSBuild compilation of anyusb_vhci.vcxproj failed with exit code $LASTEXITCODE"
           }
@@ -108,7 +150,7 @@ jobs:
           Write-Host "=================================================================="
           Write-Host "Compiling anyusb_filter.vcxproj (Release | x64)..."
           Write-Host "=================================================================="
-          msbuild drivers/filter/anyusb_filter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /v:m
+          msbuild drivers/filter/anyusb_filter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /p:SignMode=Off /v:m
           if ($LASTEXITCODE -ne 0) {
               throw "FATAL: MSBuild compilation of anyusb_filter.vcxproj failed with exit code $LASTEXITCODE"
           }
