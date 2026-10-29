@@ -8,6 +8,7 @@ use std::io::Cursor;
 pub const TURBO_USB_MAGIC: u32 = 0x54555242; // "TURB" in ASCII
 pub const PROTOCOL_VERSION: u16 = 0x0100;    // v1.0
 pub const MAX_PAYLOAD_LENGTH: u32 = 16 * 1024 * 1024; // 16 MB maximum frame size
+pub const ANYUSB_MAX_URB_BUFFER_SIZE: usize = 64 * 1024; // 64 KB single-URB hardware buffer limit
 
 /// Operation safety classification for idempotency and replay guarantees
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +197,40 @@ impl TurboUrbHeader {
             actual_length,
         })
     }
+
+    /// Validates that single-URB buffer and actual lengths do not exceed ANYUSB_MAX_URB_BUFFER_SIZE (64 KB).
+    pub fn validate_urb_buffer_boundary(&self) -> Result<(), String> {
+        if self.buffer_length as usize > ANYUSB_MAX_URB_BUFFER_SIZE {
+            return Err(format!(
+                "URB buffer length ({} bytes) exceeds maximum single-URB limit ({} bytes)",
+                self.buffer_length, ANYUSB_MAX_URB_BUFFER_SIZE
+            ));
+        }
+        if self.actual_length as usize > ANYUSB_MAX_URB_BUFFER_SIZE {
+            return Err(format!(
+                "URB actual length ({} bytes) exceeds maximum single-URB limit ({} bytes)",
+                self.actual_length, ANYUSB_MAX_URB_BUFFER_SIZE
+            ));
+        }
+        Ok(())
+    }
+
+    /// Deserializes a TurboUrbHeader and enforces single-URB 64 KB boundary check.
+    pub fn deserialize_single_urb(bytes: &[u8]) -> Result<Self, String> {
+        let hdr = Self::deserialize(bytes)?;
+        hdr.validate_urb_buffer_boundary()?;
+        Ok(hdr)
+    }
+}
+
+/// Validates that single-URB buffer and actual lengths do not exceed ANYUSB_MAX_URB_BUFFER_SIZE (64 KB).
+pub fn validate_urb_buffer_boundary(header: &TurboUrbHeader) -> Result<(), String> {
+    header.validate_urb_buffer_boundary()
+}
+
+/// Deserializes a TurboUrbHeader and enforces single-URB 64 KB boundary check.
+pub fn deserialize_single_urb(bytes: &[u8]) -> Result<TurboUrbHeader, String> {
+    TurboUrbHeader::deserialize_single_urb(bytes)
 }
 
 /// Isochronous packet descriptor for continuous video/audio streams
@@ -266,6 +301,28 @@ mod tests {
         assert_eq!(classify_operation(CMD_RESET_DEVICE, 0, 0), OperationSafety::NonIdempotentUncertain);
         // Unlink URB
         assert_eq!(classify_operation(CMD_UNLINK_URB, 0, 0), OperationSafety::NonIdempotentUncertain);
+    }
+
+    #[test]
+    fn test_standalone_validate_and_deserialize_single_urb() {
+        let valid_hdr = TurboUrbHeader::new(CMD_SUBMIT_URB, 1, 1, 0x81, TransferType::Bulk, 65536);
+        assert!(validate_urb_buffer_boundary(&valid_hdr).is_ok());
+
+        let bytes = valid_hdr.serialize();
+        let parsed = deserialize_single_urb(&bytes).expect("Valid 64 KB single URB must deserialize");
+        assert_eq!(parsed.buffer_length, 65536);
+
+        // Header with buffer length exceeding 64 KB (65537)
+        let invalid_buf = TurboUrbHeader::new(CMD_SUBMIT_URB, 2, 1, 0x81, TransferType::Bulk, 65537);
+        assert!(validate_urb_buffer_boundary(&invalid_buf).is_err());
+
+        let bytes_inv = invalid_buf.serialize();
+        assert!(deserialize_single_urb(&bytes_inv).is_err());
+
+        // Header with actual length exceeding 64 KB
+        let mut invalid_act = TurboUrbHeader::new(CMD_SUBMIT_URB, 3, 1, 0x81, TransferType::Bulk, 512);
+        invalid_act.actual_length = 65537;
+        assert!(validate_urb_buffer_boundary(&invalid_act).is_err());
     }
 }
 

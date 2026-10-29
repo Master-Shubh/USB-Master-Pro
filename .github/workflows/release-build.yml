@@ -41,24 +41,22 @@ jobs:
         with:
           sdk-version: 22621
 
-      - name: Stage & Verify KMDF Drivers (anyusb_vhci & anyusb_filter)
+      - name: Compile & Verify KMDF Drivers (anyusb_vhci & anyusb_filter)
         shell: pwsh
         run: |
           Write-Host "================================================================="
           Write-Host "Checking for Windows Driver Kit (WDK) compilation toolchain..."
           Write-Host "================================================================="
           $wdkInclude = Test-Path "C:\Program Files (x86)\Windows Kits\10\Include\*\km"
-          if ($wdkInclude) {
-              Write-Host "WDK detected. Compiling KMDF drivers with MSBuild..."
-              msbuild drivers/vhci/anyusb_vhci.vcxproj /p:Configuration=Release /p:Platform=x64
-              msbuild drivers/filter/anyusb_filter.vcxproj /p:Configuration=Release /p:Platform=x64
-              Write-Host "KMDF drivers compiled successfully."
-          } else {
-              Write-Host "NOTICE: Standard hosted runner does not include proprietary WDK."
-              Write-Host "Staging KMDF drivers, INFs, and signing scripts for WHQL submission."
+          if (-not $wdkInclude) {
+              throw "FATAL: WindowsKernelModeDriver10.0 platform toolset missing. WDK compilation toolchain is required."
           }
-          $global:LASTEXITCODE = 0
-          exit 0
+          Write-Host "WDK detected. Compiling KMDF drivers with MSBuild..."
+          msbuild drivers/vhci/anyusb_vhci.vcxproj /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { throw "FATAL: MSBuild compilation of anyusb_vhci.vcxproj failed with exit code $LASTEXITCODE" }
+          msbuild drivers/filter/anyusb_filter.vcxproj /p:Configuration=Release /p:Platform=x64
+          if ($LASTEXITCODE -ne 0) { throw "FATAL: MSBuild compilation of anyusb_filter.vcxproj failed with exit code $LASTEXITCODE" }
+          Write-Host "KMDF drivers compiled successfully."
 
       - name: Test Core Turbo-URB Engine
         shell: bash
@@ -93,6 +91,7 @@ jobs:
         shell: pwsh
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\usb_master_pro.iss
+          if ($LASTEXITCODE -ne 0) { throw "FATAL: Inno Setup compiler (ISCC.exe) failed with exit code $LASTEXITCODE" }
           Write-Host "Setup Wizard compiled successfully in dist/installer/"
           ls dist\installer\
 
@@ -101,9 +100,11 @@ jobs:
         with:
           name: USB-Master-Pro-v1.0.0-Setup-Wizard
           path: dist/installer/USBMasterPro-Setup-v1.0.0.exe
+          if-no-files-found: error
 
       - name: Upload Full Distribution Package
         uses: actions/upload-artifact@v4
         with:
           name: USB-Master-Pro-v1.0.0-Windows-x64
           path: dist/
+          if-no-files-found: error

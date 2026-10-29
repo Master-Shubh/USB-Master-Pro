@@ -1,8 +1,8 @@
 @echo off
 REM ==============================================================================
-REM USB Master Pro — Zero-Reboot Automated Installation Script
+REM USB Master Pro — Dynamic Driver Installation Script
 REM Designed for Windows 10 & Windows 11 (x64)
-REM BhartX Ecosystems Pvt Ltd | Zero Restart Invariant
+REM BhartX Ecosystems Pvt Ltd | Dynamic Driver Installation (reboot may be required if system or locked files require it)
 REM ==============================================================================
 
 echo [USB Master Pro] Verifying Administrator Privileges...
@@ -44,7 +44,9 @@ if exist "%DRIVER_DIR%\bhartx_test_ca.cer" (
 
 echo [USB Master Pro] Dynamically staging Virtual USB Host Controller (anyusb_vhci)...
 pnputil.exe /add-driver "%DRIVER_DIR%\vhci\anyusb_vhci.inf" /install
-if %errorLevel% neq 0 (
+if %errorLevel% equ 3010 (
+    echo [NOTICE] Reboot is required by Windows to complete driver registration.
+) else if %errorLevel% neq 0 (
     echo [NOTICE] If running in field test mode with test-signed drivers, run:
     if exist "%~dp0setup_field_test_signing.ps1" (
         echo          powershell -ExecutionPolicy Bypass -File "%~dp0setup_field_test_signing.ps1"
@@ -55,6 +57,9 @@ if %errorLevel% neq 0 (
 
 echo [USB Master Pro] Dynamically staging Hardware Capture Filter Driver (anyusb_filter)...
 pnputil.exe /add-driver "%DRIVER_DIR%\filter\anyusb_filter.inf" /install >nul 2>&1
+if %errorLevel% equ 3010 (
+    echo [NOTICE] Reboot is required by Windows to complete driver registration.
+)
 
 echo [USB Master Pro] Configuring Windows Firewall Rules (Zero PowerShell Dependency)...
 netsh advfirewall firewall delete rule name="USB Master Pro Daemon" >nul 2>&1
@@ -93,7 +98,7 @@ if defined BIN_DIR (
 )
 
 echo ==============================================================================
-echo [SUCCESS] USB Master Pro installed smoothly! ZERO REBOOT REQUIRED.
+echo [SUCCESS] USB Master Pro installed successfully via Dynamic Driver Installation (reboot may be required if system or locked files require it).
 if defined BIN_DIR (
     if exist "%BIN_DIR%usb_master_daemon.exe" (
         echo You can now launch: "%BIN_DIR%usb_master_daemon.exe"

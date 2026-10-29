@@ -56,13 +56,13 @@ flowchart TD
 
 ---
 
-## 2. Zero-Reboot Dynamic Driver Staging
+## 2. Dynamic Driver Installation Staging
 
-Legacy USB virtualization tools require a complete Windows restart because they register global class filters and fail to dynamically detach device nodes. USB Master Pro enforces a **Strict Zero-Restart Invariant** during both installation and uninstallation.
+Legacy USB virtualization tools require unconditional Windows restarts because they register static legacy filters and fail to dynamically detach device nodes. USB Master Pro implements **Dynamic Driver Installation** (reboot may be required if system or locked files require it, indicated by pnputil exit code 3010).
 
 ```
 +----------------------------------------------------------------------------------------------------+
-|                                ZERO-REBOOT LIFECYCLE MECHANICS                                     |
+|                         DYNAMIC DRIVER INSTALLATION LIFECYCLE MECHANICS                            |
 +----------------------------------------------------------------------------------------------------+
 |                                                                                                    |
 |  [ Installation Flow ]                                                                             |
@@ -70,6 +70,7 @@ Legacy USB virtualization tools require a complete Windows restart because they 
 |     taskkill /F /IM USBMasterDaemon.exe /IM USBMasterPro.exe                                       |
 |  2. Stage Virtual Host Controller driver dynamically into Driver Store:                            |
 |     pnputil.exe /add-driver "drivers\vhci\anyusb_vhci.inf" /install                                |
+|     (Exit code 0: clean success; Exit code 3010: reboot required by Windows)                       |
 |  3. Stage Upper Filter Driver dynamically:                                                         |
 |     pnputil.exe /add-driver "drivers\filter\anyusb_filter.inf" /install                            |
 |  4. Configure native Windows Firewall rules via netsh (Zero PowerShell dependency):                |
@@ -83,7 +84,7 @@ Legacy USB virtualization tools require a complete Windows restart because they 
 |  3. Dynamically unload and delete drivers from Driver Store:                                       |
 |     pnputil.exe /delete-driver anyusb_vhci.inf /uninstall /force                                   |
 |     pnputil.exe /delete-driver anyusb_filter.inf /uninstall /force                                 |
-|  4. Delete firewall rules via netsh. ZERO REBOOT REQUIRED.                                         |
+|  4. Delete firewall rules via netsh (reboot required only if system or file locks persist).        |
 |                                                                                                    |
 +----------------------------------------------------------------------------------------------------+
 ```

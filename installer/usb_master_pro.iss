@@ -1,7 +1,7 @@
 ; ==============================================================================
 ; USB Master Pro — Production Inno Setup Installer Script
 ; Owned & Developed by BhartX Ecosystems Pvt Ltd (https://bhartx.in)
-; Zero-Restart Invariant | Clean Control Panel Registration | x64 Native
+; Dynamic Driver Installation (reboot may be required if system or locked files require it) | Clean Control Panel Registration | x64 Native
 ; ==============================================================================
 
 #define MyAppName "USB Master Pro"
@@ -30,7 +30,7 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64
-RestartIfNeededByRun=no
+RestartIfNeededByRun=yes
 CloseApplications=force
 UninstallDisplayName={#MyAppName} ({#MyAppPublisher})
 UninstallDisplayIcon={app}\bin\{#MyAppExeName}
@@ -60,10 +60,6 @@ Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\bin\{#MyAppExeName}"; Tasks: desktopicon; IconFilename: "{app}\ui\assets\favicon.ico"
 
 [Run]
-; Dynamic PnP Driver Registration (Zero-Reboot Invariant)
-Filename: "{sys}\pnputil.exe"; Parameters: "/add-driver ""{app}\drivers\vhci\anyusb_vhci.inf"" /install"; Flags: runhidden; StatusMsg: "Configuring Virtual USB Host Controller (Zero-Reboot)..."
-Filename: "{sys}\pnputil.exe"; Parameters: "/add-driver ""{app}\drivers\filter\anyusb_filter.inf"" /install"; Flags: runhidden; StatusMsg: "Configuring Hardware Capture Filter Driver (Zero-Reboot)..."
-
 ; Native Firewall Rules Configuration (Zero PowerShell Dependency)
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Daemon"""; Flags: runhidden
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro"""; Flags: runhidden
@@ -79,7 +75,7 @@ Filename: "{app}\bin\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringC
 ; Graceful process teardown to prevent locked file reboots
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM USBMasterDaemon.exe /IM {#MyAppExeName}"; Flags: runhidden
 
-; Dynamic PnP Device Node Detachment & Driver Unloading (Zero-Reboot Invariant)
+; Dynamic PnP Device Node Detachment & Driver Unloading
 Filename: "{sys}\pnputil.exe"; Parameters: "/remove-device ""root\anyusb_vhci"""; Flags: runhidden; StatusMsg: "Dynamically detaching Virtual USB Device..."
 Filename: "{sys}\pnputil.exe"; Parameters: "/delete-driver anyusb_vhci.inf /uninstall /force"; Flags: runhidden; StatusMsg: "Dynamically unloading Virtual USB Drivers..."
 Filename: "{sys}\pnputil.exe"; Parameters: "/delete-driver anyusb_filter.inf /uninstall /force"; Flags: runhidden; StatusMsg: "Dynamically unloading Capture Filter Driver..."
@@ -87,3 +83,95 @@ Filename: "{sys}\pnputil.exe"; Parameters: "/delete-driver anyusb_filter.inf /un
 ; Clean up Windows Firewall rules
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Daemon"""; Flags: runhidden; StatusMsg: "Cleaning up Windows Firewall rules..."
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro"""; Flags: runhidden
+
+[Code]
+var
+  RestartRequired: Boolean;
+
+// Comprehensive pre-flight validation checking all required driver files exist
+procedure ValidateDriverFilesInstalled();
+var
+  AppDir: String;
+  MissingList: String;
+begin
+  AppDir := ExpandConstant('{app}');
+  MissingList := '';
+
+  if not FileExists(AppDir + '\drivers\vhci\anyusb_vhci.inf') then
+    MissingList := MissingList + '  - ' + AppDir + '\drivers\vhci\anyusb_vhci.inf' + #13#10;
+  if not FileExists(AppDir + '\drivers\vhci\anyusb_vhci.sys') then
+    MissingList := MissingList + '  - ' + AppDir + '\drivers\vhci\anyusb_vhci.sys' + #13#10;
+  if not FileExists(AppDir + '\drivers\vhci\anyusb_vhci.cat') then
+    MissingList := MissingList + '  - ' + AppDir + '\drivers\vhci\anyusb_vhci.cat' + #13#10;
+  if not FileExists(AppDir + '\drivers\filter\anyusb_filter.inf') then
+    MissingList := MissingList + '  - ' + AppDir + '\drivers\filter\anyusb_filter.inf' + #13#10;
+  if not FileExists(AppDir + '\drivers\filter\anyusb_filter.sys') then
+    MissingList := MissingList + '  - ' + AppDir + '\drivers\filter\anyusb_filter.sys' + #13#10;
+  if not FileExists(AppDir + '\drivers\filter\anyusb_filter.cat') then
+    MissingList := MissingList + '  - ' + AppDir + '\drivers\filter\anyusb_filter.cat' + #13#10;
+
+  if MissingList <> '' then
+  begin
+    MsgBox('CRITICAL ERROR: Required driver package files are missing:' + #13#10#13#10 +
+           MissingList + #13#10 +
+           'Dynamic driver installation cannot proceed. Setup will now abort.',
+           mbCriticalError, MB_OK);
+    Abort();
+  end;
+end;
+
+// Install driver package via pnputil and handle exit codes
+function InstallDriverPackage(const InfPath: String): Boolean;
+var
+  PnpUtilPath: String;
+  Params: String;
+  ResultCode: Integer;
+begin
+  Result := False;
+  PnpUtilPath := ExpandConstant('{sys}\pnputil.exe');
+  Params := '/add-driver "' + InfPath + '" /install';
+
+  if not Exec(PnpUtilPath, Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    MsgBox(Format('Driver installation failed: unable to execute pnputil.exe for %s', [InfPath]), mbCriticalError, MB_OK);
+    Abort();
+    Exit;
+  end;
+
+  if ResultCode = 0 then
+  begin
+    // Exit code 0: Success without reboot
+    Result := True;
+  end
+  else if ResultCode = 3010 then
+  begin
+    // Exit code 3010 (ERROR_SUCCESS_REBOOT_REQUIRED): Success, but system restart required
+    RestartRequired := True;
+    Result := True;
+  end
+  else
+  begin
+    // Any other code: Show visible error modal: Driver installation failed: pnputil returned exit code %d and abort setup
+    MsgBox(Format('Driver installation failed: pnputil returned exit code %d', [ResultCode]), mbCriticalError, MB_OK);
+    Abort();
+    Exit;
+  end;
+end;
+
+function NeedRestart(): Boolean;
+begin
+  Result := RestartRequired;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  AppDir: String;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    ValidateDriverFilesInstalled();
+    AppDir := ExpandConstant('{app}');
+    InstallDriverPackage(AppDir + '\drivers\vhci\anyusb_vhci.inf');
+    InstallDriverPackage(AppDir + '\drivers\filter\anyusb_filter.inf');
+  end;
+end;

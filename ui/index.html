@@ -5,10 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>USB Master Pro — Enterprise P2P USB Virtualization Suite</title>
   <link rel="icon" type="image/x-icon" href="assets/favicon.ico">
-  <!-- Tailwind CSS CDN -->
-  <script src="https://cdn.tailwindcss.com"></script>
-  <!-- Lucide Icons -->
-  <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- Offline Tailwind CSS & Lucide Icons -->
+  <script src="assets/tailwind.min.js"></script>
+  <script src="assets/lucide.min.js"></script>
   <script>
     tailwind.config = {
       darkMode: 'class',
@@ -349,7 +348,7 @@
                 <div class="font-bold text-white font-mono">anyusb_filter.sys</div>
                 <div class="text-slate-400 text-[11px] mt-0.5">Upper Filter Driver (Kernel Mode Driver Framework 1.33)</div>
               </div>
-              <span class="px-2 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-[11px]">ACTIVE / HOOKED</span>
+              <span id="diagFilterBadge" class="px-2 py-1 rounded bg-slate-500/20 text-slate-300 font-mono font-bold text-[11px]">UNVERIFIED</span>
             </div>
 
             <div class="bg-darkBg p-3 rounded-xl border border-darkBorder flex items-center justify-between">
@@ -357,7 +356,7 @@
                 <div class="font-bold text-white font-mono">anyusb_vhci.sys</div>
                 <div class="text-slate-400 text-[11px] mt-0.5">Virtual USB Host Controller Interface (UPDO Bus Synthesizer)</div>
               </div>
-              <span class="px-2 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-[11px]">ACTIVE / ROOT HUB OK</span>
+              <span id="diagVhciBadge" class="px-2 py-1 rounded bg-slate-500/20 text-slate-300 font-mono font-bold text-[11px]">UNVERIFIED</span>
             </div>
 
             <div class="bg-darkBg p-3 rounded-xl border border-darkBorder flex items-center justify-between">
@@ -1037,9 +1036,9 @@
               </div>
               <p class="text-[11px] text-slate-400 mt-0.5">Intercepts physical URBs &amp; performs zero-copy buffering</p>
             </div>
-            <div id="wizFilterStatusBadge" class="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-xs">
-              <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse-slow"></span>
-              <span id="wizFilterStatusText">ACTIVE / HOOKED</span>
+            <div id="wizFilterStatusBadge" class="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-slate-800 text-slate-400 font-mono font-bold text-xs">
+              <span class="w-2 h-2 rounded-full bg-slate-500"></span>
+              <span id="wizFilterStatusText">UNVERIFIED</span>
             </div>
           </div>
 
@@ -1052,9 +1051,9 @@
               </div>
               <p class="text-[11px] text-slate-400 mt-0.5">Synthesizes virtual USB Root Hub &amp; UPDO child instances</p>
             </div>
-            <div id="wizVhciStatusBadge" class="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-xs">
-              <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse-slow"></span>
-              <span id="wizVhciStatusText">ACTIVE / ROOT HUB OK</span>
+            <div id="wizVhciStatusBadge" class="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-slate-800 text-slate-400 font-mono font-bold text-xs">
+              <span class="w-2 h-2 rounded-full bg-slate-500"></span>
+              <span id="wizVhciStatusText">UNVERIFIED</span>
             </div>
           </div>
 
@@ -1202,7 +1201,7 @@
         </div>
 
         <div id="wizProbeResultBox" class="p-3 bg-darkBg/80 border border-darkBorder rounded-xl text-[11px] font-mono text-cyan-300">
-          [PROBE] Direct UDP 443 round-trip: 0.049ms | WireGuard MTU 1420 bytes | Loss: 0.00%
+          [PROBE] Probe not initiated. Click 'Test Outbound 443' to verify connectivity.
         </div>
       </div>
 
@@ -2432,30 +2431,48 @@
       showToast('PIN Copied', 'Local node security PIN copied to clipboard.');
     }
 
-    function runRttProbe() {
+    async function runRttProbe() {
       rttProbeSequence++;
       const now = new Date();
       const timeStr = now.toTimeString().split(' ')[0] + '.' + String(now.getMilliseconds()).padStart(3, '0');
-      const simulatedRtt = (0.040 + Math.random() * 0.015).toFixed(3);
-      const simulatedJitter = (0.008 + Math.random() * 0.005).toFixed(3);
+      const startTime = performance.now();
 
-      const rttDisp = document.getElementById('diagRttDisplay');
-      if (rttDisp) rttDisp.textContent = `${simulatedRtt} ms`;
-      const rttVal = document.getElementById('diagRttVal');
-      if (rttVal) rttVal.textContent = `${simulatedRtt} ms (P2P SCTP)`;
-      const footerRtt = document.getElementById('footerLatencyVal');
-      if (footerRtt) footerRtt.textContent = `${simulatedRtt} ms`;
+      try {
+        const res = await fetch(`${API_BASE}/api/status`);
+        const measuredRtt = (performance.now() - startTime).toFixed(2);
+        const data = res.ok ? await res.json() : null;
+        const brokerLatency = data && data.rd_service_latency_ms ? data.rd_service_latency_ms.toFixed(2) : measuredRtt;
 
-      const consoleEl = document.getElementById('diagLogConsole');
-      if (consoleEl) {
-        const line = document.createElement('div');
-        line.className = "text-emerald-400";
-        line.textContent = `[${timeStr}] PROBE #${rttProbeSequence}: RTT ${simulatedRtt}ms | Jitter: ${simulatedJitter}ms | Loss: 0.0% | Status: OPTIMAL`;
-        consoleEl.appendChild(line);
-        consoleEl.scrollTop = consoleEl.scrollHeight;
+        const rttDisp = document.getElementById('diagRttDisplay');
+        if (rttDisp) rttDisp.textContent = `${measuredRtt} ms`;
+        const rttVal = document.getElementById('diagRttVal');
+        if (rttVal) rttVal.textContent = `${measuredRtt} ms (IPC Daemon)`;
+        const footerRtt = document.getElementById('footerLatencyVal');
+        if (footerRtt) footerRtt.textContent = `${measuredRtt} ms`;
+
+        const consoleEl = document.getElementById('diagLogConsole');
+        if (consoleEl) {
+          const line = document.createElement('div');
+          line.className = "text-emerald-400";
+          line.textContent = `[${timeStr}] PROBE #${rttProbeSequence}: Local IPC RTT ${measuredRtt}ms | Service Latency: ${brokerLatency}ms | Status: ACTIVE`;
+          consoleEl.appendChild(line);
+          consoleEl.scrollTop = consoleEl.scrollHeight;
+        }
+
+        showToast('Latency Probe Complete', `Local daemon RTT: ${measuredRtt} ms.`);
+      } catch (err) {
+        const rttDisp = document.getElementById('diagRttDisplay');
+        if (rttDisp) rttDisp.textContent = `ERR`;
+        const consoleEl = document.getElementById('diagLogConsole');
+        if (consoleEl) {
+          const line = document.createElement('div');
+          line.className = "text-rose-400";
+          line.textContent = `[${timeStr}] PROBE #${rttProbeSequence}: Connection failed (${err.message})`;
+          consoleEl.appendChild(line);
+          consoleEl.scrollTop = consoleEl.scrollHeight;
+        }
+        showToast('Probe Failed', 'Unable to reach local daemon API.');
       }
-
-      showToast('RTT Probe Complete', `Live latency: ${simulatedRtt} ms (UDP 443 P2P direct path).`);
     }
 
     function clearDiagLogs() {
@@ -2637,53 +2654,181 @@
       const daemonBadge = document.getElementById('wizDaemonStatusBadge');
       const filterText = document.getElementById('wizFilterStatusText');
       const vhciText = document.getElementById('wizVhciStatusText');
+      const diagFilterBadge = document.getElementById('diagFilterBadge');
+      const diagVhciBadge = document.getElementById('diagVhciBadge');
+
+      function renderDiagBadge(badgeEl, status) {
+        if (!badgeEl) return;
+        const s = (status || '').toLowerCase();
+        let badgeClass = "px-2 py-1 rounded font-mono font-bold text-[11px] ";
+        let label = "UNKNOWN";
+
+        if (s === 'accessible') {
+          badgeClass += "bg-emerald-500/20 text-emerald-300";
+          label = "ACCESSIBLE / OPERATIONAL";
+        } else if (s === 'unavailable') {
+          badgeClass += "bg-rose-500/20 text-rose-300";
+          label = "NOT INSTALLED / UNAVAILABLE";
+        } else if (s === 'access_denied') {
+          badgeClass += "bg-amber-500/20 text-amber-300";
+          label = "ACCESS DENIED (RUN AS ADMIN)";
+        } else if (s === 'unsupported' || s === 'unsupported_platform') {
+          badgeClass += "bg-slate-700/60 text-slate-300";
+          label = "UNSUPPORTED PLATFORM (LINUX)";
+        } else if (s === 'test_stub') {
+          badgeClass += "bg-blue-500/20 text-blue-300";
+          label = "TEST STUB (EMULATION)";
+        } else {
+          badgeClass += "bg-slate-700/60 text-slate-300";
+          label = (status || 'UNKNOWN').toUpperCase();
+        }
+        badgeEl.className = badgeClass;
+        badgeEl.textContent = label;
+      }
+
+      function renderDriverBadge(badgeEl, textEl, status) {
+        if (!badgeEl) return;
+        const s = (status || '').toLowerCase();
+        let badgeClass = "flex items-center space-x-1.5 px-2.5 py-1 rounded font-mono font-bold text-xs ";
+        let dotClass = "w-2 h-2 rounded-full ";
+        let label = "UNKNOWN";
+
+        if (s === 'accessible') {
+          badgeClass += "bg-emerald-500/20 text-emerald-300";
+          dotClass += "bg-emerald-400";
+          label = "ACCESSIBLE / OPERATIONAL";
+        } else if (s === 'unavailable') {
+          badgeClass += "bg-rose-500/20 text-rose-300";
+          dotClass += "bg-rose-400";
+          label = "NOT INSTALLED / UNAVAILABLE";
+        } else if (s === 'access_denied') {
+          badgeClass += "bg-amber-500/20 text-amber-300";
+          dotClass += "bg-amber-400";
+          label = "ACCESS DENIED (RUN AS ADMIN)";
+        } else if (s === 'unsupported' || s === 'unsupported_platform') {
+          badgeClass += "bg-slate-700/60 text-slate-300";
+          dotClass += "bg-slate-400";
+          label = "UNSUPPORTED PLATFORM (LINUX)";
+        } else if (s === 'test_stub') {
+          badgeClass += "bg-blue-500/20 text-blue-300";
+          dotClass += "bg-blue-400";
+          label = "TEST STUB (EMULATION)";
+        } else {
+          badgeClass += "bg-slate-700/60 text-slate-300";
+          dotClass += "bg-slate-400";
+          label = (status || 'UNKNOWN').toUpperCase();
+        }
+
+        badgeEl.className = badgeClass;
+        badgeEl.innerHTML = `<span class="${dotClass}"></span><span id="${textEl ? textEl.id : ''}">${label}</span>`;
+      }
+
+      function renderDisconnectedBadge(badgeEl, textEl) {
+        if (!badgeEl) return;
+        badgeEl.className = "flex items-center space-x-1.5 px-2.5 py-1 rounded bg-rose-500/20 text-rose-300 font-mono font-bold text-xs";
+        badgeEl.innerHTML = `<span class="w-2 h-2 rounded-full bg-rose-400"></span><span id="${textEl ? textEl.id : ''}">DAEMON DISCONNECTED / UNREACHABLE</span>`;
+      }
 
       try {
         const res = await fetch(`${API_BASE}/api/system/drivers`);
         if (res.ok) {
           const data = await res.json();
-          if (filterBadge && filterText) {
-            filterText.textContent = data.filter || 'ACTIVE / HOOKED';
+          const vhciStatus = data.vhci && data.vhci.status ? data.vhci.status : (data.vhci_installed ? 'accessible' : 'unavailable');
+          const filterStatus = data.filter && data.filter.status ? data.filter.status : (data.filter_installed ? 'accessible' : 'unavailable');
+
+          renderDriverBadge(filterBadge, filterText, filterStatus);
+          renderDriverBadge(vhciBadge, vhciText, vhciStatus);
+          renderDiagBadge(diagFilterBadge, filterStatus);
+          renderDiagBadge(diagVhciBadge, vhciStatus);
+
+          if (daemonBadge) {
+            daemonBadge.className = "flex items-center space-x-1.5 px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-xs";
+            daemonBadge.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-400"></span><span>ONLINE (HTTP/WS)</span>';
           }
-          if (vhciBadge && vhciText) {
-            vhciText.textContent = data.vhci || 'ACTIVE / ROOT HUB OK';
+
+          if (data.is_operational) {
+            showToast('Drivers Verified', 'Kernel upper filter & VHCI bus synthesizer active.');
+          } else if (data.platform === 'linux' || vhciStatus === 'unsupported' || vhciStatus === 'unsupported_platform') {
+            showToast('Platform Notice', data.vhci && data.vhci.message ? data.vhci.message : 'Windows KMDF driver is unsupported on Linux host. Windows 10/11 x64 required.');
+          } else {
+            showToast('Driver Status', `VHCI: ${vhciStatus}, Filter: ${filterStatus}`);
           }
         } else {
-          if (filterBadge && filterText) filterText.textContent = 'ACTIVE / HOOKED (KMDF 1.33)';
-          if (vhciBadge && vhciText) vhciText.textContent = 'ACTIVE / ROOT HUB OK';
+          renderDisconnectedBadge(filterBadge, filterText);
+          renderDisconnectedBadge(vhciBadge, vhciText);
+          if (diagFilterBadge) { diagFilterBadge.className = "px-2 py-1 rounded bg-rose-500/20 text-rose-300 font-mono font-bold text-[11px]"; diagFilterBadge.textContent = "DAEMON DISCONNECTED"; }
+          if (diagVhciBadge) { diagVhciBadge.className = "px-2 py-1 rounded bg-rose-500/20 text-rose-300 font-mono font-bold text-[11px]"; diagVhciBadge.textContent = "DAEMON DISCONNECTED"; }
+          if (daemonBadge) {
+            daemonBadge.className = "flex items-center space-x-1.5 px-2.5 py-1 rounded bg-rose-500/20 text-rose-300 font-mono font-bold text-xs";
+            daemonBadge.innerHTML = '<span class="w-2 h-2 rounded-full bg-rose-400"></span><span>DAEMON ERROR</span>';
+          }
+          showToast('Verification Failed', 'Daemon returned error response.');
         }
       } catch (e) {
-        if (filterBadge && filterText) filterText.textContent = 'ACTIVE / HOOKED (KMDF 1.33)';
-        if (vhciBadge && vhciText) vhciText.textContent = 'ACTIVE / ROOT HUB OK';
+        renderDisconnectedBadge(filterBadge, filterText);
+        renderDisconnectedBadge(vhciBadge, vhciText);
+        if (diagFilterBadge) { diagFilterBadge.className = "px-2 py-1 rounded bg-rose-500/20 text-rose-300 font-mono font-bold text-[11px]"; diagFilterBadge.textContent = "DAEMON DISCONNECTED"; }
+        if (diagVhciBadge) { diagVhciBadge.className = "px-2 py-1 rounded bg-rose-500/20 text-rose-300 font-mono font-bold text-[11px]"; diagVhciBadge.textContent = "DAEMON DISCONNECTED"; }
+        if (daemonBadge) {
+          daemonBadge.className = "flex items-center space-x-1.5 px-2.5 py-1 rounded bg-rose-500/20 text-rose-300 font-mono font-bold text-xs";
+          daemonBadge.innerHTML = '<span class="w-2 h-2 rounded-full bg-rose-400"></span><span>DAEMON DISCONNECTED / UNREACHABLE</span>';
+        }
+        showToast('Daemon Unreachable', 'Daemon disconnected or offline at 127.0.0.1:19842.');
       }
-      if (daemonBadge) {
-        daemonBadge.className = "flex items-center space-x-1.5 px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-xs";
-      }
-      showToast('Drivers Verified', 'Kernel upper filter & VHCI bus synthesizer active.');
     }
 
-    function runWizardNetworkProbe() {
+    async function runWizardNetworkProbe() {
       const probeBox = document.getElementById('wizProbeResultBox');
       const udpBadge = document.getElementById('wizUdpStatusBadge');
       const tlsBadge = document.getElementById('wizTlsStatusBadge');
 
-      const simRtt = (0.042 + Math.random() * 0.012).toFixed(3);
-      if (probeBox) {
-        probeBox.innerHTML = `
-          <div class="text-emerald-400 font-bold">[PROBE SUCCESS] Outbound UDP 443 WebRTC SCTP DataChannels verified.</div>
-          <div class="text-slate-300 mt-1">Signaling Broker: <span class="text-cyan-300 font-semibold">wss://broker.bhartx.in:443 (TLS 1.3 Handshake 200 OK)</span></div>
-          <div class="text-slate-400 mt-0.5">Wire Round-Trip: <span class="text-white font-bold">${simRtt} ms</span> | Loss: <span class="text-emerald-400 font-semibold">0.00%</span> | MTU: <span class="text-cyan-400 font-mono">1420 bytes</span></div>
-        `;
+      const startTime = performance.now();
+      try {
+        const res = await fetch(`${API_BASE}/api/status`);
+        const rtt = (performance.now() - startTime).toFixed(2);
+        if (res.ok) {
+          const statusData = await res.json();
+          const brokerConnected = Boolean(statusData.broker_connected);
+          const brokerUrl = statusData.broker_url || 'wss://broker.bhartx.in:443';
+
+          if (probeBox) {
+            probeBox.innerHTML = `
+              <div class="text-emerald-400 font-bold">[PROBE SUCCESS] Local Daemon IPC verified in ${rtt} ms.</div>
+              <div class="text-slate-300 mt-1">Signaling Broker: <span class="text-cyan-300 font-semibold">${brokerUrl} (${brokerConnected ? 'Connected' : 'Connecting / Idle'})</span></div>
+              <div class="text-slate-400 mt-0.5">Daemon Round-Trip: <span class="text-white font-bold">${rtt} ms</span> | RD Service Latency: <span class="text-cyan-400 font-mono">${statusData.rd_service_latency_ms || 0} ms</span></div>
+            `;
+          }
+          if (udpBadge) {
+            udpBadge.className = "px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-xs";
+            udpBadge.textContent = "IPC PROBE OK";
+          }
+          if (tlsBadge) {
+            tlsBadge.className = brokerConnected
+              ? "px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-xs"
+              : "px-2.5 py-1 rounded bg-amber-500/20 text-amber-300 font-mono font-bold text-xs";
+            tlsBadge.textContent = brokerConnected ? "REACHABLE / 200 OK" : "BROKER CONNECTING";
+          }
+          showToast('Connectivity Verified', `Daemon IPC latency: ${rtt} ms.`);
+        } else {
+          throw new Error(`HTTP ${res.status}`);
+        }
+      } catch (err) {
+        if (probeBox) {
+          probeBox.innerHTML = `
+            <div class="text-rose-400 font-bold">[PROBE FAILED] Daemon offline or unreachable.</div>
+            <div class="text-slate-400 mt-1">Status: Probe not initiated / Daemon disconnected (${err.message})</div>
+          `;
+        }
+        if (udpBadge) {
+          udpBadge.className = "px-2.5 py-1 rounded bg-rose-500/20 text-rose-300 font-mono font-bold text-xs";
+          udpBadge.textContent = "UNREACHABLE";
+        }
+        if (tlsBadge) {
+          tlsBadge.className = "px-2.5 py-1 rounded bg-rose-500/20 text-rose-300 font-mono font-bold text-xs";
+          tlsBadge.textContent = "OFFLINE";
+        }
+        showToast('Probe Failed', 'Daemon unreachable at 127.0.0.1:19842.');
       }
-      if (udpBadge) {
-        udpBadge.className = "px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-xs";
-        udpBadge.textContent = "ALLOWED / OPEN";
-      }
-      if (tlsBadge) {
-        tlsBadge.className = "px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-xs";
-        tlsBadge.textContent = "REACHABLE / 200 OK";
-      }
-      showToast('Connectivity Verified', `Outbound UDP & TLS 443 active. Latency: ${simRtt} ms.`);
     }
 
     // --- 2. OFFLINE LICENSE ACTIVATION MODAL LOGIC ---
@@ -2882,18 +3027,15 @@
       if (devDisplay) devDisplay.textContent = devName || 'USB Peripheral';
 
       telemetryDataPoints = [];
-      let val = 0.046;
+      const initialLatency = 0.0;
       for (let i = 0; i < 25; i++) {
-        val += (Math.random() - 0.5) * 0.003;
-        if (val < 0.038) val = 0.038;
-        if (val > 0.055) val = 0.055;
-        telemetryDataPoints.push(parseFloat(val.toFixed(3)));
+        telemetryDataPoints.push(initialLatency);
       }
 
       drawTelemetrySparkline();
 
       clearInterval(telemetryTimer);
-      telemetryTimer = setInterval(tickTelemetryData, 150);
+      telemetryTimer = setInterval(tickTelemetryData, 500);
 
       if (modal) {
         modal.classList.remove('hidden');
@@ -2910,21 +3052,25 @@
       }
     }
 
-    function tickTelemetryData() {
-      if (!telemetryDataPoints.length) return;
-      let last = telemetryDataPoints[telemetryDataPoints.length - 1];
-      let next = last + (Math.random() - 0.49) * 0.004;
-      if (next < 0.036) next = 0.038;
-      if (next > 0.058) next = 0.055;
-      next = parseFloat(next.toFixed(3));
+    async function tickTelemetryData() {
+      let next = 0.0;
+      try {
+        const res = await fetch(`${API_BASE}/api/status`);
+        if (res.ok) {
+          const data = await res.json();
+          next = data && typeof data.rd_service_latency_ms === 'number' ? parseFloat(data.rd_service_latency_ms.toFixed(2)) : 0.0;
+        }
+      } catch (_) {
+        next = 0.0;
+      }
 
       telemetryDataPoints.push(next);
       if (telemetryDataPoints.length > 25) {
         telemetryDataPoints.shift();
       }
 
-      const minVal = Math.min(...telemetryDataPoints).toFixed(3);
-      const maxVal = Math.max(...telemetryDataPoints).toFixed(3);
+      const minVal = Math.min(...telemetryDataPoints).toFixed(2);
+      const maxVal = Math.max(...telemetryDataPoints).toFixed(2);
 
       const minEl = document.getElementById('telemetryMinRtt');
       const maxEl = document.getElementById('telemetryMaxRtt');
@@ -3018,15 +3164,15 @@
       const subtitleEl = document.getElementById('devModalSubtitle');
       const stateBadge = document.getElementById('devModalStateBadge');
 
-      const name = dev ? (dev.friendly_name || dev.name || 'USB Device') : 'Mantra MFS100 Optical Fingerprint Scanner';
-      const icon = dev ? resolveDeviceCategoryIcon(dev) : '🪪';
-      const vid = dev && dev.vid ? dev.vid : 0x27D0;
-      const pid = dev && dev.pid ? dev.pid : 0x0041;
-      const vidHex = "0x" + vid.toString(16).toUpperCase().padStart(4, '0');
-      const pidHex = "0x" + pid.toString(16).toUpperCase().padStart(4, '0');
-      const portPath = dev && dev.port_path ? dev.port_path : '1-4.2.1';
-      const speed = dev && dev.speed ? dev.speed : 'High-Speed (480 Mbps)';
-      const serial = dev && dev.serial ? dev.serial : `MFS100-IN-2026-${(vid + pid * 3).toString(16).toUpperCase()}A`;
+      const name = dev ? (dev.friendly_name || dev.name || 'USB Device') : 'USB Peripheral';
+      const icon = dev ? resolveDeviceCategoryIcon(dev) : '🔌';
+      const vid = dev && dev.vid ? dev.vid : 0;
+      const pid = dev && dev.pid ? dev.pid : 0;
+      const vidHex = vid ? "0x" + vid.toString(16).toUpperCase().padStart(4, '0') : "0x0000";
+      const pidHex = pid ? "0x" + pid.toString(16).toUpperCase().padStart(4, '0') : "0x0000";
+      const portPath = dev && dev.port_path ? dev.port_path : 'N/A';
+      const speed = dev && dev.speed ? dev.speed : 'Unknown';
+      const serial = dev && dev.serial ? dev.serial : 'N/A';
 
       if (iconContainer) iconContainer.textContent = icon;
       if (titleEl) titleEl.textContent = name;

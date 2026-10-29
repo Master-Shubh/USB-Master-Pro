@@ -80,6 +80,11 @@ jobs:
                   Write-Host "Copied toolset from $($ts.FullName) to $vsMsbuildToolsetDir"
               }
           }
+
+          if (-not (Test-Path $vsMsbuildToolsetDir)) {
+              throw "FATAL: WindowsKernelModeDriver10.0 platform toolset missing"
+          }
+          Write-Host "Verified WDK toolset present at: $vsMsbuildToolsetDir"
           Write-Host "WDK 11 toolchain configuration completed successfully."
 
       - name: Compile KMDF Drivers (anyusb_vhci & anyusb_filter)
@@ -88,28 +93,32 @@ jobs:
           Write-Host "Compiling anyusb_vhci.vcxproj (Release | x64)..."
           Write-Host "=================================================================="
           msbuild drivers/vhci/anyusb_vhci.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /v:m
+          if ($LASTEXITCODE -ne 0) {
+              throw "FATAL: MSBuild compilation of anyusb_vhci.vcxproj failed with exit code $LASTEXITCODE"
+          }
 
           $vhciSys = Get-ChildItem -Path . -Recurse -Filter "anyusb_vhci.sys" | Select-Object -First 1
           if ($vhciSys) {
               Copy-Item $vhciSys.FullName "drivers/vhci/anyusb_vhci.sys" -Force
               Write-Host "Successfully staged drivers/vhci/anyusb_vhci.sys ($($vhciSys.Length) bytes)"
           } else {
-              Write-Error "anyusb_vhci.sys was not produced by MSBuild!"
-              exit 1
+              throw "FATAL: anyusb_vhci.sys was not produced by MSBuild!"
           }
 
           Write-Host "=================================================================="
           Write-Host "Compiling anyusb_filter.vcxproj (Release | x64)..."
           Write-Host "=================================================================="
           msbuild drivers/filter/anyusb_filter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /v:m
+          if ($LASTEXITCODE -ne 0) {
+              throw "FATAL: MSBuild compilation of anyusb_filter.vcxproj failed with exit code $LASTEXITCODE"
+          }
 
           $filterSys = Get-ChildItem -Path . -Recurse -Filter "anyusb_filter.sys" | Select-Object -First 1
           if ($filterSys) {
               Copy-Item $filterSys.FullName "drivers/filter/anyusb_filter.sys" -Force
               Write-Host "Successfully staged drivers/filter/anyusb_filter.sys ($($filterSys.Length) bytes)"
           } else {
-              Write-Error "anyusb_filter.sys was not produced by MSBuild!"
-              exit 1
+              throw "FATAL: anyusb_filter.sys was not produced by MSBuild!"
           }
 
       - name: Generate Catalogs (Inf2Cat) & Test-Sign Drivers
@@ -118,6 +127,9 @@ jobs:
           Write-Host "Executing automated field-test signing via setup_field_test_signing.ps1..."
           Write-Host "=================================================================="
           & ".\scripts\setup_field_test_signing.ps1" -DriverRootPath "$PWD\drivers" -ForceRegenerateCert
+          if ($LASTEXITCODE -ne 0) {
+              throw "FATAL: setup_field_test_signing.ps1 failed with exit code $LASTEXITCODE"
+          }
 
           $expectedDriverFiles = @(
               "drivers/vhci/anyusb_vhci.sys",
@@ -130,10 +142,28 @@ jobs:
           )
           foreach ($file in $expectedDriverFiles) {
               if (-not (Test-Path $file)) {
-                  Write-Error "Missing expected driver package artifact: $file"
-                  exit 1
+                  throw "FATAL: Missing expected driver package artifact: $file"
               }
-              Write-Host "Verified driver file: $file ($((Get-Item $file).Length) bytes)"
+              $fileItem = Get-Item $file
+              if ($fileItem.Length -le 0) {
+                  throw "FATAL: Driver package artifact $file is empty (0 bytes)!"
+              }
+              Write-Host "Verified driver file: $file ($($fileItem.Length) bytes)"
+          }
+
+          # Verify that .sys and .cat files exist and have valid digital signatures
+          $signedDriverArtifacts = @(
+              "drivers/vhci/anyusb_vhci.sys",
+              "drivers/vhci/anyusb_vhci.cat",
+              "drivers/filter/anyusb_filter.sys",
+              "drivers/filter/anyusb_filter.cat"
+          )
+          foreach ($sf in $signedDriverArtifacts) {
+              $sig = Get-AuthenticodeSignature -FilePath $sf
+              if ($sig.Status -ne "Valid") {
+                  throw "FATAL: Digital signature verification failed for $sf (Status: $($sig.Status))"
+              }
+              Write-Host "Verified valid Authenticode signature for $sf (Signer: $($sig.SignerCertificate.Subject))"
           }
 
       - name: Compile Rust Turbo-URB Engine (usb_master_daemon & usb_master_cli)
@@ -199,6 +229,32 @@ jobs:
           Copy-Item "scripts/setup_field_test_signing.ps1" "$bundleDir\" -Force
           Copy-Item "README_INSTALL.md" "$bundleDir\" -Force
 
+          # Explicit Packaging Validation Step
+          Write-Host "=================================================================="
+          Write-Host "Validating release bundle contents in $bundleDir..."
+          Write-Host "=================================================================="
+          $expectedBundleFiles = @(
+              "usb_master_daemon.exe",
+              "usb_master_cli.exe",
+              "drivers\vhci\anyusb_vhci.sys",
+              "drivers\vhci\anyusb_vhci.inf",
+              "drivers\vhci\anyusb_vhci.cat",
+              "drivers\filter\anyusb_filter.sys",
+              "drivers\filter\anyusb_filter.inf",
+              "drivers\filter\anyusb_filter.cat"
+          )
+          foreach ($relPath in $expectedBundleFiles) {
+              $fullPath = Join-Path $bundleDir $relPath
+              if (-not (Test-Path $fullPath)) {
+                  throw "FATAL: Expected bundle file missing: $relPath at $fullPath"
+              }
+              $fItem = Get-Item $fullPath
+              if ($fItem.Length -le 0) {
+                  throw "FATAL: Expected bundle file $relPath is empty (0 bytes)!"
+              }
+              Write-Host "Verified bundle artifact: $relPath ($($fItem.Length) bytes)"
+          }
+
           # 4. Generate Zip Archive
           $zipPath = "$PWD\dist\usb-master-pro-windows-x64.zip"
           Compress-Archive -Path "$bundleDir\*" -DestinationPath $zipPath -Force
@@ -217,7 +273,15 @@ jobs:
 
           choco install innosetup --no-progress -y
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\usb_master_pro.iss
-          Write-Host "Setup Wizard compiled successfully in dist/installer/"
+          if ($LASTEXITCODE -ne 0) {
+              throw "FATAL: Inno Setup compiler (ISCC.exe) failed with exit code $LASTEXITCODE"
+          }
+
+          $installerPath = "dist\installer\USBMasterPro-Setup-v1.0.0.exe"
+          if (-not (Test-Path $installerPath)) {
+              throw "FATAL: Setup Wizard executable was not produced at $installerPath"
+          }
+          Write-Host "Setup Wizard compiled successfully: $installerPath ($((Get-Item $installerPath).Length) bytes)"
 
       - name: Upload Release Bundle (usb-master-pro-windows-x64.zip)
         uses: actions/upload-artifact@v4
@@ -228,8 +292,7 @@ jobs:
 
       - name: Upload 1-Click Setup Wizard Installer (USBMasterPro-Setup-v1.0.0.exe)
         uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: USB-Master-Pro-v1.0.0-Setup-Wizard
           path: dist/installer/USBMasterPro-Setup-v1.0.0.exe
-          if-no-files-found: warn
+          if-no-files-found: error

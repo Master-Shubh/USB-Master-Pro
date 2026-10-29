@@ -271,6 +271,17 @@ pub enum UrbPayload {
     },
 }
 
+impl UrbPayload {
+    pub fn data_len(&self) -> usize {
+        match self {
+            UrbPayload::Control { data, .. } => data.len(),
+            UrbPayload::BulkOrInterrupt { data } => data.len(),
+            UrbPayload::Isochronous { data, .. } => data.len(),
+            _ => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UrbRequest {
     pub sequence_id: u64,
@@ -595,6 +606,12 @@ impl UrbEngine {
     /// Enqueues an URB request into the bounded in-flight ring buffer.
     /// Returns `Err(UrbEngineError::PipelineCongested { max_capacity: 256 })` if full.
     pub fn enqueue_urb(&mut self, req: UrbRequest) -> Result<(), UrbEngineError> {
+        if req.payload.data_len() > crate::driver_client::ANYUSB_MAX_URB_BUFFER_SIZE {
+            return Err(UrbEngineError::InvalidParameter(format!(
+                "URB payload length ({} B) exceeds 64 KB single-URB hardware buffer limit",
+                req.payload.data_len()
+            )));
+        }
         self.in_flight.insert(req)
     }
 

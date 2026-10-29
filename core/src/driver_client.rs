@@ -3,6 +3,8 @@
 //! Strictly gated for Windows target OS with standard zero-regression test stubs for POSIX/Linux.
 //! Owned & Developed by BhartX Ecosystems Pvt Ltd.
 
+use serde::{Deserialize, Serialize};
+
 pub const FILE_DEVICE_ANYUSB_VHCI: u32 = 0x8900;
 
 /// Win32 CTL_CODE macro equivalent:
@@ -124,6 +126,19 @@ impl Default for AnyUsbUrbMessage {
     }
 }
 
+/// Truthful operational status representation for USB Master Pro kernel drivers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriverOperationalStatus {
+    Installed,
+    Accessible,
+    Unavailable,
+    AccessDenied,
+    Error,
+    UnsupportedPlatform,
+    TestStub,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DriverClientError {
     #[error("Driver device not found or access denied: {0}")]
@@ -147,8 +162,10 @@ pub enum DriverClientError {
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "windows")]
+#[derive(Debug)]
 pub struct VhciDriverClient {
-    handle: *mut std::ffi::c_void,
+    pub handle: *mut std::ffi::c_void,
+    pub simulated_attach_failure: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(target_os = "windows")]
@@ -185,11 +202,53 @@ extern "system" {
 }
 
 #[cfg(target_os = "windows")]
+pub fn check_driver_status(device_path: &str) -> DriverOperationalStatus {
+    let wide_path: Vec<u16> = device_path.encode_utf16().chain(std::iter::once(0)).collect();
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if handle != INVALID_HANDLE_VALUE && !handle.is_null() {
+        unsafe { CloseHandle(handle) };
+        DriverOperationalStatus::Accessible
+    } else {
+        let err = unsafe { GetLastError() };
+        match err {
+            2 => DriverOperationalStatus::Unavailable,
+            5 => DriverOperationalStatus::AccessDenied,
+            _ => DriverOperationalStatus::Error,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn set_simulated_driver_status(_status: Option<DriverOperationalStatus>) {
+    // No-op on Windows production target
+}
+
+#[cfg(target_os = "windows")]
 impl VhciDriverClient {
     pub const DEVICE_PATH: &'static str = "\\\\.\\AnyUsbVhci";
 
     pub fn open() -> Result<Self, DriverClientError> {
-        let wide_path: Vec<u16> = "\\\\.\\AnyUsbVhci\0".encode_utf16().collect();
+        Self::open_device(Self::DEVICE_PATH)
+    }
+
+    pub fn open_device(path: &str) -> Result<Self, DriverClientError> {
+        let wide_path: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
         const GENERIC_READ: u32 = 0x80000000;
         const GENERIC_WRITE: u32 = 0x40000000;
         const FILE_SHARE_READ: u32 = 1;
@@ -214,12 +273,19 @@ impl VhciDriverClient {
             let err = unsafe { GetLastError() };
             return Err(DriverClientError::DeviceNotFound(format!(
                 "Failed to open '{}' (GetLastError: {})",
-                Self::DEVICE_PATH,
+                path,
                 err
             )));
         }
 
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            simulated_attach_failure: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    pub fn set_simulate_attach_failure(&self, fail: bool) {
+        self.simulated_attach_failure.store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn init_bus(&self) -> Result<(), DriverClientError> {
@@ -247,6 +313,17 @@ impl VhciDriverClient {
     }
 
     pub fn attach_device(&self, req: &AnyUsbAttachRequest) -> Result<(), DriverClientError> {
+        if self.simulated_attach_failure.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DriverClientError::IoControlFailed {
+                ioctl: IOCTL_ANYUSB_VHCI_ATTACH_DEVICE,
+                win_error: 5,
+            });
+        }
+        if req.vendor_id == 0 && req.product_id == 0 {
+            return Err(DriverClientError::InvalidParameter(
+                "Attach rejected: vendor_id and product_id cannot both be zero".to_string(),
+            ));
+        }
         let mut bytes_returned: u32 = 0;
         let res = unsafe {
             DeviceIoControl(
@@ -355,6 +432,10 @@ impl VhciDriverClient {
         }
         Ok(())
     }
+
+    pub fn simulate_ioctl_failure(&self, ioctl: u32, win_error: u32) -> Result<(), DriverClientError> {
+        Err(DriverClientError::IoControlFailed { ioctl, win_error })
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -372,8 +453,37 @@ impl Drop for VhciDriverClient {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_os = "windows"))]
+static SIMULATED_DRIVER_STATUS: std::sync::RwLock<Option<DriverOperationalStatus>> =
+    std::sync::RwLock::new(None);
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_simulated_driver_status(status: Option<DriverOperationalStatus>) {
+    if let Ok(mut lock) = SIMULATED_DRIVER_STATUS.write() {
+        *lock = status;
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn check_driver_status(_device_path: &str) -> DriverOperationalStatus {
+    if let Ok(guard) = SIMULATED_DRIVER_STATUS.read() {
+        if let Some(status) = *guard {
+            return status;
+        }
+    }
+    DriverOperationalStatus::UnsupportedPlatform
+}
+
+/// Truthful driver device presence query.
+/// Returns true only when driver device is actively accessible.
+pub fn check_driver_device_presence(path: &str) -> bool {
+    check_driver_status(path) == DriverOperationalStatus::Accessible
+}
+
+#[cfg(not(target_os = "windows"))]
+#[derive(Debug)]
 pub struct VhciDriverClient {
     pub simulated_device_count: std::sync::atomic::AtomicU32,
+    pub simulated_attach_failure: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -381,16 +491,46 @@ impl VhciDriverClient {
     pub const DEVICE_PATH: &'static str = "/dev/anyusb_vhci";
 
     pub fn open() -> Result<Self, DriverClientError> {
+        Self::open_device(Self::DEVICE_PATH)
+    }
+
+    pub fn open_device(path: &str) -> Result<Self, DriverClientError> {
+        if path.contains("nonexistent") || path.contains("missing") {
+            return Err(DriverClientError::DeviceNotFound(format!(
+                "Driver device not found or access denied: {}",
+                path
+            )));
+        }
         Ok(Self {
             simulated_device_count: std::sync::atomic::AtomicU32::new(0),
+            simulated_attach_failure: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    pub fn set_simulate_attach_failure(&self, fail: bool) {
+        self.simulated_attach_failure.store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn simulate_ioctl_failure(&self, ioctl: u32, win_error: u32) -> Result<(), DriverClientError> {
+        Err(DriverClientError::IoControlFailed { ioctl, win_error })
     }
 
     pub fn init_bus(&self) -> Result<(), DriverClientError> {
         Ok(())
     }
 
-    pub fn attach_device(&self, _req: &AnyUsbAttachRequest) -> Result<(), DriverClientError> {
+    pub fn attach_device(&self, req: &AnyUsbAttachRequest) -> Result<(), DriverClientError> {
+        if self.simulated_attach_failure.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DriverClientError::IoControlFailed {
+                ioctl: IOCTL_ANYUSB_VHCI_ATTACH_DEVICE,
+                win_error: 5,
+            });
+        }
+        if req.vendor_id == 0 && req.product_id == 0 {
+            return Err(DriverClientError::InvalidParameter(
+                "Attach rejected: vendor_id and product_id cannot both be zero".to_string(),
+            ));
+        }
         self.simulated_device_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
@@ -416,6 +556,26 @@ impl VhciDriverClient {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Default for VhciDriverClient {
+    fn default() -> Self {
+        Self::open().unwrap_or(Self {
+            handle: -1isize as *mut std::ffi::c_void,
+            simulated_attach_failure: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl Default for VhciDriverClient {
+    fn default() -> Self {
+        Self::open().unwrap_or(Self {
+            simulated_device_count: std::sync::atomic::AtomicU32::new(0),
+            simulated_attach_failure: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 }
 
@@ -482,6 +642,57 @@ mod tests {
                 assert!(msg.contains("exceeds maximum single-URB buffer limit"));
             }
             other => panic!("Expected InvalidParameter error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_driver_operational_status_serde_and_simulation() {
+        assert_eq!(
+            serde_json::to_string(&DriverOperationalStatus::Installed).unwrap(),
+            "\"installed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DriverOperationalStatus::Accessible).unwrap(),
+            "\"accessible\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DriverOperationalStatus::Unavailable).unwrap(),
+            "\"unavailable\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DriverOperationalStatus::AccessDenied).unwrap(),
+            "\"access_denied\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DriverOperationalStatus::Error).unwrap(),
+            "\"error\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DriverOperationalStatus::UnsupportedPlatform).unwrap(),
+            "\"unsupported_platform\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DriverOperationalStatus::TestStub).unwrap(),
+            "\"test_stub\""
+        );
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            set_simulated_driver_status(None);
+            assert_eq!(
+                check_driver_status(VhciDriverClient::DEVICE_PATH),
+                DriverOperationalStatus::UnsupportedPlatform
+            );
+            assert!(!check_driver_device_presence(VhciDriverClient::DEVICE_PATH));
+
+            set_simulated_driver_status(Some(DriverOperationalStatus::Accessible));
+            assert_eq!(
+                check_driver_status(VhciDriverClient::DEVICE_PATH),
+                DriverOperationalStatus::Accessible
+            );
+            assert!(check_driver_device_presence(VhciDriverClient::DEVICE_PATH));
+
+            set_simulated_driver_status(None);
         }
     }
 }

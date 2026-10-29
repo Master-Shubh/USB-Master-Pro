@@ -1,8 +1,8 @@
 @echo off
 REM ==============================================================================
-REM USB Master Pro — Zero-Reboot Clean Uninstallation Script
-REM Dynamically unloads KMDF Virtual Host & Filter Drivers without machine restart
-REM BhartX Ecosystems Pvt Ltd | Zero Restart Invariant
+REM USB Master Pro — Dynamic Driver Uninstallation Script
+REM Dynamically unloads KMDF Virtual Host & Filter Drivers (reboot may be required if system or locked files require it)
+REM BhartX Ecosystems Pvt Ltd | Dynamic Driver Installation (reboot may be required if system or locked files require it)
 REM ==============================================================================
 
 echo [USB Master Pro] Verifying Administrator Privileges for clean teardown...
@@ -35,7 +35,7 @@ netsh advfirewall firewall delete rule name="USB Master Pro CLI" >nul 2>&1
 netsh advfirewall firewall delete rule name="USB Master Pro" >nul 2>&1
 
 echo ==============================================================================
-echo [SUCCESS] USB Master Pro uninstalled cleanly! ZERO REBOOT REQUIRED.
+echo [SUCCESS] USB Master Pro uninstalled cleanly via Dynamic Driver Teardown (reboot may be required if system or locked files require it).
 echo All drivers, firewall rules, and runtime services detached dynamically.
 echo ==============================================================================
 exit /b 0

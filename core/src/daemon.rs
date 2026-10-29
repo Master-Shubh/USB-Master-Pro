@@ -2,6 +2,9 @@
 //! Exposes HTTP + WebSocket APIs on 127.0.0.1:19842 for the UI front-end,
 //! and maintains an outbound WebSocket session to the signaling broker.
 
+use crate::driver_client::{
+    check_driver_status, AnyUsbAttachRequest, DriverOperationalStatus, VhciDriverClient,
+};
 use crate::enumerator::{HardwareEnumerator, UsbDeviceInfo};
 use crate::identity::NodeIdentity;
 use crate::licensing::{LicenseClaims, LicenseEngine};
@@ -23,6 +26,8 @@ const EMBEDDED_LOGO_PNG: &[u8] = include_bytes!("../../ui/assets/logo.png");
 const EMBEDDED_FAVICON_ICO: &[u8] = include_bytes!("../../ui/assets/favicon.ico");
 const EMBEDDED_ICON_64: &[u8] = include_bytes!("../../ui/assets/icon_64.png");
 const EMBEDDED_ICON_256: &[u8] = include_bytes!("../../ui/assets/icon_256.png");
+const EMBEDDED_TAILWIND_JS: &[u8] = include_bytes!("../../ui/assets/tailwind.min.js");
+const EMBEDDED_LUCIDE_JS: &[u8] = include_bytes!("../../ui/assets/lucide.min.js");
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -48,8 +53,8 @@ impl Default for SessionMetrics {
         Self {
             bytes_transferred: 0,
             urbs_completed: 0,
-            latency_ms: 0.8,
-            throughput_mb_s: 14.2,
+            latency_ms: 0.0,
+            throughput_mb_s: 0.0,
             packets_dropped: 0,
             connected_duration_secs: 0,
         }
@@ -184,6 +189,7 @@ pub struct DaemonState {
     pub broker_url: String,
     pub active_license: RwLock<Option<LicenseClaims>>,
     pub local_api_token: std::sync::RwLock<String>,
+    pub driver_client: Arc<VhciDriverClient>,
 }
 
 /// Generates a 256-bit cryptographically secure local API authorization token from the OS CSPRNG.
@@ -523,6 +529,8 @@ pub fn create_router(state: Arc<DaemonState>) -> Router {
         .route("/assets/favicon.ico", get(handle_serve_favicon))
         .route("/assets/icon_64.png", get(handle_serve_icon_64))
         .route("/assets/icon_256.png", get(handle_serve_icon_256))
+        .route("/assets/tailwind.min.js", get(handle_serve_tailwind))
+        .route("/assets/lucide.min.js", get(handle_serve_lucide))
         .route("/api/identity", get(handle_get_identity))
         .route("/api/devices", get(handle_get_devices))
         .route("/api/sessions", get(handle_get_sessions))
@@ -530,6 +538,7 @@ pub fn create_router(state: Arc<DaemonState>) -> Router {
         .route("/api/connect", post(handle_post_connect))
         .route("/api/respond", post(handle_post_respond))
         .route("/api/disconnect", post(handle_post_disconnect))
+        .route("/api/session/disconnect", post(handle_post_disconnect))
         .route("/api/status", get(handle_get_status))
         .route("/api/auth/rotate", post(handle_post_auth_rotate))
         .route("/api/license/activate", post(handle_post_license_activate))
@@ -580,6 +589,8 @@ impl DaemonServer {
         // Ensure token is stored in ~/.usb-master-pro/daemon.token with owner-only access (0600 on Unix)
         let _ = save_secure_token_to_disk(&local_api_token);
 
+        let driver_client = Arc::new(VhciDriverClient::open().unwrap_or_default());
+
         let state = Arc::new(DaemonState {
             identity,
             devices: RwLock::new(initial_devices),
@@ -592,6 +603,7 @@ impl DaemonServer {
             broker_url: broker_url.clone(),
             active_license: RwLock::new(initial_license),
             local_api_token: std::sync::RwLock::new(local_api_token),
+            driver_client,
         });
 
         // 1. Spawn Outbound Signaling Client task
@@ -646,6 +658,14 @@ async fn handle_serve_icon_64() -> impl IntoResponse {
 
 async fn handle_serve_icon_256() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/png")], EMBEDDED_ICON_256)
+}
+
+async fn handle_serve_tailwind() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/javascript; charset=utf-8")], EMBEDDED_TAILWIND_JS)
+}
+
+async fn handle_serve_lucide() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/javascript; charset=utf-8")], EMBEDDED_LUCIDE_JS)
 }
 
 // --- HTTP ENDPOINT HANDLERS ---
@@ -974,20 +994,34 @@ async fn handle_post_respond(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
-async fn handle_post_disconnect(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<DaemonState>>,
-    Json(payload): Json<DisconnectRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    validate_request_origin_and_auth(&headers, &state)?;
+/// Derives a stable 32-bit numeric device identifier from an alphanumeric or decimal peer ID
+pub fn derive_numeric_device_id(id_str: &str) -> u32 {
+    let cleaned = id_str.replace(' ', "");
+    if let Ok(num) = cleaned.parse::<u32>() {
+        num
+    } else {
+        let mut hash: u32 = 0x811c9dc5;
+        for byte in cleaned.as_bytes() {
+            hash ^= *byte as u32;
+            hash = hash.wrapping_mul(0x01000193);
+        }
+        hash & 0x7FFF_FFFF
+    }
+}
 
-    let clean_peer_id = payload.peer_id.replace(' ', "");
+/// Unified session disconnection and device unmount handler for both operator and remote requests
+pub async fn execute_session_disconnect(
+    state: &Arc<DaemonState>,
+    peer_id: &str,
+    reason: Option<String>,
+) -> bool {
+    let clean_peer_id = peer_id.replace(' ', "");
     let mut sessions = state.active_sessions.write().await;
     let mut found = false;
 
     if let Some(session) = sessions.get_mut(&clean_peer_id) {
-        let reason = payload.reason.unwrap_or_else(|| "Operator initiated disconnect".to_string());
-        let _ = session.transition_to(SessionState::Closing, Some(reason));
+        let disc_reason = reason.unwrap_or_else(|| "Operator initiated disconnect".to_string());
+        let _ = session.transition_to(SessionState::Closing, Some(disc_reason));
         let _ = session.transition_to(SessionState::Ready, Some("Session returned to ready".to_string()));
         found = true;
 
@@ -1013,7 +1047,11 @@ async fn handle_post_disconnect(
 
     // Unmount remote device if any
     let mut rem_lock = state.remote_devices.write().await;
+    let rem_len_before = rem_lock.len();
     rem_lock.retain(|d| d.remote_peer_id != clean_peer_id);
+    if rem_lock.len() < rem_len_before {
+        found = true;
+    }
     drop(rem_lock);
 
     // Unmount local device if bound to this peer
@@ -1022,9 +1060,37 @@ async fn handle_post_disconnect(
         if dev.remote_peer_id.as_deref() == Some(&clean_peer_id) {
             dev.is_mounted = false;
             dev.remote_peer_id = None;
+            found = true;
         }
     }
     drop(dev_lock);
+
+    // Detach virtual device from VHCI driver via tokio::task::spawn_blocking
+    let numeric_dev_id = derive_numeric_device_id(&clean_peer_id);
+    let driver_client = Arc::clone(&state.driver_client);
+    let _ = tokio::task::spawn_blocking(move || {
+        match driver_client.detach_device(numeric_dev_id) {
+            Ok(_) => {
+                println!("  🔌 Detached virtual device {} from VHCI driver", numeric_dev_id);
+            }
+            Err(e) => {
+                eprintln!("  ⚠️ Failed to detach device {} from VHCI driver: {}", numeric_dev_id, e);
+            }
+        }
+    }).await;
+
+    found
+}
+
+async fn handle_post_disconnect(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(payload): Json<DisconnectRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_request_origin_and_auth(&headers, &state)?;
+
+    let clean_peer_id = payload.peer_id.replace(' ', "");
+    let found = execute_session_disconnect(&state, &clean_peer_id, payload.reason).await;
 
     Ok(Json(serde_json::json!({
         "success": found,
@@ -1039,23 +1105,21 @@ async fn handle_get_status(State(state): State<Arc<DaemonState>>) -> impl IntoRe
 
     let sessions = state.active_sessions.read().await;
     let mut total_throughput = 0.0;
-    let mut avg_latency = 0.049;
+    let mut latency_sum = 0.0;
     let mut active_count = 0;
     for s in sessions.values() {
         if s.state() == SessionState::Active {
             total_throughput += s.metrics.throughput_mb_s;
-            avg_latency = s.metrics.latency_ms;
+            latency_sum += s.metrics.latency_ms;
             active_count += 1;
         }
     }
-    if active_count > 0 {
-        avg_latency /= active_count as f64;
-    }
-    let throughput = if total_throughput > 0.0 {
-        total_throughput
+    let avg_latency = if active_count > 0 {
+        latency_sum / active_count as f64
     } else {
-        10240.0
+        0.0
     };
+    let throughput = total_throughput;
 
     let telemetry = DaemonTelemetry {
         status: "active".to_string(),
@@ -1202,10 +1266,63 @@ async fn handle_get_license_status(State(state): State<Arc<DaemonState>>) -> imp
     }
 }
 
+fn get_driver_status_message(status: DriverOperationalStatus, is_vhci: bool) -> &'static str {
+    match status {
+        DriverOperationalStatus::UnsupportedPlatform => {
+            "Windows KMDF driver is unsupported on Linux host. Windows 10/11 x64 required."
+        }
+        DriverOperationalStatus::Accessible => {
+            if is_vhci {
+                "VHCI root bus synthesizer active and accessible."
+            } else {
+                "Kernel upper filter driver active and accessible."
+            }
+        }
+        DriverOperationalStatus::Unavailable => {
+            if is_vhci {
+                "VHCI driver device not found. Driver package not installed or service stopped."
+            } else {
+                "Upper filter driver device not found. Driver package not installed or service stopped."
+            }
+        }
+        DriverOperationalStatus::AccessDenied => {
+            "Access denied opening driver device. Administrative privileges required."
+        }
+        DriverOperationalStatus::Installed => "Driver device installed.",
+        DriverOperationalStatus::TestStub => "Driver running in test stub / emulation mode.",
+        DriverOperationalStatus::Error => "Error querying driver device status.",
+    }
+}
+
 async fn handle_get_system_drivers() -> impl IntoResponse {
+    let vhci_status = check_driver_status(VhciDriverClient::DEVICE_PATH);
+    let filter_status = check_driver_status(r"\\.\AnyUsbFilter");
+
+    let vhci_message = get_driver_status_message(vhci_status, true);
+    let filter_message = get_driver_status_message(filter_status, false);
+
+    let vhci_installed = vhci_status == DriverOperationalStatus::Accessible
+        || vhci_status == DriverOperationalStatus::TestStub;
+    let filter_installed = filter_status == DriverOperationalStatus::Accessible
+        || filter_status == DriverOperationalStatus::TestStub;
+    let is_operational = vhci_status == DriverOperationalStatus::Accessible
+        && filter_status == DriverOperationalStatus::Accessible;
+
     Json(serde_json::json!({
-        "vhci_installed": true,
-        "filter_installed": true,
+        "platform": std::env::consts::OS,
+        "vhci": {
+            "status": vhci_status,
+            "device_path": VhciDriverClient::DEVICE_PATH,
+            "message": vhci_message
+        },
+        "filter": {
+            "status": filter_status,
+            "device_path": r"\\.\AnyUsbFilter",
+            "message": filter_message
+        },
+        "vhci_installed": vhci_installed,
+        "filter_installed": filter_installed,
+        "is_operational": is_operational,
         "udp443_reachable": true,
         "kernel_version": "1.33.0"
     }))
@@ -1438,23 +1555,132 @@ async fn handle_broker_message(state: &Arc<DaemonState>, raw_json: &str) {
                     let _ = session.transition_to(SessionState::PreparingDevice, Some("Negotiating USB configurations".to_string()));
                     let _ = session.transition_to(SessionState::Active, Some("Turbo-URB link online".to_string()));
 
-                    let current_sess = session.clone();
+                    let session_device_id = session.device_id.clone();
+                    let mut current_sess = session.clone();
                     drop(sessions);
 
-                    // Mount remote device with REAL state and metrics (no hardcoded mock strings!)
-                    let mut rem_lock = state.remote_devices.write().await;
-                    let dev_name = format!("Remote USB Peripheral from [{}]", from_id);
-                    rem_lock.retain(|d| d.remote_peer_id != from_id);
-                    rem_lock.push(RemoteMountedDevice {
-                        id: format!("rem-{}", date_now_millis()),
-                        remote_peer_id: from_id.to_string(),
-                        name: dev_name,
-                        icon: "⚡".to_string(),
-                        driver_state: format!("Virtual USB Host (VHCI: {:?})", current_sess.state()),
-                        latency: format!("{:.1} ms", current_sess.metrics.latency_ms),
-                        throughput: format!("{:.1} MB/s", current_sess.metrics.throughput_mb_s),
-                    });
-                    drop(rem_lock);
+                    // Extract VID/PID from message or remote device request
+                    let (vid, pid) = {
+                        let mut v = msg.get("vendorId").or_else(|| msg.get("vid")).and_then(|x| {
+                            x.as_u64().map(|n| n as u16).or_else(|| {
+                                x.as_str().and_then(|s| u16::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16).ok())
+                            })
+                        }).unwrap_or(0);
+
+                        let mut p = msg.get("productId").or_else(|| msg.get("pid")).and_then(|x| {
+                            x.as_u64().map(|n| n as u16).or_else(|| {
+                                x.as_str().and_then(|s| u16::from_str_radix(s.trim_start_matches("0x").trim_start_matches("0X"), 16).ok())
+                            })
+                        }).unwrap_or(0);
+
+                        if v == 0 && p == 0 {
+                            if let Some(dev_str) = msg.get("deviceId").and_then(|d| d.as_str()) {
+                                if let Some((v_str, p_str)) = dev_str.split_once(':') {
+                                    v = u16::from_str_radix(v_str.trim_start_matches("0x").trim_start_matches("0X"), 16).unwrap_or(0);
+                                    p = u16::from_str_radix(p_str.trim_start_matches("0x").trim_start_matches("0X"), 16).unwrap_or(0);
+                                }
+                            }
+                        }
+
+                        if v == 0 && p == 0 {
+                            // Anti-Inversion: Look up from state.devices by device ID; do NOT invent a fake Mantra peripheral
+                            let target_dev_id = msg.get("deviceId").and_then(|d| d.as_str()).unwrap_or(&session_device_id);
+                            let dev_lock = state.devices.read().await;
+                            if let Some(matched) = dev_lock.iter().find(|d| (!target_dev_id.is_empty() && d.id == target_dev_id) || d.remote_peer_id.as_deref() == Some(from_id)) {
+                                (matched.vid, matched.pid)
+                            } else {
+                                eprintln!("  ⚠️ [CONNECT_DECISION] Missing VID/PID for peer [{}], device [{}] - no hardware fallback assumed", from_id, target_dev_id);
+                                (0, 0)
+                            }
+                        } else {
+                            (v, p)
+                        }
+                    };
+
+                    let numeric_dev_id = derive_numeric_device_id(from_id);
+                    let mut attach_req = AnyUsbAttachRequest {
+                        device_id: numeric_dev_id,
+                        vendor_id: vid,
+                        product_id: pid,
+                        bcd_device: 0x0100,
+                        speed: 3, // HighSpeed (480 Mbps)
+                        ..Default::default()
+                    };
+
+                    let dev_desc = format!("Remote USB Peripheral [{}]", from_id);
+                    for (i, c) in dev_desc.encode_utf16().take(127).enumerate() {
+                        attach_req.product_description[i] = c;
+                    }
+
+                    let driver_client = Arc::clone(&state.driver_client);
+                    let attach_result = tokio::task::spawn_blocking(move || {
+                        driver_client.attach_device(&attach_req)
+                    }).await;
+
+                    let attach_success = match attach_result {
+                        Ok(Ok(())) => {
+                            println!(
+                                "  🔌 Attached virtual device {} (VID: 0x{:04X}, PID: 0x{:04X}) to VHCI driver",
+                                numeric_dev_id, vid, pid
+                            );
+                            true
+                        }
+                        Ok(Err(e)) => {
+                            eprintln!(
+                                "  ⚠️ Failed to attach device {} to VHCI driver: {}",
+                                numeric_dev_id, e
+                            );
+                            let mut sessions = state.active_sessions.write().await;
+                            if let Some(s) = sessions.get_mut(from_id) {
+                                let _ = s.transition_to(SessionState::Failed, Some(format!("VHCI driver attach failed: {}", e)));
+                                current_sess = s.clone();
+                            }
+                            drop(sessions);
+
+                            let _ = state.ui_events_tx.send(serde_json::json!({
+                                "type": "DRIVER_ATTACH_ERROR",
+                                "peer_id": from_id,
+                                "error": e.to_string(),
+                            }));
+                            false
+                        }
+                        Err(join_err) => {
+                            eprintln!(
+                                "  ⚠️ Spawn blocking failed for driver attach: {}",
+                                join_err
+                            );
+                            let mut sessions = state.active_sessions.write().await;
+                            if let Some(s) = sessions.get_mut(from_id) {
+                                let _ = s.transition_to(SessionState::Failed, Some(format!("VHCI driver attach spawn error: {}", join_err)));
+                                current_sess = s.clone();
+                            }
+                            drop(sessions);
+
+                            let _ = state.ui_events_tx.send(serde_json::json!({
+                                "type": "DRIVER_ATTACH_ERROR",
+                                "peer_id": from_id,
+                                "error": join_err.to_string(),
+                            }));
+                            false
+                        }
+                    };
+
+                    if attach_success {
+                        // Mount remote device with REAL state and metrics (no hardcoded mock strings!)
+                        let mut rem_lock = state.remote_devices.write().await;
+                        let dev_name = format!("Remote USB Peripheral from [{}]", from_id);
+                        rem_lock.retain(|d| d.remote_peer_id != from_id);
+                        rem_lock.push(RemoteMountedDevice {
+                            id: format!("rem-{}", date_now_millis()),
+                            remote_peer_id: from_id.to_string(),
+                            name: dev_name,
+                            icon: "⚡".to_string(),
+                            driver_state: format!("Virtual USB Host (VHCI: {:?})", current_sess.state()),
+                            latency: format!("{:.1} ms", current_sess.metrics.latency_ms),
+                            throughput: format!("{:.1} MB/s", current_sess.metrics.throughput_mb_s),
+                        });
+                        drop(rem_lock);
+                    }
 
                     // Broadcast real state change and telemetry events
                     let _ = state.ui_events_tx.send(serde_json::json!({
@@ -1526,6 +1752,11 @@ async fn handle_broker_message(state: &Arc<DaemonState>, raw_json: &str) {
                 } else {
                     println!("  ✅ Broker registration acknowledged: ID [{}]", msg["id"]);
                 }
+            }
+            "DISCONNECT" => {
+                let peer_id = msg["fromId"].as_str().or_else(|| msg["peerId"].as_str()).unwrap_or_default();
+                let clean_peer = peer_id.replace(' ', "");
+                execute_session_disconnect(&state, &clean_peer, Some("Remote peer requested disconnect".to_string())).await;
             }
             "PONG" => {}
             _ => {

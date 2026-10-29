@@ -25,11 +25,15 @@ pub use adapters::{
 };
 pub use buffer_pool::BufferPool;
 pub use compression::TurboCompressor;
-pub use daemon::{start_daemon, DaemonServer};
+pub use daemon::{
+    derive_numeric_device_id, execute_session_disconnect, start_daemon, ActiveSession,
+    DaemonServer, DaemonState, RemoteMountedDevice,
+};
 pub use device_reset::{DeviceOperationalState, DeviceResetController, ResetMethod};
 pub use driver_client::{
+    check_driver_device_presence, check_driver_status, set_simulated_driver_status,
     AnyUsbAttachRequest, AnyUsbCompleteRequest, AnyUsbDetachRequest, AnyUsbUrbMessage,
-    DriverClientError, VhciDriverClient, ANYUSB_MAX_URB_BUFFER_SIZE,
+    DriverClientError, DriverOperationalStatus, VhciDriverClient, ANYUSB_MAX_URB_BUFFER_SIZE,
 };
 pub use enumerator::{HardwareEnumerator, UsbDeviceInfo};
 pub use hardware_db::{DeviceCategory, HardwareClassifier};
@@ -47,9 +51,9 @@ pub use security::{
 };
 pub use loopback_test::{SimulatedBiometricDevice, VirtualLoopbackPipeline};
 pub use protocol::{
-    classify_operation, OperationSafety, TransferType, TurboUrbHeader, CMD_ATTACH_DEVICE,
-    CMD_COMPLETE_URB, CMD_DETACH_DEVICE, CMD_PING, CMD_PONG, CMD_RESET_DEVICE, CMD_SUBMIT_URB,
-    CMD_UNLINK_URB, MAX_PAYLOAD_LENGTH,
+    classify_operation, deserialize_single_urb, validate_urb_buffer_boundary, OperationSafety,
+    TransferType, TurboUrbHeader, CMD_ATTACH_DEVICE, CMD_COMPLETE_URB, CMD_DETACH_DEVICE,
+    CMD_PING, CMD_PONG, CMD_RESET_DEVICE, CMD_SUBMIT_URB, CMD_UNLINK_URB, MAX_PAYLOAD_LENGTH,
 };
 pub use state::{can_transition, transitory_timeout, SessionState, SessionStateMachine, StateTransitionError};
 pub use urb_engine::{

@@ -4,7 +4,7 @@
 **Company**: BhartX Ecosystems Pvt Ltd ([https://bhartx.in](https://bhartx.in))  
 **Target OS**: Windows 10 (1809+), Windows 11 (all versions), Windows Server 2019/2022/2025  
 **Architecture**: x64 (AMD64 Native)  
-**Classification**: Enterprise Zero-Reboot Virtual USB Distribution  
+**Classification**: Enterprise Dynamic Driver Virtual USB Distribution
 
 ---
 
@@ -17,7 +17,7 @@ This portable release bundle (`usb-master-pro-windows-x64.zip`) contains all nec
 usb-master-pro-windows-x64/
 ├── usb_master_daemon.exe          # High-performance Turbo-URB background server
 ├── usb_master_cli.exe             # Interactive command-line client & control utility
-├── install_zero_reboot.bat        # 1-Click zero-reboot administrator installation
+├── install_zero_reboot.bat        # 1-Click dynamic driver administrator installation
 ├── uninstall_zero_reboot.bat      # 1-Click clean dynamic driver teardown
 ├── setup_field_test_signing.ps1   # PowerShell field-testing & CA management utility
 ├── README_INSTALL.md              # This technical operations document
@@ -35,13 +35,13 @@ usb-master-pro-windows-x64/
 
 ---
 
-## 2. Zero-Reboot Philosophy & Invariant
+## 2. Dynamic Driver Installation Architecture
 
-Unlike legacy USB virtualization software that locks class filters into the Windows registry requiring full system restarts, **USB Master Pro** adheres strictly to the **Zero-Restart Invariant**:
+Unlike legacy USB virtualization software that locks class filters into the Windows registry requiring unconditional restarts, **USB Master Pro** leverages **Dynamic Driver Installation** (reboot may be required if system or locked files require it):
 - Drivers are dynamically staged into the Windows Driver Store via `pnputil.exe`.
 - Virtual device nodes (`root\anyusb_vhci`) are created and detached dynamically at runtime.
 - Inbound and outbound firewall rules are configured on-the-fly using native `netsh advfirewall`.
-- Drivers are fully unloaded on uninstallation without machine reboots.
+- Drivers are uninstalled cleanly via dynamic detachment (reboot required only if system or file locks persist).
 
 ---
 
@@ -58,7 +58,7 @@ Extract `usb-master-pro-windows-x64.zip` to your target directory (e.g. `C:\Prog
    - Import `bhartx_test_ca.cer` into Windows `Root` and `TrustedPublisher` certificate stores.
    - Dynamically stage `anyusb_vhci.inf` and `anyusb_filter.inf`.
    - Register Windows Firewall rules for daemon and CLI communication.
-   - Confirm successful installation with **ZERO REBOOT REQUIRED**.
+   - Confirm successful installation via dynamic staging (reboot may be required if system or locked files require it).
 
 ---
 
@@ -122,9 +122,9 @@ usb_master_cli.exe attach --server ws://<remote-ip>:8080 --device-id <device-uui
 
 ---
 
-## 6. Clean Zero-Reboot Uninstallation
+## 6. Clean Dynamic Driver Uninstallation
 
-To cleanly and completely remove USB Master Pro without rebooting:
+To cleanly and completely remove USB Master Pro without unnecessary rebooting:
 1. Right-click `uninstall_zero_reboot.bat`.
 2. Select **"Run as Administrator"**.
 3. The script will:
@@ -132,7 +132,7 @@ To cleanly and completely remove USB Master Pro without rebooting:
    - Dynamically detach synthetic PnP device `root\anyusb_vhci`.
    - Force-uninstall and delete driver packages from Driver Store.
    - Flush and remove all registered Windows Firewall rules.
-   - Exit with zero pending restarts.
+   - Complete clean uninstallation (reboot required only if system or file locks persist).
 
 ---
 
