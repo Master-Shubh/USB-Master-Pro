@@ -286,7 +286,7 @@ AnyUsbFilter_GetRequestDeviceId(
         PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
         if (irpSp != NULL && irpSp->DeviceObject != NULL) {
             WDFDEVICE wdfDev = WdfWdmDeviceGetWdfDevice(irpSp->DeviceObject);
-            if (wdfDev != NULL) {
+            if (wdfDev != NULL && wdfDev != g_ControlDevice) {
                 PFILTER_DEVICE_DATA filterData = GetFilterData(wdfDev);
                 if (filterData != NULL) {
                     return filterData->DeviceId;
@@ -298,7 +298,7 @@ AnyUsbFilter_GetRequestDeviceId(
     WDFQUEUE reqQueue = WdfRequestGetIoQueue(Request);
     if (reqQueue != NULL) {
         WDFDEVICE fidoDev = WdfIoQueueGetDevice(reqQueue);
-        if (fidoDev != NULL) {
+        if (fidoDev != NULL && fidoDev != g_ControlDevice) {
             PFILTER_DEVICE_DATA fidoData = GetFilterData(fidoDev);
             if (fidoData != NULL) {
                 return fidoData->DeviceId;
@@ -334,8 +334,13 @@ AnyUsbFilter_DrainPendingRequests(
         if (req != NULL) {
             ULONG reqDevId = AnyUsbFilter_GetRequestDeviceId(req);
             if (TargetDeviceId == 0 || reqDevId == TargetDeviceId) {
-                ControlData->PendingRequests[i] = NULL;
-                requestsToComplete[countToComplete++] = req;
+                NTSTATUS unmarkStatus = WdfRequestUnmarkCancelable(req);
+                if (NT_SUCCESS(unmarkStatus)) {
+                    ControlData->PendingRequests[i] = NULL;
+                    requestsToComplete[countToComplete++] = req;
+                }
+                // If unmarkStatus == STATUS_CANCELLED:
+                // Do NOT clear slot and do NOT complete here; EvtPendingUrbCancel is running and will handle it.
             }
         }
     }
@@ -343,41 +348,36 @@ AnyUsbFilter_DrainPendingRequests(
 
     // Complete extracted requests outside spinlock
     for (ULONG i = 0; i < countToComplete; i++) {
-        WDFREQUEST req = requestsToComplete[i];
-        NTSTATUS unmarkStatus = WdfRequestUnmarkCancelable(req);
-        if (NT_SUCCESS(unmarkStatus)) {
-            WdfRequestComplete(req, CompletionStatus);
-        }
-        // If unmarkStatus == STATUS_CANCELLED, EvtPendingUrbCancel handles completion
+        WdfRequestComplete(requestsToComplete[i], CompletionStatus);
     }
 
     // Phase 2: Drain matching requests from PendingUrbQueue (intercepted URBs not yet fetched)
     if (ControlData->PendingUrbQueue != NULL) {
-        WDFREQUEST retainedRequests[ANYUSB_MAX_PENDING_URBS];
-        ULONG retainedCount = 0;
-        WDFREQUEST queueReq = NULL;
+        WDFREQUEST prevTag = NULL;
+        WDFREQUEST tagRequest = NULL;
 
-        while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(ControlData->PendingUrbQueue, &queueReq)) && queueReq != NULL) {
-            ULONG reqDevId = AnyUsbFilter_GetRequestDeviceId(queueReq);
+        while (NT_SUCCESS(WdfIoQueueFindRequest(ControlData->PendingUrbQueue, prevTag, NULL, NULL, &tagRequest))) {
+            ULONG reqDevId = AnyUsbFilter_GetRequestDeviceId(tagRequest);
             if (TargetDeviceId == 0 || reqDevId == TargetDeviceId) {
-                WdfRequestComplete(queueReq, CompletionStatus);
-            } else {
-                if (retainedCount < ANYUSB_MAX_PENDING_URBS) {
-                    retainedRequests[retainedCount++] = queueReq;
-                } else {
-                    // Queue overflow safety: complete to prevent resource leak
-                    WdfRequestComplete(queueReq, CompletionStatus);
+                WDFREQUEST matchedRequest = NULL;
+                NTSTATUS retrieveStatus = WdfIoQueueRetrieveFoundRequest(ControlData->PendingUrbQueue, tagRequest, &matchedRequest);
+                WdfObjectDereference(tagRequest);
+                if (NT_SUCCESS(retrieveStatus) && matchedRequest != NULL) {
+                    WdfRequestComplete(matchedRequest, CompletionStatus);
                 }
+                // prevTag remains unchanged as the cursor for the next search
+            } else {
+                if (prevTag != NULL) {
+                    WdfObjectDereference(prevTag);
+                }
+                prevTag = tagRequest;
             }
-            queueReq = NULL;
+            tagRequest = NULL;
         }
 
-        // Re-forward retained requests back to PendingUrbQueue in FIFO order
-        for (ULONG i = 0; i < retainedCount; i++) {
-            NTSTATUS fwdStatus = WdfRequestForwardToIoQueue(retainedRequests[i], ControlData->PendingUrbQueue);
-            if (!NT_SUCCESS(fwdStatus)) {
-                WdfRequestComplete(retainedRequests[i], fwdStatus);
-            }
+        if (prevTag != NULL) {
+            WdfObjectDereference(prevTag);
+            prevTag = NULL;
         }
     }
 }
@@ -452,6 +452,30 @@ AnyUsbFilter_EvtPendingUrbCancel(
     KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
         "USB Master Pro Filter: Intercepted pending URB cancelled by caller/system\n"));
     WdfRequestComplete(Request, STATUS_CANCELLED);
+}
+
+static VOID
+AnyUsbFilter_CancelAndCompletePendingSlot(
+    _In_ PCONTROL_DEVICE_DATA ControlData,
+    _In_ ULONG                Slot,
+    _In_ WDFREQUEST           ExpectedRequest,
+    _In_ NTSTATUS             CompletionStatus
+)
+{
+    BOOLEAN shouldComplete = FALSE;
+    WdfSpinLockAcquire(ControlData->PendingUrbLock);
+    if (Slot < ANYUSB_MAX_PENDING_URBS && ControlData->PendingRequests[Slot] == ExpectedRequest) {
+        NTSTATUS unmarkStatus = WdfRequestUnmarkCancelable(ExpectedRequest);
+        ControlData->PendingRequests[Slot] = NULL;
+        if (NT_SUCCESS(unmarkStatus)) {
+            shouldComplete = TRUE;
+        }
+    }
+    WdfSpinLockRelease(ControlData->PendingUrbLock);
+
+    if (shouldComplete) {
+        WdfRequestComplete(ExpectedRequest, CompletionStatus);
+    }
 }
 
 VOID
@@ -560,33 +584,38 @@ AnyUsbFilter_EvtControlIoDeviceControl(
                 }
 
                 ULONG assignedSlot = ANYUSB_MAX_PENDING_URBS;
+                NTSTATUS markStatus = STATUS_SUCCESS;
+
                 WdfSpinLockAcquire(controlData->PendingUrbLock);
                 for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
                     if (controlData->PendingRequests[i] == NULL) {
-                        controlData->PendingRequests[i] = pendingGuestRequest;
                         assignedSlot = i;
                         break;
+                    }
+                }
+
+                if (assignedSlot < ANYUSB_MAX_PENDING_URBS) {
+                    markStatus = WdfRequestMarkCancelableEx(pendingGuestRequest, AnyUsbFilter_EvtPendingUrbCancel);
+                    if (NT_SUCCESS(markStatus)) {
+                        controlData->PendingRequests[assignedSlot] = pendingGuestRequest;
+                    } else {
+                        assignedSlot = ANYUSB_MAX_PENDING_URBS;
                     }
                 }
                 WdfSpinLockRelease(controlData->PendingUrbLock);
 
                 if (assignedSlot == ANYUSB_MAX_PENDING_URBS) {
-                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                        "USB Master Pro Filter: Pending URB sequence table is full (max %d)\n", ANYUSB_MAX_PENDING_URBS));
-                    WdfRequestComplete(pendingGuestRequest, STATUS_INSUFFICIENT_RESOURCES);
-                    bytesReturned = 0;
-                    status = STATUS_INSUFFICIENT_RESOURCES;
-                    break;
-                }
-
-                NTSTATUS markStatus = WdfRequestMarkCancelableEx(pendingGuestRequest, AnyUsbFilter_EvtPendingUrbCancel);
-                if (!NT_SUCCESS(markStatus)) {
-                    WdfSpinLockAcquire(controlData->PendingUrbLock);
-                    controlData->PendingRequests[assignedSlot] = NULL;
-                    WdfSpinLockRelease(controlData->PendingUrbLock);
-                    WdfRequestComplete(pendingGuestRequest, STATUS_CANCELLED);
-                    bytesReturned = 0;
-                    status = STATUS_CANCELLED;
+                    if (!NT_SUCCESS(markStatus)) {
+                        WdfRequestComplete(pendingGuestRequest, markStatus);
+                        bytesReturned = 0;
+                        status = markStatus;
+                    } else {
+                        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                            "USB Master Pro Filter: Pending URB sequence table is full (max %d)\n", ANYUSB_MAX_PENDING_URBS));
+                        WdfRequestComplete(pendingGuestRequest, STATUS_INSUFFICIENT_RESOURCES);
+                        bytesReturned = 0;
+                        status = STATUS_INSUFFICIENT_RESOURCES;
+                    }
                     break;
                 }
 
@@ -607,11 +636,7 @@ AnyUsbFilter_EvtControlIoDeviceControl(
                         KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                             "USB Master Pro Filter: Control transfer %lu exceeds 64 KB limit. Rejected.\n",
                             msg->TransferBufferLength));
-                        WdfRequestUnmarkCancelable(pendingGuestRequest);
-                        WdfSpinLockAcquire(controlData->PendingUrbLock);
-                        controlData->PendingRequests[assignedSlot] = NULL;
-                        WdfSpinLockRelease(controlData->PendingUrbLock);
-                        WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
+                        AnyUsbFilter_CancelAndCompletePendingSlot(controlData, assignedSlot, pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
                         bytesReturned = 0;
                         status = STATUS_BUFFER_OVERFLOW;
                         break;
@@ -634,11 +659,7 @@ AnyUsbFilter_EvtControlIoDeviceControl(
                         KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                             "USB Master Pro Filter: Control Ex transfer %lu exceeds 64 KB limit. Rejected.\n",
                             msg->TransferBufferLength));
-                        WdfRequestUnmarkCancelable(pendingGuestRequest);
-                        WdfSpinLockAcquire(controlData->PendingUrbLock);
-                        controlData->PendingRequests[assignedSlot] = NULL;
-                        WdfSpinLockRelease(controlData->PendingUrbLock);
-                        WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
+                        AnyUsbFilter_CancelAndCompletePendingSlot(controlData, assignedSlot, pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
                         bytesReturned = 0;
                         status = STATUS_BUFFER_OVERFLOW;
                         break;
@@ -660,11 +681,7 @@ AnyUsbFilter_EvtControlIoDeviceControl(
                         KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                             "USB Master Pro Filter: Bulk transfer %lu exceeds 64 KB limit. Rejected.\n",
                             msg->TransferBufferLength));
-                        WdfRequestUnmarkCancelable(pendingGuestRequest);
-                        WdfSpinLockAcquire(controlData->PendingUrbLock);
-                        controlData->PendingRequests[assignedSlot] = NULL;
-                        WdfSpinLockRelease(controlData->PendingUrbLock);
-                        WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
+                        AnyUsbFilter_CancelAndCompletePendingSlot(controlData, assignedSlot, pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
                         bytesReturned = 0;
                         status = STATUS_BUFFER_OVERFLOW;
                         break;
@@ -686,11 +703,7 @@ AnyUsbFilter_EvtControlIoDeviceControl(
                         KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                             "USB Master Pro Filter: Isoch transfer %lu exceeds 64 KB limit. Rejected.\n",
                             msg->TransferBufferLength));
-                        WdfRequestUnmarkCancelable(pendingGuestRequest);
-                        WdfSpinLockAcquire(controlData->PendingUrbLock);
-                        controlData->PendingRequests[assignedSlot] = NULL;
-                        WdfSpinLockRelease(controlData->PendingUrbLock);
-                        WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
+                        AnyUsbFilter_CancelAndCompletePendingSlot(controlData, assignedSlot, pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
                         bytesReturned = 0;
                         status = STATUS_BUFFER_OVERFLOW;
                         break;
@@ -741,85 +754,87 @@ AnyUsbFilter_EvtControlIoDeviceControl(
 
                 WdfSpinLockAcquire(controlData->PendingUrbLock);
                 targetRequest = controlData->PendingRequests[slot];
-                controlData->PendingRequests[slot] = NULL;
-                WdfSpinLockRelease(controlData->PendingUrbLock);
-
                 if (targetRequest != NULL) {
                     NTSTATUS unmarkStatus = WdfRequestUnmarkCancelable(targetRequest);
-                    if (unmarkStatus == STATUS_CANCELLED) {
-                        status = STATUS_CANCELLED;
-                        break;
+                    if (NT_SUCCESS(unmarkStatus)) {
+                        controlData->PendingRequests[slot] = NULL;
+                    } else {
+                        targetRequest = NULL; // STATUS_CANCELLED: cancel routine owns it
                     }
+                }
+                WdfSpinLockRelease(controlData->PendingUrbLock);
 
-                    PIRP irp = WdfRequestWdmGetIrp(targetRequest);
-                    if (irp != NULL) {
-                        PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
-                        PURB urb = (irpSp != NULL) ? (PURB)irpSp->Parameters.Others.Argument1 : NULL;
-                        if (urb != NULL) {
-                            urb->UrbHeader.Status = compReq->Status;
+                if (targetRequest == NULL) {
+                    status = STATUS_CANCELLED;
+                    break;
+                }
 
-                            if (urb->UrbHeader.Function == URB_FUNCTION_CONTROL_TRANSFER) {
-                                urb->UrbControlTransfer.TransferBufferLength = compReq->ActualLength;
-                                if ((urb->UrbControlTransfer.SetupPacket[0] & 0x80) && compReq->ActualLength > 0) {
-                                    ULONG copyLen = compReq->ActualLength;
-                                    if (copyLen > sizeof(compReq->Data)) {
-                                        copyLen = sizeof(compReq->Data);
-                                    }
-                                    PVOID dst = AnyUsb_GetTransferBuffer(urb->UrbControlTransfer.TransferBuffer,
-                                                                         urb->UrbControlTransfer.TransferBufferMDL);
-                                    if (dst != NULL) {
-                                        RtlCopyMemory(dst, compReq->Data, copyLen);
-                                    }
+                PIRP irp = WdfRequestWdmGetIrp(targetRequest);
+                if (irp != NULL) {
+                    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
+                    PURB urb = (irpSp != NULL) ? (PURB)irpSp->Parameters.Others.Argument1 : NULL;
+                    if (urb != NULL) {
+                        urb->UrbHeader.Status = compReq->Status;
+
+                        if (urb->UrbHeader.Function == URB_FUNCTION_CONTROL_TRANSFER) {
+                            urb->UrbControlTransfer.TransferBufferLength = compReq->ActualLength;
+                            if ((urb->UrbControlTransfer.SetupPacket[0] & 0x80) && compReq->ActualLength > 0) {
+                                ULONG copyLen = compReq->ActualLength;
+                                if (copyLen > sizeof(compReq->Data)) {
+                                    copyLen = sizeof(compReq->Data);
                                 }
-                            } else if (urb->UrbHeader.Function == URB_FUNCTION_CONTROL_TRANSFER_EX) {
-                                urb->UrbControlTransferEx.TransferBufferLength = compReq->ActualLength;
-                                if ((urb->UrbControlTransferEx.SetupPacket[0] & 0x80) && compReq->ActualLength > 0) {
-                                    ULONG copyLen = compReq->ActualLength;
-                                    if (copyLen > sizeof(compReq->Data)) {
-                                        copyLen = sizeof(compReq->Data);
-                                    }
-                                    PVOID dst = AnyUsb_GetTransferBuffer(urb->UrbControlTransferEx.TransferBuffer,
-                                                                         urb->UrbControlTransferEx.TransferBufferMDL);
-                                    if (dst != NULL) {
-                                        RtlCopyMemory(dst, compReq->Data, copyLen);
-                                    }
+                                PVOID dst = AnyUsb_GetTransferBuffer(urb->UrbControlTransfer.TransferBuffer,
+                                                                     urb->UrbControlTransfer.TransferBufferMDL);
+                                if (dst != NULL) {
+                                    RtlCopyMemory(dst, compReq->Data, copyLen);
                                 }
-                            } else if (urb->UrbHeader.Function == URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER) {
-                                urb->UrbBulkOrInterruptTransfer.TransferBufferLength = compReq->ActualLength;
-                                if ((urb->UrbBulkOrInterruptTransfer.TransferFlags & USBD_TRANSFER_DIRECTION_IN) && compReq->ActualLength > 0) {
-                                    ULONG copyLen = compReq->ActualLength;
-                                    if (copyLen > sizeof(compReq->Data)) {
-                                        copyLen = sizeof(compReq->Data);
-                                    }
-                                    PVOID dst = AnyUsb_GetTransferBuffer(urb->UrbBulkOrInterruptTransfer.TransferBuffer,
-                                                                         urb->UrbBulkOrInterruptTransfer.TransferBufferMDL);
-                                    if (dst != NULL) {
-                                        RtlCopyMemory(dst, compReq->Data, copyLen);
-                                    }
+                            }
+                        } else if (urb->UrbHeader.Function == URB_FUNCTION_CONTROL_TRANSFER_EX) {
+                            urb->UrbControlTransferEx.TransferBufferLength = compReq->ActualLength;
+                            if ((urb->UrbControlTransferEx.SetupPacket[0] & 0x80) && compReq->ActualLength > 0) {
+                                ULONG copyLen = compReq->ActualLength;
+                                if (copyLen > sizeof(compReq->Data)) {
+                                    copyLen = sizeof(compReq->Data);
                                 }
-                            } else if (urb->UrbHeader.Function == URB_FUNCTION_ISOCH_TRANSFER) {
-                                urb->UrbIsochronousTransfer.TransferBufferLength = compReq->ActualLength;
-                                if ((urb->UrbIsochronousTransfer.TransferFlags & USBD_TRANSFER_DIRECTION_IN) && compReq->ActualLength > 0) {
-                                    ULONG copyLen = compReq->ActualLength;
-                                    if (copyLen > sizeof(compReq->Data)) {
-                                        copyLen = sizeof(compReq->Data);
-                                    }
-                                    PVOID dst = AnyUsb_GetTransferBuffer(urb->UrbIsochronousTransfer.TransferBuffer,
-                                                                         urb->UrbIsochronousTransfer.TransferBufferMDL);
-                                    if (dst != NULL) {
-                                        RtlCopyMemory(dst, compReq->Data, copyLen);
-                                    }
+                                PVOID dst = AnyUsb_GetTransferBuffer(urb->UrbControlTransferEx.TransferBuffer,
+                                                                     urb->UrbControlTransferEx.TransferBufferMDL);
+                                if (dst != NULL) {
+                                    RtlCopyMemory(dst, compReq->Data, copyLen);
+                                }
+                            }
+                        } else if (urb->UrbHeader.Function == URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER) {
+                            urb->UrbBulkOrInterruptTransfer.TransferBufferLength = compReq->ActualLength;
+                            if ((urb->UrbBulkOrInterruptTransfer.TransferFlags & USBD_TRANSFER_DIRECTION_IN) && compReq->ActualLength > 0) {
+                                ULONG copyLen = compReq->ActualLength;
+                                if (copyLen > sizeof(compReq->Data)) {
+                                    copyLen = sizeof(compReq->Data);
+                                }
+                                PVOID dst = AnyUsb_GetTransferBuffer(urb->UrbBulkOrInterruptTransfer.TransferBuffer,
+                                                                     urb->UrbBulkOrInterruptTransfer.TransferBufferMDL);
+                                if (dst != NULL) {
+                                    RtlCopyMemory(dst, compReq->Data, copyLen);
+                                }
+                            }
+                        } else if (urb->UrbHeader.Function == URB_FUNCTION_ISOCH_TRANSFER) {
+                            urb->UrbIsochronousTransfer.TransferBufferLength = compReq->ActualLength;
+                            if ((urb->UrbIsochronousTransfer.TransferFlags & USBD_TRANSFER_DIRECTION_IN) && compReq->ActualLength > 0) {
+                                ULONG copyLen = compReq->ActualLength;
+                                if (copyLen > sizeof(compReq->Data)) {
+                                    copyLen = sizeof(compReq->Data);
+                                }
+                                PVOID dst = AnyUsb_GetTransferBuffer(urb->UrbIsochronousTransfer.TransferBuffer,
+                                                                     urb->UrbIsochronousTransfer.TransferBufferMDL);
+                                if (dst != NULL) {
+                                    RtlCopyMemory(dst, compReq->Data, copyLen);
                                 }
                             }
                         }
                     }
-
-                    WdfRequestCompleteWithInformation(targetRequest, compReq->Status, compReq->ActualLength);
-                    bytesReturned = 0;
-                    status = STATUS_SUCCESS;
-                } else {
-                    status = STATUS_INVALID_PARAMETER;
                 }
+
+                WdfRequestCompleteWithInformation(targetRequest, compReq->Status, compReq->ActualLength);
+                bytesReturned = 0;
+                status = STATUS_SUCCESS;
             }
             break;
         }
