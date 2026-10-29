@@ -143,4 +143,6 @@
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
+  <!-- Override WDK premature Inf2Cat target; Inf2Cat executes in Step 8 via setup_field_test_signing.ps1 -->
+  <Target Name="Inf2Cat" />
 </Project>
