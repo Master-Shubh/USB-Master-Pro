@@ -99,6 +99,10 @@ Filename: "{sys}\pnputil.exe"; Parameters: "/delete-driver anyusb_filter.inf /un
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Daemon"""; Flags: runhidden; StatusMsg: "Cleaning up Windows Firewall rules..."
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro"""; Flags: runhidden
 
+; Clean up Field Testing Root CA from system stores
+Filename: "{sys}\certutil.exe"; Parameters: "-delstore ""Root"" ""BhartX Ecosystems Field Testing CA"""; Flags: runhidden; StatusMsg: "Removing Field Testing CA from Root store..."
+Filename: "{sys}\certutil.exe"; Parameters: "-delstore ""TrustedPublisher"" ""BhartX Ecosystems Field Testing CA"""; Flags: runhidden; StatusMsg: "Removing Field Testing CA from TrustedPublisher store..."
+
 [Code]
 var
   RestartRequired: Boolean;

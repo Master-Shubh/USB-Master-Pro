@@ -1447,16 +1447,11 @@ async fn run_signaling_client(
 
                 let (mut ws_write, mut ws_read) = ws_stream.split();
 
-                // 1. Send REGISTER with 9-digit AnyUSB ID and local devices
+                // 1. Send cryptographic REGISTER_INIT with 9-digit AnyUSB ID and public key
                 let register_msg = serde_json::json!({
-                    "type": "REGISTER",
+                    "type": "REGISTER_INIT",
                     "id": state.identity.raw_id.to_string(),
-                    "info": {
-                        "hostname": std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")).unwrap_or_else(|_| "Host".to_string()),
-                        "os": std::env::consts::OS,
-                        "devices": *state.devices.read().await,
-                        "version": "1.0.0"
-                    }
+                    "publicKey": state.identity.installation_public_key,
                 });
 
                 if let Ok(txt) = serde_json::to_string(&register_msg) {

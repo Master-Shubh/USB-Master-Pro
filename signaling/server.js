@@ -72,7 +72,6 @@ const server = http.createServer((req, res) => {
       os: peer.info?.os || 'Unknown OS',
       version: peer.info?.version || '1.0.0',
       devicesCount: (peer.info?.devices || []).length,
-      devices: peer.info?.devices || [],
       online: peer.ws?.readyState === WebSocket.OPEN,
       registeredAt: peer.registeredAt,
       lastPing: peer.lastPing
@@ -117,7 +116,7 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: 'Endpoint not found' }));
 });
 
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ server, maxPayload: 1024 * 1024 }); // 1MB frame limit for DoS prevention
 
 console.log(`[USB Master Pro Broker] Initializing P2P Rendezvous Fabric on port ${PORT}...`);
 
@@ -353,7 +352,17 @@ function handleMessage(ws, msg) {
     }
 
     case 'REGISTER': {
-      // Legacy unauthenticated registration fallback
+      // Legacy unauthenticated registration fallback (Gated by ALLOW_LEGACY_REGISTER environment flag)
+      if (process.env.ALLOW_LEGACY_REGISTER !== 'true') {
+        console.warn(`[Broker] Rejected unauthenticated legacy REGISTER attempt. Unauthenticated registration is disabled for security.`);
+        ws.send(JSON.stringify({
+          type: 'REGISTER_RESP',
+          success: false,
+          error: 'Unauthenticated legacy registration is disabled. Upgrade client to REGISTER_INIT cryptographic challenge-response.'
+        }));
+        return;
+      }
+
       // msg: { type: 'REGISTER', id: '482190334', info: { hostname, os, devices, version } }
       const peerId = String(msg.id).replace(/\s+/g, '');
       if (!peerId || peerId.length !== 9) {
