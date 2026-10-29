@@ -26,14 +26,16 @@ pub use adapters::{
 pub use buffer_pool::BufferPool;
 pub use compression::TurboCompressor;
 pub use daemon::{
-    derive_numeric_device_id, execute_session_disconnect, start_daemon, ActiveSession,
-    DaemonServer, DaemonState, RemoteMountedDevice,
+    derive_numeric_device_id, execute_session_disconnect, run_network_to_vhci_pump,
+    run_vhci_to_network_pump, spawn_session_pumps, start_daemon, ActiveSession, DaemonServer,
+    DaemonState, RemoteMountedDevice, SessionPumpHandles,
 };
 pub use device_reset::{DeviceOperationalState, DeviceResetController, ResetMethod};
 pub use driver_client::{
     check_driver_device_presence, check_driver_status, set_simulated_driver_status,
-    AnyUsbAttachRequest, AnyUsbCompleteRequest, AnyUsbDetachRequest, AnyUsbUrbMessage,
-    DriverClientError, DriverOperationalStatus, VhciDriverClient, ANYUSB_MAX_URB_BUFFER_SIZE,
+    AnyUsbAttachRequest, AnyUsbCompleteRequest, AnyUsbDetachRequest, AnyUsbFilterCaptureRequest,
+    AnyUsbUrbMessage, DriverClientError, DriverOperationalStatus, FilterDriverClient,
+    VhciDriverClient, ANYUSB_MAX_URB_BUFFER_SIZE,
 };
 pub use enumerator::{HardwareEnumerator, UsbDeviceInfo};
 pub use hardware_db::{DeviceCategory, HardwareClassifier};

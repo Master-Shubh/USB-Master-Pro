@@ -76,12 +76,17 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\bin\{#MyAppExeName}"; Tasks
 
 [Run]
 ; Native Firewall Rules Configuration (Zero PowerShell Dependency)
+; Explicitly scope inbound daemon communications to local loopback (127.0.0.1) for local UI/IPC,
+; and authorize outbound UDP/TCP tunnel transport for peer sessions.
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Daemon"""; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Daemon (Loopback In)"""; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Daemon (Loopback)"""; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Daemon (Tunnel Out)"""; Flags: runhidden
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro"""; Flags: runhidden
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""USB Master Pro Daemon"" dir=in action=allow program=""{app}\bin\USBMasterDaemon.exe"" enable=yes"; Flags: runhidden; StatusMsg: "Configuring Windows Firewall for USB Master Pro Daemon..."
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""USB Master Pro Daemon"" dir=out action=allow program=""{app}\bin\USBMasterDaemon.exe"" enable=yes"; Flags: runhidden
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""USB Master Pro"" dir=in action=allow program=""{app}\bin\{#MyAppExeName}"" enable=yes"; Flags: runhidden; StatusMsg: "Configuring Windows Firewall for USB Master Pro..."
-Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""USB Master Pro"" dir=out action=allow program=""{app}\bin\{#MyAppExeName}"" enable=yes"; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro (Outbound)"""; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""USB Master Pro Daemon (Loopback In)"" dir=in action=allow program=""{app}\bin\USBMasterDaemon.exe"" localip=127.0.0.1 enable=yes"; Flags: runhidden; StatusMsg: "Configuring Windows Firewall for USB Master Pro Daemon..."
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""USB Master Pro Daemon (Tunnel Out)"" dir=out action=allow program=""{app}\bin\USBMasterDaemon.exe"" enable=yes"; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""USB Master Pro (Outbound)"" dir=out action=allow program=""{app}\bin\{#MyAppExeName}"" enable=yes"; Flags: runhidden; StatusMsg: "Configuring Windows Firewall for USB Master Pro..."
 
 ; Launch application after setup
 Filename: "{app}\bin\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
@@ -97,7 +102,11 @@ Filename: "{sys}\pnputil.exe"; Parameters: "/delete-driver anyusb_filter.inf /un
 
 ; Clean up Windows Firewall rules
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Daemon"""; Flags: runhidden; StatusMsg: "Cleaning up Windows Firewall rules..."
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Daemon (Loopback In)"""; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Daemon (Loopback)"""; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro Daemon (Tunnel Out)"""; Flags: runhidden
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro"""; Flags: runhidden
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro (Outbound)"""; Flags: runhidden
 
 ; Clean up Field Testing Root CA from system stores
 Filename: "{sys}\certutil.exe"; Parameters: "-delstore ""Root"" ""BhartX Ecosystems Field Testing CA"""; Flags: runhidden; StatusMsg: "Removing Field Testing CA from Root store..."

@@ -32,9 +32,27 @@ pub const IOCTL_ANYUSB_VHCI_COMPLETE_URB: u32 =
 pub const IOCTL_ANYUSB_VHCI_ABORT_PIPE: u32 =
     ctl_code(FILE_DEVICE_ANYUSB_VHCI, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS);
 
+// Filter Driver (DevType 0x8901) IOCTLs matching drivers/filter/filter.h
+pub const FILE_DEVICE_ANYUSB_FILTER: u32 = 0x8901;
+
+pub const IOCTL_ANYUSB_FILTER_START_CAPTURE: u32 =
+    ctl_code(FILE_DEVICE_ANYUSB_FILTER, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS);
+pub const IOCTL_ANYUSB_FILTER_STOP_CAPTURE: u32 =
+    ctl_code(FILE_DEVICE_ANYUSB_FILTER, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS);
+pub const IOCTL_ANYUSB_FILTER_FETCH_URB: u32 =
+    ctl_code(FILE_DEVICE_ANYUSB_FILTER, 0x812, METHOD_OUT_DIRECT, FILE_ANY_ACCESS);
+pub const IOCTL_ANYUSB_FILTER_COMPLETE_URB: u32 =
+    ctl_code(FILE_DEVICE_ANYUSB_FILTER, 0x813, METHOD_IN_DIRECT, FILE_ANY_ACCESS);
+
 /// 64 KB buffer cap to accommodate large fingerprint slaps, iris frames, and high-throughput bulk streams
 pub const ANYUSB_MAX_URB_BUFFER_SIZE: usize = 64 * 1024;
 pub const ANYUSB_MAX_PENDING_URBS: usize = 256;
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AnyUsbFilterCaptureRequest {
+    pub device_id: u32,
+}
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
@@ -81,6 +99,7 @@ pub struct AnyUsbDetachRequest {
 }
 
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct AnyUsbCompleteRequest {
     pub device_id: u32,
     pub sequence_id: u64,
@@ -101,7 +120,23 @@ impl Default for AnyUsbCompleteRequest {
     }
 }
 
+impl std::fmt::Debug for AnyUsbCompleteRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let device_id = self.device_id;
+        let sequence_id = self.sequence_id;
+        let status = self.status;
+        let actual_length = self.actual_length;
+        f.debug_struct("AnyUsbCompleteRequest")
+            .field("device_id", &device_id)
+            .field("sequence_id", &sequence_id)
+            .field("status", &status)
+            .field("actual_length", &actual_length)
+            .finish()
+    }
+}
+
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct AnyUsbUrbMessage {
     pub device_id: u32,
     pub sequence_id: u64,
@@ -110,6 +145,25 @@ pub struct AnyUsbUrbMessage {
     pub transfer_buffer_length: u32,
     pub setup_packet: [u8; 8],
     pub data: [u8; ANYUSB_MAX_URB_BUFFER_SIZE],
+}
+
+impl std::fmt::Debug for AnyUsbUrbMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let device_id = self.device_id;
+        let sequence_id = self.sequence_id;
+        let endpoint_address = self.endpoint_address;
+        let transfer_type = self.transfer_type;
+        let transfer_buffer_length = self.transfer_buffer_length;
+        let setup_packet = self.setup_packet;
+        f.debug_struct("AnyUsbUrbMessage")
+            .field("device_id", &device_id)
+            .field("sequence_id", &sequence_id)
+            .field("endpoint_address", &endpoint_address)
+            .field("transfer_type", &transfer_type)
+            .field("transfer_buffer_length", &transfer_buffer_length)
+            .field("setup_packet", &setup_packet)
+            .finish()
+    }
 }
 
 impl Default for AnyUsbUrbMessage {
@@ -448,6 +502,195 @@ impl Drop for VhciDriverClient {
     }
 }
 
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+pub struct FilterDriverClient {
+    pub handle: *mut std::ffi::c_void,
+    pub simulated_capture_failure: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for FilterDriverClient {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for FilterDriverClient {}
+
+#[cfg(target_os = "windows")]
+impl FilterDriverClient {
+    pub const DEVICE_PATH: &'static str = "\\\\.\\AnyUsbFilter";
+
+    pub fn open() -> Result<Self, DriverClientError> {
+        Self::open_device(Self::DEVICE_PATH)
+    }
+
+    pub fn open_device(path: &str) -> Result<Self, DriverClientError> {
+        let wide_path: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        const GENERIC_READ: u32 = 0x80000000;
+        const GENERIC_WRITE: u32 = 0x40000000;
+        const FILE_SHARE_READ: u32 = 1;
+        const FILE_SHARE_WRITE: u32 = 2;
+        const OPEN_EXISTING: u32 = 3;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+        const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            let err = unsafe { GetLastError() };
+            return Err(DriverClientError::DeviceNotFound(format!(
+                "Failed to open '{}' (GetLastError: {})",
+                path,
+                err
+            )));
+        }
+
+        Ok(Self {
+            handle,
+            simulated_capture_failure: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    pub fn set_simulate_capture_failure(&self, fail: bool) {
+        self.simulated_capture_failure.store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn start_capture(&self, device_id: u32) -> Result<(), DriverClientError> {
+        if self.simulated_capture_failure.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DriverClientError::IoControlFailed {
+                ioctl: IOCTL_ANYUSB_FILTER_START_CAPTURE,
+                win_error: 5,
+            });
+        }
+        let req = AnyUsbFilterCaptureRequest { device_id };
+        let mut bytes_returned: u32 = 0;
+        let res = unsafe {
+            DeviceIoControl(
+                self.handle,
+                IOCTL_ANYUSB_FILTER_START_CAPTURE,
+                &req as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<AnyUsbFilterCaptureRequest>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if res == 0 {
+            let err = unsafe { GetLastError() };
+            return Err(DriverClientError::IoControlFailed {
+                ioctl: IOCTL_ANYUSB_FILTER_START_CAPTURE,
+                win_error: err,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn stop_capture(&self, device_id: u32) -> Result<(), DriverClientError> {
+        let req = AnyUsbFilterCaptureRequest { device_id };
+        let mut bytes_returned: u32 = 0;
+        let res = unsafe {
+            DeviceIoControl(
+                self.handle,
+                IOCTL_ANYUSB_FILTER_STOP_CAPTURE,
+                &req as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<AnyUsbFilterCaptureRequest>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if res == 0 {
+            let err = unsafe { GetLastError() };
+            return Err(DriverClientError::IoControlFailed {
+                ioctl: IOCTL_ANYUSB_FILTER_STOP_CAPTURE,
+                win_error: err,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn fetch_urb(&self) -> Result<Option<Box<AnyUsbUrbMessage>>, DriverClientError> {
+        let mut msg = Box::new(AnyUsbUrbMessage::default());
+        let mut bytes_returned: u32 = 0;
+        let res = unsafe {
+            DeviceIoControl(
+                self.handle,
+                IOCTL_ANYUSB_FILTER_FETCH_URB,
+                std::ptr::null(),
+                0,
+                msg.as_mut() as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<AnyUsbUrbMessage>() as u32,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if res == 0 {
+            let err = unsafe { GetLastError() };
+            if err == 259 {
+                // ERROR_NO_MORE_ITEMS (STATUS_NO_MORE_ENTRIES)
+                return Ok(None);
+            }
+            return Err(DriverClientError::IoControlFailed {
+                ioctl: IOCTL_ANYUSB_FILTER_FETCH_URB,
+                win_error: err,
+            });
+        }
+        Ok(Some(msg))
+    }
+
+    pub fn complete_urb(&self, req: &AnyUsbCompleteRequest) -> Result<(), DriverClientError> {
+        let actual_len = req.actual_length;
+        if actual_len as usize > ANYUSB_MAX_URB_BUFFER_SIZE {
+            return Err(DriverClientError::InvalidParameter(format!(
+                "Transfer length ({} B) exceeds maximum single-URB buffer limit ({} B). Transfers >64 KB require chunking.",
+                actual_len, ANYUSB_MAX_URB_BUFFER_SIZE
+            )));
+        }
+
+        let mut bytes_returned: u32 = 0;
+        let res = unsafe {
+            DeviceIoControl(
+                self.handle,
+                IOCTL_ANYUSB_FILTER_COMPLETE_URB,
+                req as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<AnyUsbCompleteRequest>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if res == 0 {
+            let err = unsafe { GetLastError() };
+            return Err(DriverClientError::IoControlFailed {
+                ioctl: IOCTL_ANYUSB_FILTER_COMPLETE_URB,
+                win_error: err,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for FilterDriverClient {
+    fn drop(&mut self) {
+        const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+        if !self.handle.is_null() && self.handle != INVALID_HANDLE_VALUE {
+            unsafe { CloseHandle(self.handle) };
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // POSIX / LINUX IMPLEMENTATION: Test & cross-platform emulation stub
 // ---------------------------------------------------------------------------
@@ -484,6 +727,8 @@ pub fn check_driver_device_presence(path: &str) -> bool {
 pub struct VhciDriverClient {
     pub simulated_device_count: std::sync::atomic::AtomicU32,
     pub simulated_attach_failure: std::sync::atomic::AtomicBool,
+    pub pending_urb_queue: std::sync::Mutex<std::collections::VecDeque<Box<AnyUsbUrbMessage>>>,
+    pub completed_urbs: std::sync::Mutex<Vec<AnyUsbCompleteRequest>>,
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -504,6 +749,8 @@ impl VhciDriverClient {
         Ok(Self {
             simulated_device_count: std::sync::atomic::AtomicU32::new(0),
             simulated_attach_failure: std::sync::atomic::AtomicBool::new(false),
+            pending_urb_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            completed_urbs: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -543,8 +790,14 @@ impl VhciDriverClient {
         Ok(())
     }
 
+    pub fn queue_simulated_urb(&self, msg: AnyUsbUrbMessage) {
+        let mut queue = self.pending_urb_queue.lock().unwrap();
+        queue.push_back(Box::new(msg));
+    }
+
     pub fn fetch_pending_urb(&self) -> Result<Option<Box<AnyUsbUrbMessage>>, DriverClientError> {
-        Ok(None)
+        let mut queue = self.pending_urb_queue.lock().unwrap();
+        Ok(queue.pop_front())
     }
 
     pub fn complete_urb(&self, req: &AnyUsbCompleteRequest) -> Result<(), DriverClientError> {
@@ -555,7 +808,102 @@ impl VhciDriverClient {
                 actual_len, ANYUSB_MAX_URB_BUFFER_SIZE
             )));
         }
+        let mut completed = self.completed_urbs.lock().unwrap();
+        completed.push(*req);
         Ok(())
+    }
+
+    pub fn get_completed_urbs(&self) -> Vec<AnyUsbCompleteRequest> {
+        let completed = self.completed_urbs.lock().unwrap();
+        completed.clone()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+#[derive(Debug)]
+pub struct FilterDriverClient {
+    pub captured_devices: std::sync::Mutex<std::collections::HashSet<u32>>,
+    pub simulated_capture_failure: std::sync::atomic::AtomicBool,
+    pub pending_urb_queue: std::sync::Mutex<std::collections::VecDeque<Box<AnyUsbUrbMessage>>>,
+    pub completed_urbs: std::sync::Mutex<Vec<AnyUsbCompleteRequest>>,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl FilterDriverClient {
+    pub const DEVICE_PATH: &'static str = "/dev/anyusb_filter";
+
+    pub fn open() -> Result<Self, DriverClientError> {
+        Self::open_device(Self::DEVICE_PATH)
+    }
+
+    pub fn open_device(path: &str) -> Result<Self, DriverClientError> {
+        if path.contains("nonexistent") || path.contains("missing") {
+            return Err(DriverClientError::DeviceNotFound(format!(
+                "Driver device not found or access denied: {}",
+                path
+            )));
+        }
+        Ok(Self {
+            captured_devices: std::sync::Mutex::new(std::collections::HashSet::new()),
+            simulated_capture_failure: std::sync::atomic::AtomicBool::new(false),
+            pending_urb_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            completed_urbs: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    pub fn set_simulate_capture_failure(&self, fail: bool) {
+        self.simulated_capture_failure.store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn start_capture(&self, device_id: u32) -> Result<(), DriverClientError> {
+        if self.simulated_capture_failure.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DriverClientError::IoControlFailed {
+                ioctl: IOCTL_ANYUSB_FILTER_START_CAPTURE,
+                win_error: 5,
+            });
+        }
+        let mut caps = self.captured_devices.lock().unwrap();
+        caps.insert(device_id);
+        Ok(())
+    }
+
+    pub fn stop_capture(&self, device_id: u32) -> Result<(), DriverClientError> {
+        let mut caps = self.captured_devices.lock().unwrap();
+        caps.remove(&device_id);
+        Ok(())
+    }
+
+    pub fn is_capturing(&self, device_id: u32) -> bool {
+        let caps = self.captured_devices.lock().unwrap();
+        caps.contains(&device_id)
+    }
+
+    pub fn queue_simulated_urb(&self, msg: AnyUsbUrbMessage) {
+        let mut queue = self.pending_urb_queue.lock().unwrap();
+        queue.push_back(Box::new(msg));
+    }
+
+    pub fn fetch_urb(&self) -> Result<Option<Box<AnyUsbUrbMessage>>, DriverClientError> {
+        let mut queue = self.pending_urb_queue.lock().unwrap();
+        Ok(queue.pop_front())
+    }
+
+    pub fn complete_urb(&self, req: &AnyUsbCompleteRequest) -> Result<(), DriverClientError> {
+        let actual_len = req.actual_length;
+        if actual_len as usize > ANYUSB_MAX_URB_BUFFER_SIZE {
+            return Err(DriverClientError::InvalidParameter(format!(
+                "Transfer length ({} B) exceeds maximum single-URB buffer limit ({} B). Transfers >64 KB require chunking.",
+                actual_len, ANYUSB_MAX_URB_BUFFER_SIZE
+            )));
+        }
+        let mut completed = self.completed_urbs.lock().unwrap();
+        completed.push(*req);
+        Ok(())
+    }
+
+    pub fn get_completed_urbs(&self) -> Vec<AnyUsbCompleteRequest> {
+        let completed = self.completed_urbs.lock().unwrap();
+        completed.clone()
     }
 }
 
@@ -575,6 +923,30 @@ impl Default for VhciDriverClient {
         Self::open().unwrap_or(Self {
             simulated_device_count: std::sync::atomic::AtomicU32::new(0),
             simulated_attach_failure: std::sync::atomic::AtomicBool::new(false),
+            pending_urb_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            completed_urbs: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Default for FilterDriverClient {
+    fn default() -> Self {
+        Self::open().unwrap_or(Self {
+            handle: -1isize as *mut std::ffi::c_void,
+            simulated_capture_failure: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl Default for FilterDriverClient {
+    fn default() -> Self {
+        Self::open().unwrap_or_else(|_| Self {
+            captured_devices: std::sync::Mutex::new(std::collections::HashSet::new()),
+            simulated_capture_failure: std::sync::atomic::AtomicBool::new(false),
+            pending_urb_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            completed_urbs: std::sync::Mutex::new(Vec::new()),
         })
     }
 }
@@ -594,11 +966,57 @@ mod tests {
     }
 
     #[test]
+    fn test_ioctl_codes_match_driver_filter_header() {
+        assert_eq!(IOCTL_ANYUSB_FILTER_START_CAPTURE, 0x89012040);
+        assert_eq!(IOCTL_ANYUSB_FILTER_STOP_CAPTURE, 0x89012044);
+        assert_eq!(IOCTL_ANYUSB_FILTER_FETCH_URB, 0x8901204A);
+        assert_eq!(IOCTL_ANYUSB_FILTER_COMPLETE_URB, 0x8901204D);
+    }
+
+    #[test]
     fn test_driver_struct_sizes_and_alignments() {
         assert_eq!(std::mem::size_of::<AnyUsbDetachRequest>(), 4);
+        assert_eq!(std::mem::size_of::<AnyUsbFilterCaptureRequest>(), 4);
         assert_eq!(std::mem::size_of::<AnyUsbAttachRequest>(), 1554);
         assert_eq!(std::mem::size_of::<AnyUsbCompleteRequest>(), 65556);
         assert_eq!(std::mem::size_of::<AnyUsbUrbMessage>(), 65562);
+    }
+
+    #[test]
+    fn test_filter_driver_client_lifecycle_stub() {
+        let client = FilterDriverClient::open().expect("Failed to open filter client");
+        client.start_capture(1001).expect("Failed to start capture");
+        assert!(client.is_capturing(1001));
+        assert!(!client.is_capturing(9999));
+
+        // Queue simulated URB into stub
+        let mut sim_msg = AnyUsbUrbMessage::default();
+        sim_msg.device_id = 1001;
+        sim_msg.sequence_id = 77;
+        sim_msg.endpoint_address = 0x81;
+        sim_msg.transfer_buffer_length = 64;
+        client.queue_simulated_urb(sim_msg);
+
+        let fetched = client.fetch_urb().expect("Fetch URB failed").expect("URB should be present");
+        assert_eq!({ fetched.device_id }, 1001);
+        assert_eq!({ fetched.sequence_id }, 77);
+        assert_eq!(fetched.endpoint_address, 0x81);
+
+        let comp_req = AnyUsbCompleteRequest {
+            device_id: 1001,
+            sequence_id: 77,
+            status: 0,
+            actual_length: 64,
+            data: [0xAA; ANYUSB_MAX_URB_BUFFER_SIZE],
+        };
+        client.complete_urb(&comp_req).expect("Complete URB failed");
+        let completed = client.get_completed_urbs();
+        assert_eq!(completed.len(), 1);
+        assert_eq!({ completed[0].sequence_id }, 77);
+        assert_eq!({ completed[0].actual_length }, 64);
+
+        client.stop_capture(1001).expect("Failed to stop capture");
+        assert!(!client.is_capturing(1001));
     }
 
     #[test]

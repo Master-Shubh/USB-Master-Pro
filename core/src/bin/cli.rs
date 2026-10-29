@@ -118,7 +118,8 @@ async fn main() {
         }
 
         "benchmark" | "--benchmark" | "test" | "--test" => {
-            println!("🚀 Running Turbo-URB In-Memory Throughput & Compression Benchmark...\n");
+            println!("🚀 Running Turbo-URB Synthetic In-Memory Throughput Benchmark...\n");
+            println!("  [Note: Synthetic RAM-to-RAM test measuring serialization and compression; not wire latency]\n");
             let pool = BufferPool::default_pool();
             let raw_size = 512 * 1024; // 512 KB biometric high-res scan frame
             let mut sample_frame = vec![0x20; raw_size];
@@ -161,17 +162,61 @@ async fn main() {
                 compression_ratio * 100.0,
                 1.0 / compression_ratio
             );
-            println!("  Average Latency:     \x1b[1;32m{:.3} ms/frame\x1b[0m (RD Service SLA < 200ms)", elapsed.as_secs_f64() * 1000.0 / iterations as f64);
-            println!("\n  Verdict: \x1b[1;32m100% Green — Ultra High Speed Turbo-URB Verified!\x1b[0m");
+            println!("  Average In-Memory CPU Latency: {:.3} ms/frame", elapsed.as_secs_f64() * 1000.0 / iterations as f64);
+            println!("\n  Verdict: \x1b[1;32mSynthetic Benchmark Completed — In-Memory Pipeline Verified.\x1b[0m");
         }
 
         "connect" => {
-            let target_id = args.get(2).cloned().unwrap_or_else(|| "712883910".to_string());
-            let dev_id = args.get(3).cloned().unwrap_or_else(|| "1-4".to_string());
-            println!("Initiating AnyDesk-style P2P connection to ID [{}]...", target_id);
-            println!("Requesting remote device: [{}]", dev_id);
-            println!("Direct UDP 443 hole-punching initiated...");
-            println!("\x1b[1;32mConnected! Device mounted into Windows Device Manager.\x1b[0m");
+            let target_id = args.get(2).cloned().unwrap_or_default();
+            let dev_id = args.get(3).cloned().unwrap_or_else(|| "auto".to_string());
+            if target_id.trim().is_empty() {
+                println!("Usage: usb_master_cli connect <target_9_digit_id> [device_id]");
+                return;
+            }
+            let clean_target_id = target_id.replace(' ', "");
+            println!("Initiating connection request to remote peer [{}] for device [{}]...", clean_target_id, dev_id);
+
+            let port = std::env::var("DAEMON_PORT")
+                .ok()
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(19842);
+            let token = std::env::var("USB_MASTER_DAEMON_TOKEN")
+                .ok()
+                .or_else(usb_master_core::daemon::read_secure_token_from_disk)
+                .unwrap_or_default();
+
+            let payload = serde_json::json!({
+                "target_id": clean_target_id,
+                "device_id": dev_id
+            }).to_string();
+
+            let req = format!(
+                "POST /api/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+
+            match tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await {
+                Ok(mut stream) => {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    if let Err(e) = stream.write_all(req.as_bytes()).await {
+                        eprintln!("❌ Failed to send connect request to local daemon: {}", e);
+                        return;
+                    }
+                    let mut resp_buf = Vec::new();
+                    let _ = stream.read_to_end(&mut resp_buf).await;
+                    let resp_str = String::from_utf8_lossy(&resp_buf);
+                    if resp_str.contains("200 OK") {
+                        println!("\x1b[1;32m[+] Connection request dispatched to daemon. Session state: Pairing/Negotiating.\x1b[0m");
+                        println!("    Check web dashboard (http://127.0.0.1:{port}/) for real-time status.");
+                    } else {
+                        eprintln!("❌ Daemon responded with error:\n{}", resp_str.lines().next().unwrap_or("Unknown error"));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Local daemon is not running on 127.0.0.1:{} ({}).", port, e);
+                    eprintln!("   Please start the daemon first with 'usb_master_cli daemon' or 'usb_master_cli gui'.");
+                }
+            }
         }
 
         _ => {

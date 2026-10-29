@@ -3,11 +3,13 @@
 //! and maintains an outbound WebSocket session to the signaling broker.
 
 use crate::driver_client::{
-    check_driver_status, AnyUsbAttachRequest, DriverOperationalStatus, VhciDriverClient,
+    check_driver_status, AnyUsbAttachRequest, AnyUsbCompleteRequest, DriverClientError,
+    DriverOperationalStatus, FilterDriverClient, VhciDriverClient, ANYUSB_MAX_URB_BUFFER_SIZE,
 };
 use crate::enumerator::{HardwareEnumerator, UsbDeviceInfo};
 use crate::identity::NodeIdentity;
 use crate::licensing::{LicenseClaims, LicenseEngine};
+use crate::protocol::{TurboUrbHeader, CMD_COMPLETE_URB, CMD_SUBMIT_URB, TransferType};
 use crate::state::{SessionState, SessionStateMachine, StateTransitionError};
 use axum::{
     extract::{
@@ -177,6 +179,15 @@ pub struct DaemonTelemetry {
     pub rd_service_latency_ms: f64,
 }
 
+/// Async Tokio URB pump worker task handles and data channels for an active session
+pub struct SessionPumpHandles {
+    pub vhci_to_net_task: tokio::task::JoinHandle<()>,
+    pub net_to_vhci_task: tokio::task::JoinHandle<()>,
+    pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    pub session_data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    pub vhci_out_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+}
+
 pub struct DaemonState {
     pub identity: NodeIdentity,
     pub devices: RwLock<Vec<UsbDeviceInfo>>,
@@ -190,6 +201,8 @@ pub struct DaemonState {
     pub active_license: RwLock<Option<LicenseClaims>>,
     pub local_api_token: std::sync::RwLock<String>,
     pub driver_client: Arc<VhciDriverClient>,
+    pub filter_client: Arc<FilterDriverClient>,
+    pub session_pumps: Arc<tokio::sync::Mutex<HashMap<String, SessionPumpHandles>>>,
 }
 
 /// Generates a 256-bit cryptographically secure local API authorization token from the OS CSPRNG.
@@ -653,6 +666,7 @@ impl DaemonServer {
         let _ = save_secure_token_to_disk(&local_api_token);
 
         let driver_client = Arc::new(VhciDriverClient::open().unwrap_or_default());
+        let filter_client = Arc::new(FilterDriverClient::open().unwrap_or_default());
 
         let state = Arc::new(DaemonState {
             identity,
@@ -667,6 +681,8 @@ impl DaemonServer {
             active_license: RwLock::new(initial_license),
             local_api_token: std::sync::RwLock::new(local_api_token),
             driver_client,
+            filter_client,
+            session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         });
 
         // 1. Spawn Outbound Signaling Client task
@@ -1007,6 +1023,10 @@ async fn handle_post_respond(
         let session_clone = session.clone();
         drop(sessions);
 
+        // Spawn Tokio URB pump worker tasks for the active session
+        let numeric_dev_id = derive_numeric_device_id(&clean_from_id);
+        spawn_session_pumps(&state, &clean_from_id, numeric_dev_id).await;
+
         // Mark local shared device as mounted
         let mut dev_lock = state.devices.write().await;
         if let Some(first_shareable) = dev_lock.iter_mut().find(|d| d.can_forward) {
@@ -1072,6 +1092,221 @@ async fn handle_post_respond(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+// -----------------------------------------------------------------------------
+// TOKIO ASYNC RUNTIME URB PUMP WORKER TASKS
+// -----------------------------------------------------------------------------
+
+/// Pulls pending URBs from `driver_client.fetch_pending_urb()` with adaptive backoff
+/// (100 µs to 2 ms) and streams them across the session data channel.
+pub async fn run_vhci_to_network_pump(
+    driver_client: Arc<VhciDriverClient>,
+    device_id: u32,
+    session_data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    const MIN_BACKOFF: std::time::Duration = std::time::Duration::from_micros(100);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(2);
+    let mut current_backoff = MIN_BACKOFF;
+
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        let client = Arc::clone(&driver_client);
+        let fetch_res = tokio::task::spawn_blocking(move || client.fetch_pending_urb()).await;
+
+        match fetch_res {
+            Ok(Ok(Some(urb_msg))) => {
+                // Work received: reset adaptive backoff immediately
+                current_backoff = MIN_BACKOFF;
+
+                let buffer_len = urb_msg.transfer_buffer_length;
+                if buffer_len as usize > ANYUSB_MAX_URB_BUFFER_SIZE {
+                    eprintln!(
+                        "⚠️ URB buffer length {} exceeds 64 KB limit. Dropping transfer.",
+                        buffer_len
+                    );
+                    continue;
+                }
+
+                let xfer_type = TransferType::from(urb_msg.transfer_type);
+                let mut header = TurboUrbHeader::new(
+                    CMD_SUBMIT_URB,
+                    urb_msg.sequence_id,
+                    if urb_msg.device_id != 0 {
+                        urb_msg.device_id
+                    } else {
+                        device_id
+                    },
+                    urb_msg.endpoint_address,
+                    xfer_type,
+                    buffer_len,
+                );
+                header.actual_length = buffer_len;
+
+                let mut frame = header.serialize();
+                let payload_len = (buffer_len as usize).min(ANYUSB_MAX_URB_BUFFER_SIZE);
+                if payload_len > 0 {
+                    frame.extend_from_slice(&urb_msg.data[..payload_len]);
+                }
+
+                if session_data_tx.send(frame).await.is_err() {
+                    // Session data channel closed / disconnected
+                    break;
+                }
+            }
+            Ok(Ok(None)) | Ok(Err(DriverClientError::NoMoreEntries)) => {
+                // Adaptive backoff: exponentially increase from 100µs to 2ms
+                tokio::select! {
+                    _ = tokio::time::sleep(current_backoff) => {
+                        current_backoff = (current_backoff * 2).min(MAX_BACKOFF);
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("⚠️ VHCI fetch_pending_urb returned error: {}", e);
+                tokio::select! {
+                    _ = tokio::time::sleep(MAX_BACKOFF) => {}
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // spawn_blocking task cancelled or panicked
+                break;
+            }
+        }
+    }
+}
+
+/// Receives completed URBs from the session data channel, parses wire framing,
+/// enforces 64 KB single-URB bounds protection, and dispatches completion to VHCI driver.
+pub async fn run_network_to_vhci_pump(
+    driver_client: Arc<VhciDriverClient>,
+    mut session_data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        let frame = tokio::select! {
+            msg = session_data_rx.recv() => {
+                match msg {
+                    Some(f) => f,
+                    None => break, // Data channel closed
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        if frame.len() < TurboUrbHeader::SIZE {
+            eprintln!("⚠️ Truncated wire frame received (< {} bytes)", TurboUrbHeader::SIZE);
+            continue;
+        }
+
+        let header = match TurboUrbHeader::deserialize_single_urb(&frame[..TurboUrbHeader::SIZE]) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("⚠️ Wire header parsing error: {}", e);
+                continue;
+            }
+        };
+
+        if header.command != CMD_COMPLETE_URB {
+            continue;
+        }
+
+        let mut comp_req = AnyUsbCompleteRequest {
+            device_id: header.device_id,
+            sequence_id: header.sequence_id,
+            status: header.status,
+            actual_length: header.actual_length,
+            data: [0u8; ANYUSB_MAX_URB_BUFFER_SIZE],
+        };
+
+        if header.actual_length as usize > ANYUSB_MAX_URB_BUFFER_SIZE {
+            eprintln!(
+                "⚠️ Completion URB Seq {} length {} exceeds 64 KB limit. Dropping.",
+                header.sequence_id, header.actual_length
+            );
+            continue;
+        }
+
+        let payload = &frame[TurboUrbHeader::SIZE..];
+        let copy_len = (header.actual_length as usize)
+            .min(payload.len())
+            .min(ANYUSB_MAX_URB_BUFFER_SIZE);
+        if copy_len > 0 {
+            comp_req.data[..copy_len].copy_from_slice(&payload[..copy_len]);
+        }
+
+        let client = Arc::clone(&driver_client);
+        let complete_res = tokio::task::spawn_blocking(move || client.complete_urb(&comp_req)).await;
+
+        if let Ok(Err(e)) = complete_res {
+            eprintln!("⚠️ Failed to complete URB Seq {}: {}", header.sequence_id, e);
+        }
+    }
+}
+
+/// Spawns VHCI-to-network and network-to-VHCI pump worker tasks for an active session.
+pub async fn spawn_session_pumps(
+    state: &Arc<DaemonState>,
+    peer_id: &str,
+    device_id: u32,
+) {
+    let clean_peer_id = peer_id.replace(' ', "");
+    let mut pumps = state.session_pumps.lock().await;
+
+    // Clean up any lingering pump for this peer
+    if let Some(old) = pumps.remove(&clean_peer_id) {
+        let _ = old.shutdown_tx.send(true);
+        old.vhci_to_net_task.abort();
+        old.net_to_vhci_task.abort();
+    }
+
+    let (shutdown_tx, shutdown_rx_vhci) = tokio::sync::watch::channel(false);
+    let shutdown_rx_net = shutdown_tx.subscribe();
+
+    // Data channel for incoming completed frames (network -> vhci)
+    let (net_to_vhci_tx, net_to_vhci_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    // Data channel for outgoing captured frames (vhci -> network)
+    let (vhci_to_net_tx, vhci_to_net_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+
+    let driver_client_1 = Arc::clone(&state.driver_client);
+    let vhci_to_net_task = tokio::spawn(async move {
+        run_vhci_to_network_pump(driver_client_1, device_id, vhci_to_net_tx, shutdown_rx_vhci).await;
+    });
+
+    let driver_client_2 = Arc::clone(&state.driver_client);
+    let net_to_vhci_task = tokio::spawn(async move {
+        run_network_to_vhci_pump(driver_client_2, net_to_vhci_rx, shutdown_rx_net).await;
+    });
+
+    pumps.insert(
+        clean_peer_id,
+        SessionPumpHandles {
+            vhci_to_net_task,
+            net_to_vhci_task,
+            shutdown_tx,
+            session_data_tx: net_to_vhci_tx,
+            vhci_out_rx: Arc::new(tokio::sync::Mutex::new(vhci_to_net_rx)),
+        },
+    );
+}
+
 /// Derives a stable 32-bit numeric device identifier from an alphanumeric or decimal peer ID
 pub fn derive_numeric_device_id(id_str: &str) -> u32 {
     let cleaned = id_str.replace(' ', "");
@@ -1122,6 +1357,16 @@ pub async fn execute_session_disconnect(
         }));
     }
     drop(sessions);
+
+    // Cancel and tear down active session Tokio URB pump worker tasks cleanly
+    let mut pumps = state.session_pumps.lock().await;
+    if let Some(handles) = pumps.remove(&clean_peer_id) {
+        let _ = handles.shutdown_tx.send(true);
+        handles.vhci_to_net_task.abort();
+        handles.net_to_vhci_task.abort();
+        println!("  🛑 Aborted URB pump tasks for peer [{}]", clean_peer_id);
+    }
+    drop(pumps);
 
     // Unmount remote device if any
     let mut rem_lock = state.remote_devices.write().await;
@@ -1672,6 +1917,10 @@ async fn handle_broker_message(state: &Arc<DaemonState>, raw_json: &str) {
                     let session_device_id = session.device_id.clone();
                     let mut current_sess = session.clone();
                     drop(sessions);
+
+                    // Spawn Tokio URB pump worker tasks for the active session
+                    let numeric_dev_id = derive_numeric_device_id(from_id);
+                    spawn_session_pumps(&state, from_id, numeric_dev_id).await;
 
                     // Extract VID/PID from message or remote device request
                     let (vid, pid) = {

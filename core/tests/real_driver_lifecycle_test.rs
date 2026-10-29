@@ -21,8 +21,8 @@ use usb_master_core::daemon::{
 use usb_master_core::driver_client::{
     check_driver_device_presence, check_driver_status, set_simulated_driver_status,
     AnyUsbAttachRequest, AnyUsbCompleteRequest, DriverClientError, DriverOperationalStatus,
-    VhciDriverClient, ANYUSB_MAX_URB_BUFFER_SIZE, IOCTL_ANYUSB_VHCI_ATTACH_DEVICE,
-    IOCTL_ANYUSB_VHCI_INIT_BUS,
+    FilterDriverClient, VhciDriverClient, ANYUSB_MAX_URB_BUFFER_SIZE,
+    IOCTL_ANYUSB_VHCI_ATTACH_DEVICE, IOCTL_ANYUSB_VHCI_INIT_BUS,
 };
 use usb_master_core::hardware_db::DeviceCategory;
 use usb_master_core::identity::NodeIdentity;
@@ -471,6 +471,8 @@ async fn test_execute_session_disconnect_cleans_remote_and_local_mounts() {
         active_license: RwLock::new(None),
         local_api_token: std::sync::RwLock::new("test-token".to_string()),
         driver_client,
+        filter_client: Arc::new(FilterDriverClient::default()),
+        session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     });
 
     // Execute disconnect using spaced peer ID
@@ -543,6 +545,8 @@ async fn test_execute_session_disconnect_idempotency_and_missing_session() {
         active_license: RwLock::new(None),
         local_api_token: std::sync::RwLock::new("test-token".to_string()),
         driver_client,
+        filter_client: Arc::new(FilterDriverClient::default()),
+        session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     });
 
     // 1. Disconnect on non-existent peer must return false safely without panic
