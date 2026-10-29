@@ -42,10 +42,11 @@ pub use identity::{
     NodeIdentity,
 };
 pub use licensing::{
-    LicenseClaims, LicenseEngine, LicenseError, BHARTX_ROOT_LICENSE_PUBKEY,
+    LicenseClaims, LicenseEngine, LicenseError, BHARTX_PRODUCTION_ROOT_LICENSE_PUBKEY,
+    BHARTX_ROOT_LICENSE_PUBKEY,
 };
 #[cfg(any(test, feature = "test-utils"))]
-pub use licensing::BHARTX_ROOT_SEED;
+pub use licensing::{BHARTX_ROOT_SEED, BHARTX_TEST_ROOT_SEED};
 pub use security::{
     KeyStorageProvider, PortableFileKeyStorage, SecurityError, WindowsDpapiKeyStorage,
 };

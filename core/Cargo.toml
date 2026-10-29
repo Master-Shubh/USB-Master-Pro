@@ -29,6 +29,7 @@ tokio-tungstenite = "0.23"
 futures-util = "0.3"
 base64 = "0.22"
 thiserror = "1.0"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["fast", "zeroize"] }
 
 [lib]
 name = "usb_master_core"

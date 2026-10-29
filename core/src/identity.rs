@@ -1,6 +1,7 @@
 //! Hardware Identity & 9-Digit AnyDesk-Style ID Generator
 //! Generates an immutable, human-readable 9-digit ID anchored to platform hardware.
 
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -52,29 +53,16 @@ impl InstallationKeypair {
         Self::from_seed(&seed)
     }
 
-    /// Derives an asymmetric keypair deterministically from a 32-byte seed
+    /// Derives an asymmetric keypair deterministically from a 32-byte seed using RFC 8032 Ed25519
     pub fn from_seed(seed: &[u8; 32]) -> Self {
-        let mut priv_hasher = Sha256::new();
-        priv_hasher.update(b"USB_MASTER_ED25519_PRIV_V1");
-        priv_hasher.update(seed);
-        let priv_hash = priv_hasher.finalize();
-
-        let mut pub_hasher = Sha256::new();
-        pub_hasher.update(b"USB_MASTER_ED25519_PUB_V1");
-        pub_hasher.update(&priv_hash);
-        let pub_hash = pub_hasher.finalize();
-
-        let mut private_key = [0u8; 32];
-        private_key.copy_from_slice(&priv_hash);
-
-        let mut public_key = [0u8; 32];
-        public_key.copy_from_slice(&pub_hash);
-
+        let signing_key = SigningKey::from_bytes(seed);
+        let verifying_key = signing_key.verifying_key();
+        let public_key = verifying_key.to_bytes();
         let public_key_hex = hex::encode(public_key);
 
         Self {
             public_key,
-            private_key,
+            private_key: *seed,
             public_key_hex,
         }
     }
@@ -102,23 +90,9 @@ impl InstallationKeypair {
 
     /// Signs an arbitrary message using the private key, returning a 64-byte signature
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
-        let mut r_hasher = Sha256::new();
-        r_hasher.update(b"USB_MASTER_ED25519_SIG_COMMITMENT_R");
-        r_hasher.update(&self.private_key);
-        r_hasher.update(message);
-        let r_digest = r_hasher.finalize();
-
-        let mut s_hasher = Sha256::new();
-        s_hasher.update(b"USB_MASTER_ED25519_SIG_RESPONSE_S");
-        s_hasher.update(&r_digest);
-        s_hasher.update(&self.public_key);
-        s_hasher.update(message);
-        let s_digest = s_hasher.finalize();
-
-        let mut signature = [0u8; 64];
-        signature[0..32].copy_from_slice(&r_digest);
-        signature[32..64].copy_from_slice(&s_digest);
-        signature
+        let signing_key = SigningKey::from_bytes(&self.private_key);
+        let sig: Signature = signing_key.sign(message);
+        sig.to_bytes()
     }
 
     /// Verifies a 64-byte signature against this keypair's public key and the message
@@ -126,19 +100,13 @@ impl InstallationKeypair {
         Self::verify_with_public_key(&self.public_key, message, signature)
     }
 
-    /// Verifies a 64-byte signature given only the 32-byte public key
+    /// Verifies a 64-byte signature given only the 32-byte public key using strict Ed25519 verification (RFC 8032)
     pub fn verify_with_public_key(public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
-        let r_part = &signature[0..32];
-        let s_part = &signature[32..64];
-
-        let mut s_verifier = Sha256::new();
-        s_verifier.update(b"USB_MASTER_ED25519_SIG_RESPONSE_S");
-        s_verifier.update(r_part);
-        s_verifier.update(public_key);
-        s_verifier.update(message);
-        let expected_s = s_verifier.finalize();
-
-        s_part == expected_s.as_slice()
+        let Ok(verifying_key) = VerifyingKey::from_bytes(public_key) else {
+            return false;
+        };
+        let sig = Signature::from_bytes(signature);
+        verifying_key.verify_strict(message, &sig).is_ok()
     }
 }
 

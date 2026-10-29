@@ -1153,6 +1153,36 @@ fn get_license_file_path() -> std::path::PathBuf {
     std::path::PathBuf::from("license.json")
 }
 
+/// Parses and cryptographically verifies a persisted license payload.
+/// Supports both:
+/// 1. Structured JSON: `{"token": "<token>", "claims": { ... }}`
+/// 2. Raw cryptographic token string: `<base64_payload>.<hex_ed25519_signature>`
+///
+/// SEC-ADV-01 Remediation: Unsigned `LicenseClaims` JSON objects are strictly rejected.
+/// Cryptographic signature verification via `LicenseEngine::verify_token` is strictly mandatory.
+fn parse_and_verify_persisted_license(content: &str, hardware_hash: &str) -> Option<LicenseClaims> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // 1. If stored as structured JSON containing a "token" field
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(token) = val.get("token").and_then(|t| t.as_str()) {
+            if let Ok(claims) = LicenseEngine::verify_token(token.trim(), hardware_hash) {
+                return Some(claims);
+            }
+        }
+    }
+
+    // 2. If stored as a raw cryptographic token string (<base64>.<hex>)
+    if let Ok(claims) = LicenseEngine::verify_token(trimmed, hardware_hash) {
+        return Some(claims);
+    }
+
+    None
+}
+
 fn load_persisted_license(hardware_hash: &str) -> Option<LicenseClaims> {
     let candidate_paths = [
         get_license_file_path(),
@@ -1162,12 +1192,7 @@ fn load_persisted_license(hardware_hash: &str) -> Option<LicenseClaims> {
     for path in candidate_paths {
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(claims) = serde_json::from_str::<LicenseClaims>(&content) {
-                    if claims.hardware_hash == hardware_hash && claims.is_valid_now() {
-                        return Some(claims);
-                    }
-                }
-                if let Ok(claims) = LicenseEngine::verify_token(content.trim(), hardware_hash) {
+                if let Some(claims) = parse_and_verify_persisted_license(&content, hardware_hash) {
                     return Some(claims);
                 }
             }
@@ -1176,18 +1201,27 @@ fn load_persisted_license(hardware_hash: &str) -> Option<LicenseClaims> {
     None
 }
 
-fn persist_license(claims: &LicenseClaims, _token: &str) {
+fn persist_license(claims: &LicenseClaims, token: &str) {
     let candidate_paths = [
         get_license_file_path(),
         std::path::PathBuf::from("license.json"),
     ];
 
-    if let Ok(json_str) = serde_json::to_string_pretty(claims) {
+    let record = serde_json::json!({
+        "token": token,
+        "claims": claims,
+    });
+
+    if let Ok(json_str) = serde_json::to_string_pretty(&record) {
         for path in candidate_paths {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let _ = std::fs::write(path, &json_str);
         }
     }
 }
+
 
 async fn handle_post_license_activate(
     headers: axum::http::HeaderMap,
@@ -1872,5 +1906,140 @@ mod tests {
         assert_eq!(t1.len(), 64);
         assert_eq!(t2.len(), 64);
         assert_ne!(t1, t2, "Successive CSPRNG tokens must be cryptographically distinct");
+    }
+
+    #[test]
+    fn test_persisted_license_rejects_unsigned_claims_json() {
+        let hw_hash = "test_hardware_hash_sec_adv_01";
+        let claims = LicenseClaims {
+            license_id: "LIC-UNSIGNED-BYPASS-ATTEMPT".to_string(),
+            hardware_hash: hw_hash.to_string(),
+            customer_name: "Attacker Entity".to_string(),
+            tier: "EnterprisePro".to_string(),
+            max_devices: 128,
+            features: vec!["TURBO_URB_ZSTD".to_string()],
+            issued_at: 1000,
+            expires_at: 2000000000,
+        };
+
+        // Attempting to persist raw unverified claims JSON (as old SEC-ADV-01 vulnerability allowed)
+        let unsigned_json = serde_json::to_string_pretty(&claims).unwrap();
+        let loaded = parse_and_verify_persisted_license(&unsigned_json, hw_hash);
+        assert!(
+            loaded.is_none(),
+            "SEC-ADV-01: Persisted unsigned LicenseClaims JSON must NEVER be accepted without signature verification"
+        );
+    }
+
+    #[test]
+    fn test_persisted_license_rejects_tampered_token() {
+        let hw_hash = "test_hardware_hash_sec_adv_01";
+        let root_kp = LicenseEngine::root_ca_keypair();
+        let valid_claims = LicenseClaims {
+            license_id: "LIC-2026-BHARTX-VALID".to_string(),
+            hardware_hash: hw_hash.to_string(),
+            customer_name: "Legit Customer".to_string(),
+            tier: "EnterprisePro".to_string(),
+            max_devices: 32,
+            features: vec!["TURBO_URB_ZSTD".to_string()],
+            issued_at: 1000,
+            expires_at: 2000000000,
+        };
+        let token = LicenseEngine::issue_token(&valid_claims, &root_kp).unwrap();
+        let mut tampered_token = token.clone();
+        tampered_token.replace_range(10..15, "XXXXX");
+
+        // Structured JSON with tampered token
+        let tampered_json = serde_json::json!({
+            "token": tampered_token,
+            "claims": valid_claims,
+        }).to_string();
+        assert!(parse_and_verify_persisted_license(&tampered_json, hw_hash).is_none());
+
+        // Raw tampered token string
+        assert!(parse_and_verify_persisted_license(&tampered_token, hw_hash).is_none());
+    }
+
+    #[test]
+    fn test_persisted_license_rejects_hardware_mismatch() {
+        let hw_hash_a = "test_hardware_hash_machine_a";
+        let hw_hash_b = "test_hardware_hash_machine_b";
+        let root_kp = LicenseEngine::root_ca_keypair();
+        let claims = LicenseClaims {
+            license_id: "LIC-2026-BHARTX-HW".to_string(),
+            hardware_hash: hw_hash_a.to_string(),
+            customer_name: "Machine A".to_string(),
+            tier: "EnterprisePro".to_string(),
+            max_devices: 16,
+            features: vec![],
+            issued_at: 1000,
+            expires_at: 2000000000,
+        };
+        let token = LicenseEngine::issue_token(&claims, &root_kp).unwrap();
+
+        let json = serde_json::json!({
+            "token": token,
+            "claims": claims,
+        }).to_string();
+
+        assert!(
+            parse_and_verify_persisted_license(&json, hw_hash_b).is_none(),
+            "Token anchored to machine A must be rejected on machine B"
+        );
+    }
+
+    #[test]
+    fn test_persisted_license_accepts_valid_signed_token_json_and_raw() {
+        let hw_hash = "test_hardware_hash_machine_c";
+        let root_kp = LicenseEngine::root_ca_keypair();
+        let valid_claims = LicenseClaims {
+            license_id: "LIC-2026-BHARTX-VALID-C".to_string(),
+            hardware_hash: hw_hash.to_string(),
+            customer_name: "Machine C".to_string(),
+            tier: "EnterprisePro".to_string(),
+            max_devices: 64,
+            features: vec!["TURBO_URB_ZSTD".to_string()],
+            issued_at: 1000,
+            expires_at: 2050000000,
+        };
+        let token = LicenseEngine::issue_token(&valid_claims, &root_kp).unwrap();
+
+        // 1. Structured JSON with "token"
+        let json = serde_json::json!({
+            "token": token,
+            "claims": valid_claims,
+        }).to_string();
+        let loaded = parse_and_verify_persisted_license(&json, hw_hash)
+            .expect("Valid structured JSON license must be accepted");
+        assert_eq!(loaded.license_id, "LIC-2026-BHARTX-VALID-C");
+        assert_eq!(loaded.tier, "EnterprisePro");
+
+        // 2. Structured JSON where claims block was tampered with, but token is intact
+        // The parser MUST return claims from the cryptographically verified token!
+        let tampered_claims_json = serde_json::json!({
+            "token": token,
+            "claims": {
+                "license_id": "TAMPERED_ID",
+                "hardware_hash": hw_hash,
+                "tier": "FreeHackedTier",
+                "customer_name": "Tampered",
+                "max_devices": 99999,
+                "features": [],
+                "issued_at": 1000,
+                "expires_at": 2050000000
+            }
+        }).to_string();
+        let loaded_tampered = parse_and_verify_persisted_license(&tampered_claims_json, hw_hash)
+            .expect("Valid token in JSON must still verify");
+        assert_eq!(
+            loaded_tampered.license_id, "LIC-2026-BHARTX-VALID-C",
+            "Claims must be derived from cryptographically verified token payload, never untrusted JSON fields"
+        );
+        assert_eq!(loaded_tampered.tier, "EnterprisePro");
+
+        // 3. Raw token string
+        let loaded_raw = parse_and_verify_persisted_license(&token, hw_hash)
+            .expect("Valid raw token string must be accepted");
+        assert_eq!(loaded_raw.license_id, "LIC-2026-BHARTX-VALID-C");
     }
 }

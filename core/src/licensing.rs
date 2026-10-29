@@ -6,18 +6,26 @@ use crate::identity::InstallationKeypair;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-/// BhartX Enterprise Root CA Public Key (Ed25519)
-/// Used for offline verification of cryptographic license tokens.
-pub const BHARTX_ROOT_LICENSE_PUBKEY: [u8; 32] = [
-    163, 219, 54, 106, 106, 29, 202, 89, 0, 132, 0, 176, 66, 220, 126, 129,
-    127, 184, 229, 40, 73, 63, 123, 180, 10, 122, 206, 177, 229, 14, 26, 157,
+/// BhartX Production Root CA Public Key (Ed25519 - RFC 8032)
+/// Used for offline verification of cryptographic license tokens in production.
+/// Root private seed is stored strictly offline / off-repo in HSM/secure vault.
+pub const BHARTX_PRODUCTION_ROOT_LICENSE_PUBKEY: [u8; 32] = [
+    102, 79, 204, 176, 207, 73, 52, 236, 91, 182, 71, 184, 161, 84, 59, 155,
+    25, 65, 43, 63, 15, 190, 249, 162, 24, 100, 252, 179, 181, 8, 87, 204,
 ];
 
-/// BhartX Root CA Master Seed (STRICTLY FOR IN-TREE TEST HARNESS AND SYNTHETIC TOKEN GENERATION ONLY).
+/// BhartX Root CA Public Key alias for backwards compatibility.
+pub const BHARTX_ROOT_LICENSE_PUBKEY: [u8; 32] = BHARTX_PRODUCTION_ROOT_LICENSE_PUBKEY;
+
+/// BhartX Test Root CA Seed (COMPROMISED - STRICTLY FOR IN-TREE TEST HARNESS ONLY).
 /// SECURITY INVARIANT: Must NEVER be embedded in release client binaries or treated as a real production CA.
-/// Production token issuance is performed strictly on an isolated HSM / server-side signing authority.
+/// Any token signed with this seed MUST be rejected by the production verifier.
 #[cfg(any(test, feature = "test-utils"))]
-pub const BHARTX_ROOT_SEED: [u8; 32] = *b"BHARTX_MOCK_TEST_HARNESS_KEY_001";
+pub const BHARTX_TEST_ROOT_SEED: [u8; 32] = *b"BHARTX_MOCK_TEST_HARNESS_KEY_001";
+
+/// Legacy alias for test harness.
+#[cfg(any(test, feature = "test-utils"))]
+pub const BHARTX_ROOT_SEED: [u8; 32] = BHARTX_TEST_ROOT_SEED;
 
 /// Claims embedded within a cryptographic license payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,11 +93,50 @@ pub enum LicenseError {
 pub struct LicenseEngine;
 
 impl LicenseEngine {
-    /// Obtains the BhartX Root CA keypair (derived deterministically from root seed).
+    /// Obtains the BhartX Test Root CA keypair (derived from the compromised test seed).
     /// Gated exclusively to test harness and test-utils feature; physically absent in production client builds.
     #[cfg(any(test, feature = "test-utils"))]
+    pub fn test_ca_keypair() -> InstallationKeypair {
+        InstallationKeypair::from_seed(&BHARTX_TEST_ROOT_SEED)
+    }
+
+    /// Obtains the BhartX Root CA keypair for testing and synthetic token generation.
+    /// Prefers the offline production keypair if present at `/home/shubh/.config/bhartx/licensing/production_root_ca.key`
+    /// (or custom path via BHARTX_PRODUCTION_ROOT_KEY_PATH).
+    /// Falls back to the test CA keypair.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn root_ca_keypair() -> InstallationKeypair {
-        InstallationKeypair::from_seed(&BHARTX_ROOT_SEED)
+        if let Some(kp) = Self::load_offline_production_keypair() {
+            kp
+        } else {
+            Self::test_ca_keypair()
+        }
+    }
+
+    /// Loads the offline production root keypair from the filesystem if present.
+    /// Gated exclusively to test / test-utils. NEVER compiled into production client builds.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn load_offline_production_keypair() -> Option<InstallationKeypair> {
+        let key_path = std::env::var("BHARTX_PRODUCTION_ROOT_KEY_PATH")
+            .unwrap_or_else(|_| "/home/shubh/.config/bhartx/licensing/production_root_ca.key".to_string());
+        if let Ok(bytes) = std::fs::read(&key_path) {
+            if bytes.len() == 32 {
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&bytes);
+                return Some(InstallationKeypair::from_seed(&seed));
+            } else if bytes.len() >= 64 {
+                if let Ok(hex_str) = std::str::from_utf8(&bytes) {
+                    if let Ok(decoded) = hex::decode(hex_str.trim()) {
+                        if decoded.len() == 32 {
+                            let mut seed = [0u8; 32];
+                            seed.copy_from_slice(&decoded);
+                            return Some(InstallationKeypair::from_seed(&seed));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Issues and signs a license token using the specified keypair.
@@ -105,13 +152,18 @@ impl LicenseEngine {
         Ok(format!("{}.{}", payload_b64, sig_hex))
     }
 
-    /// Verifies a license token against the embedded BhartX Root CA public key
+    /// Verifies a license token against the embedded BhartX Production Root CA public key
     /// and the machine's local hardware hash.
+    /// In production builds, MUST trust ONLY BHARTX_PRODUCTION_ROOT_LICENSE_PUBKEY with ZERO fallback.
     pub fn verify_token(
         raw_token: &str,
         local_hardware_hash: &str,
     ) -> Result<LicenseClaims, LicenseError> {
-        Self::verify_token_with_pubkey(raw_token, local_hardware_hash, &BHARTX_ROOT_LICENSE_PUBKEY)
+        Self::verify_token_with_pubkey(
+            raw_token,
+            local_hardware_hash,
+            &BHARTX_PRODUCTION_ROOT_LICENSE_PUBKEY,
+        )
     }
 
     /// Verifies a license token against an explicit 32-byte public key.
@@ -296,5 +348,89 @@ mod tests {
             LicenseEngine::verify_token("cGF5bG9hZA==.deadbeef", hw_hash),
             Err(LicenseError::InvalidSignatureLength)
         );
+    }
+
+    #[test]
+    fn test_production_verifier_strictly_rejects_test_key_signed_tokens() {
+        let hw_hash = "a4f89d816c4f74d0932e6a9821804d9d15024b423714bfa4d82260ff8719bc01";
+        let claims = sample_claims(hw_hash, 2050000000);
+        let test_kp = LicenseEngine::test_ca_keypair();
+        let token = LicenseEngine::issue_token(&claims, &test_kp).expect("Failed to issue test token");
+
+        // Production verifier MUST strictly reject tokens signed by the compromised test seed
+        let result = LicenseEngine::verify_token(&token, hw_hash);
+        assert_eq!(result, Err(LicenseError::CryptographicSignatureFailed));
+    }
+
+    #[test]
+    fn test_production_verifier_accepts_production_key_signed_tokens() {
+        let hw_hash = "a4f89d816c4f74d0932e6a9821804d9d15024b423714bfa4d82260ff8719bc01";
+        let claims = sample_claims(hw_hash, 2050000000);
+        let prod_kp = LicenseEngine::load_offline_production_keypair()
+            .expect("Offline production keypair must exist at /home/shubh/.config/bhartx/licensing/production_root_ca.key");
+        assert_eq!(*prod_kp.public_key(), BHARTX_PRODUCTION_ROOT_LICENSE_PUBKEY);
+
+        let token = LicenseEngine::issue_token(&claims, &prod_kp).expect("Failed to issue production token");
+        let verified = LicenseEngine::verify_token(&token, hw_hash).expect("Production token must be accepted");
+        assert_eq!(verified.license_id, "LIC-2026-BHARTX-9941");
+        assert_eq!(verified.tier, "EnterprisePro");
+        assert!(verified.is_enterprise());
+    }
+
+    #[test]
+    fn test_tampered_token_rejected_under_ed25519_dalek() {
+        let hw_hash = "a4f89d816c4f74d0932e6a9821804d9d15024b423714bfa4d82260ff8719bc01";
+        let claims = sample_claims(hw_hash, 2050000000);
+        let prod_kp = LicenseEngine::root_ca_keypair();
+        let token = LicenseEngine::issue_token(&claims, &prod_kp).unwrap();
+
+        let parts: Vec<&str> = token.split('.').collect();
+        let b64_payload = parts[0];
+        let sig_hex = parts[1];
+
+        // 1. Bit flip in payload
+        let mut tampered_b64 = b64_payload.to_string();
+        let last_char = tampered_b64.pop().unwrap();
+        let flipped = if last_char == 'A' { 'B' } else { 'A' };
+        tampered_b64.push(flipped);
+        let tampered_payload_token = format!("{}.{}", tampered_b64, sig_hex);
+        assert!(LicenseEngine::verify_token(&tampered_payload_token, hw_hash).is_err());
+
+        // 2. Modifying 1 bit of signature
+        let mut sig_bytes = hex::decode(sig_hex).unwrap();
+        sig_bytes[0] ^= 0x01; // flip 1 bit
+        let tampered_sig_hex = hex::encode(sig_bytes);
+        let tampered_sig_token = format!("{}.{}", b64_payload, tampered_sig_hex);
+        let result = LicenseEngine::verify_token(&tampered_sig_token, hw_hash);
+        assert_eq!(result, Err(LicenseError::CryptographicSignatureFailed));
+    }
+
+    #[test]
+    fn test_legacy_sha256_forgery_impossible() {
+        let hw_hash = "a4f89d816c4f74d0932e6a9821804d9d15024b423714bfa4d82260ff8719bc01";
+        let claims = sample_claims(hw_hash, 2050000000);
+        let json_bytes = serde_json::to_vec(&claims).unwrap();
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&json_bytes);
+
+        // Craft legacy simulated signature with arbitrary R and SHA-256 S commitment
+        use sha2::{Digest, Sha256};
+        let fake_r = [0x42u8; 32];
+        let mut s_hasher = Sha256::new();
+        s_hasher.update(b"USB_MASTER_ED25519_SIG_RESPONSE_S");
+        s_hasher.update(&fake_r);
+        s_hasher.update(&BHARTX_PRODUCTION_ROOT_LICENSE_PUBKEY);
+        s_hasher.update(&json_bytes);
+        let fake_s = s_hasher.finalize();
+
+        let mut fake_sig = [0u8; 64];
+        fake_sig[0..32].copy_from_slice(&fake_r);
+        fake_sig[32..64].copy_from_slice(&fake_s);
+        let fake_sig_hex = hex::encode(fake_sig);
+
+        let forged_token = format!("{}.{}", payload_b64, fake_sig_hex);
+
+        // Strict Ed25519 Dalek verification MUST reject this arbitrary R/S forgery
+        let result = LicenseEngine::verify_token(&forged_token, hw_hash);
+        assert_eq!(result, Err(LicenseError::CryptographicSignatureFailed));
     }
 }

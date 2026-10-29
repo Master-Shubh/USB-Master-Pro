@@ -5,6 +5,11 @@ Cargo.lock
 license.json
 **/license.json
 
+# Cryptographic Keys & Private Material
+*.key
+*.priv
+*ca.key
+
 # Node.js
 node_modules/
 npm-debug.log*
