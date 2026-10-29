@@ -1,0 +1,19 @@
+# ==============================================================================
+# USB Master Pro — Git Attributes & GitHub Linguist Classification
+# Owned & Developed by BhartX Ecosystems Pvt Ltd (https://bhartx.in)
+# ==============================================================================
+
+# Universal line ending normalization
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.iss text eol=crlf
+*.inf text eol=crlf
+*.vcxproj text eol=crlf
+
+# GitHub Linguist classification:
+# ui/ contains offline bundled single-page WebUI assets embedded into Rust binaries.
+# Marking them as linguist-vendored keeps repository language metrics accurate to core systems code (Rust & C).
+ui/* linguist-vendored
+ui/**/* linguist-vendored
