@@ -270,6 +270,10 @@ foreach ($dir in $driverDirs) {
         continue
     }
 
+    # Clean intermediate build directories to ensure Inf2Cat only processes the final staged driver package
+    Get-ChildItem -Path $dir -Directory | Where-Object { $_.Name -in @("x64", "bin", "obj", "ARM64", "arm64", "x86", "Intermediate", "Debug", "Release") } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Path $dir -Recurse -Filter "*.inf" | Where-Object { $_.DirectoryName -ne (Resolve-Path $dir).Path } | Remove-Item -Force -ErrorAction SilentlyContinue
+
     $infFiles = Get-ChildItem -Path $dir -Filter "*.inf"
     foreach ($inf in $infFiles) {
         Write-Info "Processing INF: $($inf.FullName)"

@@ -176,6 +176,10 @@ jobs:
               Write-Host "Successfully synced MSBuild stamped INF to drivers/filter/anyusb_filter.inf"
           }
 
+          # Clean intermediate MSBuild output directories to ensure Inf2Cat only sees staged driver files
+          Get-ChildItem -Path "drivers/vhci", "drivers/filter" -Directory | Where-Object { $_.Name -in @("x64", "bin", "obj", "ARM64", "arm64", "x86", "Intermediate", "Debug", "Release") } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Get-ChildItem -Path "bin" -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
       - name: Generate Catalogs (Inf2Cat) & Test-Sign Drivers
         run: |
           Write-Host "=================================================================="
