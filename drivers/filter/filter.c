@@ -285,7 +285,7 @@ AnyUsbFilter_GetRequestDeviceId(
     if (irp != NULL) {
         PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
         if (irpSp != NULL && irpSp->DeviceObject != NULL) {
-            WDFDEVICE wdfDev = WdfWdmDeviceGetWdfDevice(irpSp->DeviceObject);
+            WDFDEVICE wdfDev = WdfWdmDeviceGetWdfDeviceHandle(irpSp->DeviceObject);
             if (wdfDev != NULL && wdfDev != g_ControlDevice) {
                 PFILTER_DEVICE_DATA filterData = GetFilterData(wdfDev);
                 if (filterData != NULL) {
