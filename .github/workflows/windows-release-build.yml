@@ -29,6 +29,7 @@ jobs:
         uses: microsoft/setup-msbuild@v2
         with:
           vs-version: '[17.0,18.0)'
+          msbuild-architecture: 'x64'
 
       - name: Setup Windows 11 SDK (22621)
         uses: GuillaumeFalourd/setup-windows10-sdk-action@v1
