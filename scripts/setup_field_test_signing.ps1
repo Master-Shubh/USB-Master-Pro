@@ -261,8 +261,8 @@ $driverDirs = @(
     (Join-Path $DriverRootPath "filter")
 )
 
-# Supported Windows OS Targets for Inf2Cat (x64 package targets)
-$osTargets = "10_X64,10_CO_X64,10_NI_X64,Server2016_X64,Server2019_X64,Server2022_X64"
+# Supported Windows OS Targets for Inf2Cat (Windows 10 and Windows 11 x64)
+$osTargets = "10_X64"
 
 foreach ($dir in $driverDirs) {
     if (-not (Test-Path $dir)) {
