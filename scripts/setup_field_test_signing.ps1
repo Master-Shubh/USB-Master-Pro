@@ -115,7 +115,7 @@ if ($EnableBcdTestSigning) {
                 Write-Warn "For local physical test machines: Disable Secure Boot in UEFI BIOS, OR submit via Microsoft WHQL Attestation Signing."
                 Write-Warn "A system restart may be required for BCDEdit changes to take full effect."
             } else {
-                Write-Warn "BCDEdit command exited with code $LASTEXITCODE: $res"
+                Write-Warn "BCDEdit command exited with code $($LASTEXITCODE): $res"
                 Write-Warn "If Secure Boot is active, disable Secure Boot in UEFI settings to enable Test-Signing."
             }
         }
@@ -186,6 +186,14 @@ if ($existingCert -and -not $ForceRegenerateCert) {
     $pubStore.Add($signingCert)
     $pubStore.Close()
     Write-Success "Installed into Cert:\LocalMachine\TrustedPublisher."
+
+    # Also install into Cert:\CurrentUser\My for maximum toolchain compatibility
+    try {
+        $userMyStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("My", "CurrentUser")
+        $userMyStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        $userMyStore.Add($signingCert)
+        $userMyStore.Close()
+    } catch {}
 }
 
 # Export public CA certificate (.cer) for client installations
@@ -210,12 +218,16 @@ function Find-Tool {
     $cmd = Get-Command $ExeName -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
 
-    # Common Windows Kits directories
+    # Common Windows Kits directories (search both x64 and x86 since tools like Inf2Cat reside in x86)
     $searchPaths = @(
         "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\$ExeName",
+        "C:\Program Files (x86)\Windows Kits\10\bin\*\x86\$ExeName",
         "C:\Program Files\Windows Kits\10\bin\*\x64\$ExeName",
+        "C:\Program Files\Windows Kits\10\bin\*\x86\$ExeName",
         "C:\Program Files (x86)\Windows Kits\10\bin\x64\$ExeName",
-        "C:\Program Files (x86)\Windows Kits\8.1\bin\x64\$ExeName"
+        "C:\Program Files (x86)\Windows Kits\10\bin\x86\$ExeName",
+        "C:\Program Files (x86)\Windows Kits\8.1\bin\x64\$ExeName",
+        "C:\Program Files (x86)\Windows Kits\8.1\bin\x86\$ExeName"
     )
 
     foreach ($pattern in $searchPaths) {
@@ -250,8 +262,8 @@ $driverDirs = @(
     Join-Path $DriverRootPath "filter"
 )
 
-# Supported Windows OS Targets for Inf2Cat
-$osTargets = "10_X64,10_CO_X64,10_NI_X64,Server2016_X64,Server2019_X64,Server2022_X64,10_ARM64,10_CO_ARM64,10_NI_ARM64"
+# Supported Windows OS Targets for Inf2Cat (x64 package targets)
+$osTargets = "10_X64,10_CO_X64,10_NI_X64,Server2016_X64,Server2019_X64,Server2022_X64"
 
 foreach ($dir in $driverDirs) {
     if (-not (Test-Path $dir)) {
@@ -302,12 +314,12 @@ if ($filesToSign.Count -eq 0) {
 
         if ($signToolPath) {
             # Attempt 1: Sign with RFC-3161 Timestamping
-            $signArgs = "sign /v /s `"MY`" /sha1 `"$($signingCert.Thumbprint)`" /fd sha256 /tr $timestampUrl /td sha256 `"$($item.FullName)`""
+            $signArgs = "sign /v /sm /s `"MY`" /sha1 `"$($signingCert.Thumbprint)`" /fd sha256 /tr $timestampUrl /td sha256 `"$($item.FullName)`""
             $res = Start-Process -FilePath $signToolPath -ArgumentList $signArgs -Wait -NoNewWindow -PassThru
 
             if ($res.ExitCode -ne 0) {
                 Write-Warn "Timestamped signing failed (network offline?). Retrying without timestamp..."
-                $signArgsNoTs = "sign /v /s `"MY`" /sha1 `"$($signingCert.Thumbprint)`" /fd sha256 `"$($item.FullName)`""
+                $signArgsNoTs = "sign /v /sm /s `"MY`" /sha1 `"$($signingCert.Thumbprint)`" /fd sha256 `"$($item.FullName)`""
                 $resNoTs = Start-Process -FilePath $signToolPath -ArgumentList $signArgsNoTs -Wait -NoNewWindow -PassThru
                 if ($resNoTs.ExitCode -eq 0) {
                     Write-Success "Signed successfully (local timestamp): $($item.Name)"
@@ -371,7 +383,7 @@ if ($InstallDrivers) {
                 Write-Warn "Reboot recommended by Windows to complete driver activation."
             }
         } else {
-            Write-Warn "PnPUtil exited with code $LASTEXITCODE: $res"
+            Write-Warn "PnPUtil exited with code $($LASTEXITCODE): $res"
         }
     }
 }

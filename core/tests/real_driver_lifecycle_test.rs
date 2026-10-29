@@ -29,6 +29,8 @@ use usb_master_core::identity::NodeIdentity;
 use usb_master_core::state::SessionState;
 use usb_master_core::UsbDeviceInfo;
 
+static TEST_DRIVER_STATUS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn find_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
     let port = listener.local_addr().unwrap().port();
@@ -231,6 +233,10 @@ fn test_single_urb_buffer_boundary_rejection() {
 
 #[tokio::test]
 async fn test_embedded_tailwind_and_lucide_endpoints() {
+    let _guard = TEST_DRIVER_STATUS_LOCK.lock().unwrap();
+    #[cfg(not(target_os = "windows"))]
+    set_simulated_driver_status(None);
+
     let port = find_free_port();
     let token = format!("test_assets_token_{}", port);
     let broker_url = "ws://127.0.0.1:8443".to_string();
@@ -675,6 +681,7 @@ async fn test_assets_content_integrity_and_404_handling() {
 
 #[test]
 fn test_linux_returns_unsupported_platform_by_default() {
+    let _guard = TEST_DRIVER_STATUS_LOCK.lock().unwrap();
     #[cfg(not(target_os = "windows"))]
     {
         set_simulated_driver_status(None);
@@ -699,6 +706,7 @@ fn test_linux_returns_unsupported_platform_by_default() {
 
 #[test]
 fn test_mock_override_driver_operational_states() {
+    let _guard = TEST_DRIVER_STATUS_LOCK.lock().unwrap();
     #[cfg(not(target_os = "windows"))]
     {
         // 1. Accessible
@@ -752,6 +760,7 @@ fn test_mock_override_driver_operational_states() {
 
 #[tokio::test]
 async fn test_system_drivers_endpoint_truthful_structured_status() {
+    let _guard = TEST_DRIVER_STATUS_LOCK.lock().unwrap();
     let port = find_free_port();
     let token = "test_driver_status_token".to_string();
     let token_clone = token.clone();
