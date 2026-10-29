@@ -42,13 +42,28 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; Main Executables
-Source: "..\dist\bin\USBMasterPro.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
-Source: "..\dist\bin\USBMasterDaemon.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+; Main Executables (Configurable binary source directory with fallback to dist\bin)
+#ifndef BinDir
+  #define BinDir "..\dist\bin"
+#endif
+Source: "{#BinDir}\USBMasterPro.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
+Source: "{#BinDir}\USBMasterDaemon.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 
-; Embedded Drivers & Signing Tools
-Source: "..\drivers\*"; DestDir: "{app}\drivers"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "..\scripts\*"; DestDir: "{app}\scripts"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Embedded Drivers & Security Certificates (Strict production binaries; no source or build intermediates)
+Source: "..\drivers\vhci\anyusb_vhci.sys"; DestDir: "{app}\drivers\vhci"; Flags: ignoreversion
+Source: "..\drivers\vhci\anyusb_vhci.inf"; DestDir: "{app}\drivers\vhci"; Flags: ignoreversion
+Source: "..\drivers\vhci\anyusb_vhci.cat"; DestDir: "{app}\drivers\vhci"; Flags: ignoreversion
+Source: "..\drivers\filter\anyusb_filter.sys"; DestDir: "{app}\drivers\filter"; Flags: ignoreversion
+Source: "..\drivers\filter\anyusb_filter.inf"; DestDir: "{app}\drivers\filter"; Flags: ignoreversion
+Source: "..\drivers\filter\anyusb_filter.cat"; DestDir: "{app}\drivers\filter"; Flags: ignoreversion
+Source: "..\drivers\bhartx_test_ca.cer"; DestDir: "{app}\drivers"; Flags: ignoreversion skipifsourcedoesntexist
+
+; Deployment & Operational Scripts
+Source: "..\scripts\install_zero_reboot.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "..\scripts\uninstall_zero_reboot.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "..\scripts\setup_field_test_signing.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "..\scripts\configure_firewall.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "..\README_INSTALL.md"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Assets for shortcuts
 Source: "..\ui\assets\favicon.ico"; DestDir: "{app}\ui\assets"; Flags: ignoreversion
@@ -166,11 +181,22 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   AppDir: String;
+  CertPath: String;
+  CertResultCode: Integer;
 begin
   if CurStep = ssPostInstall then
   begin
     ValidateDriverFilesInstalled();
     AppDir := ExpandConstant('{app}');
+
+    // If Field Testing CA is present, install into Root & TrustedPublisher to prevent driver signature rejection
+    CertPath := AppDir + '\drivers\bhartx_test_ca.cer';
+    if FileExists(CertPath) then
+    begin
+      Exec(ExpandConstant('{sys}\certutil.exe'), '-addstore -f "Root" "' + CertPath + '"', '', SW_HIDE, ewWaitUntilTerminated, CertResultCode);
+      Exec(ExpandConstant('{sys}\certutil.exe'), '-addstore -f "TrustedPublisher" "' + CertPath + '"', '', SW_HIDE, ewWaitUntilTerminated, CertResultCode);
+    end;
+
     InstallDriverPackage(AppDir + '\drivers\vhci\anyusb_vhci.inf');
     InstallDriverPackage(AppDir + '\drivers\filter\anyusb_filter.inf');
   end;

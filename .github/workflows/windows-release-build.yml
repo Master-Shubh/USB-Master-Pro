@@ -147,6 +147,12 @@ jobs:
               throw "FATAL: anyusb_vhci.sys was not produced by MSBuild!"
           }
 
+          $vhciInf = Get-ChildItem -Path "bin", "drivers\vhci\x64" -Recurse -Filter "anyusb_vhci.inf" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($vhciInf -and ($vhciInf.FullName -ne (Resolve-Path "drivers/vhci/anyusb_vhci.inf").Path)) {
+              Copy-Item $vhciInf.FullName "drivers/vhci/anyusb_vhci.inf" -Force
+              Write-Host "Successfully synced MSBuild stamped INF to drivers/vhci/anyusb_vhci.inf"
+          }
+
           Write-Host "=================================================================="
           Write-Host "Compiling anyusb_filter.vcxproj (Release | x64)..."
           Write-Host "=================================================================="
@@ -161,6 +167,12 @@ jobs:
               Write-Host "Successfully staged drivers/filter/anyusb_filter.sys ($($filterSys.Length) bytes)"
           } else {
               throw "FATAL: anyusb_filter.sys was not produced by MSBuild!"
+          }
+
+          $filterInf = Get-ChildItem -Path "bin", "drivers\filter\x64" -Recurse -Filter "anyusb_filter.inf" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($filterInf -and ($filterInf.FullName -ne (Resolve-Path "drivers/filter/anyusb_filter.inf").Path)) {
+              Copy-Item $filterInf.FullName "drivers/filter/anyusb_filter.inf" -Force
+              Write-Host "Successfully synced MSBuild stamped INF to drivers/filter/anyusb_filter.inf"
           }
 
       - name: Generate Catalogs (Inf2Cat) & Test-Sign Drivers
@@ -310,11 +322,21 @@ jobs:
           Write-Host "Compiling Inno Setup 1-Click Windows Setup Wizard..."
           Write-Host "=================================================================="
           New-Item -ItemType Directory -Path "dist\bin" -Force | Out-Null
+          New-Item -ItemType Directory -Path "dist\installer" -Force | Out-Null
           Copy-Item "target/x86_64-pc-windows-msvc/release/usb_master_cli.exe" "dist\bin\USBMasterPro.exe" -Force
           Copy-Item "target/x86_64-pc-windows-msvc/release/usb_master_daemon.exe" "dist\bin\USBMasterDaemon.exe" -Force
 
+          if (-not (Test-Path "dist\bin\USBMasterPro.exe") -or -not (Test-Path "dist\bin\USBMasterDaemon.exe")) {
+              throw "FATAL: Staged user-mode binaries (USBMasterPro.exe / USBMasterDaemon.exe) missing in dist\bin"
+          }
+
           choco install innosetup --no-progress -y
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\usb_master_pro.iss
+          $isccExe = if (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe") {
+              "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          } else {
+              "ISCC.exe"
+          }
+          & $isccExe /Q installer\usb_master_pro.iss
           if ($LASTEXITCODE -ne 0) {
               throw "FATAL: Inno Setup compiler (ISCC.exe) failed with exit code $LASTEXITCODE"
           }

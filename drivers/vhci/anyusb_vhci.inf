@@ -8,6 +8,7 @@ ClassGUID={4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider=%ProviderName%
 DriverVer=10/27/2026,1.0.0.1
 CatalogFile=anyusb_vhci.cat
+PnpLockDown=1
 
 [DestinationDirs]
 DefaultDestDir = 12
@@ -42,6 +43,18 @@ ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
 StartType      = 3               ; SERVICE_DEMAND_START
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\anyusb_vhci.sys
+
+[AnyUsbVhci_Device.NTamd64.Wdf]
+KmdfService = anyusb_vhci, AnyUsbVhci_wdfsect
+
+[AnyUsbVhci_Device.NTarm64.Wdf]
+KmdfService = anyusb_vhci, AnyUsbVhci_wdfsect
+
+[AnyUsbVhci_Device.NT.Wdf]
+KmdfService = anyusb_vhci, AnyUsbVhci_wdfsect
+
+[AnyUsbVhci_wdfsect]
+KmdfLibraryVersion = 1.33
 
 [Strings]
 SPSVCINST_ASSOCSERVICE = 0x00000002

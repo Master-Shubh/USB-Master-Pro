@@ -8,6 +8,7 @@ ClassGUID={36FC9E60-C465-11CF-8056-444553540000}
 Provider=%ProviderName%
 DriverVer=10/27/2026,1.0.0.1
 CatalogFile=anyusb_filter.cat
+PnpLockDown=1
 
 [DestinationDirs]
 DefaultDestDir = 12
@@ -39,6 +40,15 @@ ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
 StartType      = 3               ; SERVICE_DEMAND_START
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\anyusb_filter.sys
+
+[DefaultInstall.NTamd64.Wdf]
+KmdfService = anyusb_filter, AnyUsbFilter_wdfsect
+
+[DefaultInstall.NTarm64.Wdf]
+KmdfService = anyusb_filter, AnyUsbFilter_wdfsect
+
+[AnyUsbFilter_wdfsect]
+KmdfLibraryVersion = 1.33
 
 [Strings]
 ProviderName           = "BhartX Ecosystems Pvt Ltd"

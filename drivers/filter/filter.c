@@ -3,37 +3,7 @@
  * KMDF 1.33 Driver with Self-Exclusion & URB Redirection Pipeline
  */
 
-#include <ntddk.h>
-#include <wdf.h>
-#include <usb.h>
-#include <usbioctl.h>
-#include <initguid.h>
-#include <devpkey.h>
-
-#define ANYUSB_FILTER_POOL_TAG 'TFNA' // 'ANTF'
-
-// Custom IOCTLs for User-Mode Daemon Communication
-#define FILE_DEVICE_ANYUSB_FILTER 0x8901
-#define IOCTL_ANYUSB_FILTER_START_CAPTURE \
-    CTL_CODE(FILE_DEVICE_ANYUSB_FILTER, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_ANYUSB_FILTER_STOP_CAPTURE \
-    CTL_CODE(FILE_DEVICE_ANYUSB_FILTER, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-typedef struct _FILTER_DEVICE_DATA {
-    WDFDEVICE               WdfDevice;
-    WDFIOTARGET             IoTarget;
-    WDFQUEUE                IoctlQueue;
-    BOOLEAN                 IsCaptured;
-    ULONG                   SessionId;
-} FILTER_DEVICE_DATA, *PFILTER_DEVICE_DATA;
-
-WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FILTER_DEVICE_DATA, GetFilterData)
-
-DRIVER_INITIALIZE DriverEntry;
-EVT_WDF_DRIVER_DEVICE_ADD AnyUsbFilter_EvtDeviceAdd;
-EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL AnyUsbFilter_EvtIoDeviceControl;
-EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL AnyUsbFilter_EvtIoInternalDeviceControl;
-EVT_WDF_REQUEST_COMPLETION_ROUTINE AnyUsbFilter_EvtUrbComplete;
+#include "filter.h"
 
 NTSTATUS
 DriverEntry(
@@ -65,17 +35,8 @@ AnyUsbFilter_EvtDeviceAdd(
     PFILTER_DEVICE_DATA filterData;
     WDF_IO_QUEUE_CONFIG queueConfig;
 
-    // Configure as an Upper Filter Device
+    // Configure as an Upper Filter Device (inherits device stack security descriptors)
     WdfFdoInitSetFilter(DeviceInit);
-
-    // Security Hardening: Restrict IOCTL access strictly to SYSTEM and Administrators (SDDL_DEVOBJ_SYS_ALL_ADM_ALL)
-    DECLARE_CONST_UNICODE_STRING(sddlString, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
-    status = WdfDeviceInitAssignSDDLString(DeviceInit, &sddlString);
-    if (!NT_SUCCESS(status)) {
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-            "USB Master Pro Filter: WdfDeviceInitAssignSDDLString failed: 0x%08X\n", status));
-        return status;
-    }
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttributes, FILTER_DEVICE_DATA);
 
@@ -118,7 +79,7 @@ AnyUsbFilter_EvtDeviceAdd(
             KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                 "USB Master Pro Filter: Self-exclusion matched for virtual device [%wZ]. Skipping capture hook.\n",
                 &enumeratorStr));
-            return STATUS_SUCCESS;
+            return STATUS_NOT_SUPPORTED;
         }
     }
 

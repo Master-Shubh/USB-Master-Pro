@@ -417,7 +417,7 @@ AnyUsbVhci_EvtIoDeviceControl(
             WdfDeviceInitSetDeviceType(pdoInit, FILE_DEVICE_UNKNOWN);
 
             // Construct PnP Hardware, Compatible, and Instance IDs
-            DECLARE_CONST_UNICODE_STRING(compatId, L"USB\\COMPOSITE\0");
+            DECLARE_CONST_UNICODE_STRING(compatId, L"USB\\COMPOSITE");
             DECLARE_UNICODE_STRING_SIZE(hwId, 128);
             DECLARE_UNICODE_STRING_SIZE(devId, 64);
             DECLARE_UNICODE_STRING_SIZE(instId, 64);
@@ -933,6 +933,16 @@ AnyUsbVhci_EvtIoDeviceControl(
                                     if (dst != NULL) {
                                         RtlCopyMemory(dst, compReq->Data, copyLen);
                                     }
+                                }
+                            } else if (urb->UrbHeader.Function == URB_FUNCTION_SELECT_CONFIGURATION) {
+                                PUSBD_INTERFACE_INFORMATION iface = &urb->UrbSelectConfiguration.Interface;
+                                for (ULONG i = 0; i < iface->NumberOfPipes; i++) {
+                                    iface->Pipes[i].PipeHandle = (USBD_PIPE_HANDLE)(ULONG_PTR)iface->Pipes[i].EndpointAddress;
+                                }
+                            } else if (urb->UrbHeader.Function == URB_FUNCTION_SELECT_INTERFACE) {
+                                PUSBD_INTERFACE_INFORMATION iface = &urb->UrbSelectInterface.Interface;
+                                for (ULONG i = 0; i < iface->NumberOfPipes; i++) {
+                                    iface->Pipes[i].PipeHandle = (USBD_PIPE_HANDLE)(ULONG_PTR)iface->Pipes[i].EndpointAddress;
                                 }
                             }
                         }

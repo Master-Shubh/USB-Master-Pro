@@ -251,7 +251,7 @@ $driverDirs = @(
 )
 
 # Supported Windows OS Targets for Inf2Cat
-$osTargets = "10_X64,10_NI_X64,Server2016_X64,Server2019_X64,Server2022_X64,10_ARM64,10_CO_ARM64"
+$osTargets = "10_X64,10_CO_X64,10_NI_X64,Server2016_X64,Server2019_X64,Server2022_X64,10_ARM64,10_CO_ARM64,10_NI_ARM64"
 
 foreach ($dir in $driverDirs) {
     if (-not (Test-Path $dir)) {
@@ -269,7 +269,7 @@ foreach ($dir in $driverDirs) {
             if ($p.ExitCode -eq 0) {
                 Write-Success "Catalog generation succeeded for $($inf.Name)."
             } else {
-                Write-Warn "Inf2Cat exited with code $($p.ExitCode). Check INF syntax or OS targets."
+                throw "FATAL: Inf2Cat failed with exit code $($p.ExitCode) for $($inf.Name). Check INF syntax or OS targets."
             }
         } else {
             Write-Info "Skipping Inf2Cat (tool not installed). Checking for existing .cat file..."
