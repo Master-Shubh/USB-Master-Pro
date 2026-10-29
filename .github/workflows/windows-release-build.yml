@@ -227,6 +227,22 @@ jobs:
               Write-Host "Verified valid Authenticode signature for $sf (Signer: $($sig.SignerCertificate.Subject))"
           }
 
+      - name: Setup Node.js & Install Signaling Dependencies
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: signaling/package-lock.json
+
+      - name: Install Signaling Server Dependencies (npm ci)
+        run: |
+          Write-Host "=================================================================="
+          Write-Host "Installing signaling broker dependencies (npm ci)..."
+          Write-Host "=================================================================="
+          Push-Location signaling
+          npm ci
+          Pop-Location
+
       - name: Execute Automated Core Test Suite (cargo test --workspace)
         run: |
           Write-Host "=================================================================="
@@ -239,9 +255,9 @@ jobs:
           Write-Host "=================================================================="
           Write-Host "Executing signaling security tests..."
           Write-Host "=================================================================="
-          cd signaling
+          Push-Location signaling
           npm test
-          cd ..
+          Pop-Location
 
       - name: Compile Rust Turbo-URB Engine (usb_master_daemon & usb_master_cli)
         run: |
@@ -354,12 +370,22 @@ jobs:
           }
 
           choco install innosetup --no-progress -y
-          $isccExe = if (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe") {
-              "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
-          } else {
-              "ISCC.exe"
+          $isccCandidates = @(
+              "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+              "C:\Program Files\Inno Setup 6\ISCC.exe",
+              "C:\ProgramData\chocolatey\bin\iscc.exe",
+              (Get-Command "ISCC.exe" -ErrorAction SilentlyContinue)?.Source
+          )
+          $isccExe = $isccCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $isccExe) {
+              $found = Get-ChildItem -Path "C:\Program Files", "C:\Program Files (x86)", "C:\ProgramData\chocolatey" -Recurse -Filter "ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) { $isccExe = $found.FullName }
           }
-          & $isccExe /Q installer\usb_master_pro.iss
+          if (-not $isccExe) {
+              throw "FATAL: Inno Setup compiler (ISCC.exe) was not found after installation!"
+          }
+          Write-Host "Found Inno Setup Compiler at: $isccExe"
+          & $isccExe installer\usb_master_pro.iss
           if ($LASTEXITCODE -ne 0) {
               throw "FATAL: Inno Setup compiler (ISCC.exe) failed with exit code $LASTEXITCODE"
           }

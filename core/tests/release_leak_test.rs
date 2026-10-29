@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[test]
+#[cfg(unix)]
 fn test_verify_no_leaks_script_passes() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir.parent().expect("Failed to locate repo root");
@@ -37,4 +38,13 @@ fn test_verify_no_leaks_script_passes() {
         stdout.contains("LEAK CHECK PASSED"),
         "Script output must confirm LEAK CHECK PASSED"
     );
+}
+
+#[test]
+#[cfg(windows)]
+fn test_verify_no_leaks_ps1_exists() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir.parent().expect("Failed to locate repo root");
+    let script_path = repo_root.join("scripts").join("verify_no_leaks.ps1");
+    assert!(script_path.exists(), "verify_no_leaks.ps1 must exist at {:?}", script_path);
 }
