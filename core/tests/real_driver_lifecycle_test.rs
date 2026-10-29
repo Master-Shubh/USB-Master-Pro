@@ -18,6 +18,7 @@ use usb_master_core::daemon::{
     derive_numeric_device_id, execute_session_disconnect, ActiveSession, DaemonServer,
     DaemonState, RemoteMountedDevice,
 };
+#[allow(unused_imports)]
 use usb_master_core::driver_client::{
     check_driver_device_presence, check_driver_status, set_simulated_driver_status,
     AnyUsbAttachRequest, AnyUsbCompleteRequest, DriverClientError, DriverOperationalStatus,
