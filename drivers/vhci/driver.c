@@ -346,7 +346,7 @@ AnyUsbVhci_EvtPendingUrbCancel(
     _In_ WDFREQUEST Request
 )
 {
-    WDFDEVICE dev = WdfRequestGetDevice(Request);
+    WDFDEVICE dev = WdfIoQueueGetDevice(WdfRequestGetIoQueue(Request));
     PFDO_DEVICE_DATA fdoData = NULL;
 
     if (dev != NULL) {
@@ -533,10 +533,10 @@ AnyUsbVhci_EvtIoDeviceControl(
             }
 
             // Add Child PDO to Virtual Bus FDO
-            status = WdfFdoAddChild(device, childDevice);
+            status = WdfFdoAddStaticChild(device, childDevice);
             if (!NT_SUCCESS(status)) {
                 KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                    "USB Master Pro: WdfFdoAddChild failed: 0x%08X\n", status));
+                    "USB Master Pro: WdfFdoAddStaticChild failed: 0x%08X\n", status));
                 break;
             }
 
@@ -590,7 +590,7 @@ AnyUsbVhci_EvtIoDeviceControl(
                 for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
                     WDFREQUEST pendingReq = fdoData->PendingRequests[i];
                     if (pendingReq != NULL) {
-                        WDFDEVICE reqDev = WdfRequestGetDevice(pendingReq);
+                        WDFDEVICE reqDev = WdfIoQueueGetDevice(WdfRequestGetIoQueue(pendingReq));
                         if (reqDev == targetChildDevice) {
                             fdoData->PendingRequests[i] = NULL;
                             if (NT_SUCCESS(WdfRequestUnmarkCancelable(pendingReq))) {
@@ -601,13 +601,9 @@ AnyUsbVhci_EvtIoDeviceControl(
                 }
                 WdfSpinLockRelease(fdoData->PendingUrbLock);
 
-                // Mark child PDO missing and request child relations invalidation
+                // Mark child PDO missing (WdfPdoMarkMissing automatically invalidates bus relations)
                 status = WdfPdoMarkMissing(targetChildDevice);
                 if (NT_SUCCESS(status)) {
-                    WDFCHILDLIST childList = WdfFdoGetDefaultChildList(device);
-                    if (childList != NULL) {
-                        WdfChildListRequestChildRelations(childList);
-                    }
                     KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                         "USB Master Pro: Child PDO [DeviceId:%lu] marked missing and relations invalidated. Remaining: %lu\n",
                         targetPdoData->DeviceId, fdoData->AttachedDeviceCount));

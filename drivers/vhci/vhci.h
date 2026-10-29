@@ -14,6 +14,11 @@
 #include <usbbusif.h>
 #include <ntstrsafe.h>
 
+// KMDF Compatibility Macro: Retrieve WDFDEVICE from WDFREQUEST via its WDFQUEUE
+#ifndef WdfRequestGetDevice
+#define WdfRequestGetDevice(Request) (WdfIoQueueGetDevice(WdfRequestGetIoQueue(Request)))
+#endif
+
 #define ANYUSB_VHCI_POOL_TAG 'ICHV' // 'VHCI'
 
 // Custom IOCTLs for User-Mode Daemon Communication (DevType 0x8900)
