@@ -35,6 +35,7 @@ AnyUsbFilter_CreateControlDevice(
     WDFDEVICE controlDevice = NULL;
     PCONTROL_DEVICE_DATA controlData = NULL;
     WDF_IO_QUEUE_CONFIG queueConfig;
+    WDF_FILEOBJECT_CONFIG fileConfig;
 
     // Security Hardening: SDDL allowing SYSTEM and Administrators
     DECLARE_CONST_UNICODE_STRING(sddlString, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
@@ -50,6 +51,17 @@ AnyUsbFilter_CreateControlDevice(
         WdfDeviceInitFree(deviceInit);
         return status;
     }
+
+    // Configure FileObject Cleanup callback:
+    // When the user-mode daemon closes \\.\AnyUsbFilter or crashes, EvtFileCleanup
+    // automatically un-captures devices and drains/cancels all pending requests.
+    WDF_FILEOBJECT_CONFIG_INIT(
+        &fileConfig,
+        NULL,
+        NULL,
+        AnyUsbFilter_EvtControlFileCleanup
+    );
+    WdfDeviceInitSetFileObjectConfig(deviceInit, &fileConfig, WDF_NO_OBJECT_ATTRIBUTES);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttributes, CONTROL_DEVICE_DATA);
 
@@ -151,8 +163,26 @@ AnyUsbFilter_EvtDriverUnload(
     UNREFERENCED_PARAMETER(Driver);
     KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
         "USB Master Pro Filter: Driver unloading, cleaning up CDO...\n"));
+
+    if (g_ControlData != NULL) {
+        WdfSpinLockAcquire(g_ControlData->ControlLock);
+        g_ControlData->IsCaptured = FALSE;
+        PLIST_ENTRY entry = g_ControlData->FilterDeviceList.Flink;
+        while (entry != &g_ControlData->FilterDeviceList) {
+            PFILTER_DEVICE_DATA fData = CONTAINING_RECORD(entry, FILTER_DEVICE_DATA, Link);
+            fData->IsCaptured = FALSE;
+            entry = entry->Flink;
+        }
+        WdfSpinLockRelease(g_ControlData->ControlLock);
+
+        AnyUsbFilter_DrainPendingRequests(g_ControlData, 0, STATUS_CANCELLED);
+    }
+
+    if (g_ControlDevice != NULL) {
+        WdfObjectDelete(g_ControlDevice);
+        g_ControlDevice = NULL;
+    }
     g_ControlData = NULL;
-    g_ControlDevice = NULL;
 }
 
 NTSTATUS
@@ -246,6 +276,140 @@ AnyUsbFilter_EvtDeviceAdd(
     return STATUS_SUCCESS;
 }
 
+static ULONG
+AnyUsbFilter_GetRequestDeviceId(
+    _In_ WDFREQUEST Request
+)
+{
+    PIRP irp = WdfRequestWdmGetIrp(Request);
+    if (irp != NULL) {
+        PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
+        if (irpSp != NULL && irpSp->DeviceObject != NULL) {
+            WDFDEVICE wdfDev = WdfWdmDeviceGetWdfDevice(irpSp->DeviceObject);
+            if (wdfDev != NULL) {
+                PFILTER_DEVICE_DATA filterData = GetFilterData(wdfDev);
+                if (filterData != NULL) {
+                    return filterData->DeviceId;
+                }
+            }
+        }
+    }
+
+    WDFQUEUE reqQueue = WdfRequestGetIoQueue(Request);
+    if (reqQueue != NULL) {
+        WDFDEVICE fidoDev = WdfIoQueueGetDevice(reqQueue);
+        if (fidoDev != NULL) {
+            PFILTER_DEVICE_DATA fidoData = GetFilterData(fidoDev);
+            if (fidoData != NULL) {
+                return fidoData->DeviceId;
+            }
+        }
+    }
+
+    return 0;
+}
+
+VOID
+AnyUsbFilter_DrainPendingRequests(
+    _In_ PCONTROL_DEVICE_DATA ControlData,
+    _In_ ULONG                TargetDeviceId,
+    _In_ NTSTATUS             CompletionStatus
+)
+{
+    if (ControlData == NULL) {
+        return;
+    }
+
+    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "USB Master Pro Filter: Draining pending requests for DeviceId %lu with status 0x%08X\n",
+        TargetDeviceId, CompletionStatus));
+
+    // Phase 1: Drain matching requests from PendingRequests table (fetched requests in-flight)
+    WDFREQUEST requestsToComplete[ANYUSB_MAX_PENDING_URBS];
+    ULONG countToComplete = 0;
+
+    WdfSpinLockAcquire(ControlData->PendingUrbLock);
+    for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
+        WDFREQUEST req = ControlData->PendingRequests[i];
+        if (req != NULL) {
+            ULONG reqDevId = AnyUsbFilter_GetRequestDeviceId(req);
+            if (TargetDeviceId == 0 || reqDevId == TargetDeviceId) {
+                ControlData->PendingRequests[i] = NULL;
+                requestsToComplete[countToComplete++] = req;
+            }
+        }
+    }
+    WdfSpinLockRelease(ControlData->PendingUrbLock);
+
+    // Complete extracted requests outside spinlock
+    for (ULONG i = 0; i < countToComplete; i++) {
+        WDFREQUEST req = requestsToComplete[i];
+        NTSTATUS unmarkStatus = WdfRequestUnmarkCancelable(req);
+        if (NT_SUCCESS(unmarkStatus)) {
+            WdfRequestComplete(req, CompletionStatus);
+        }
+        // If unmarkStatus == STATUS_CANCELLED, EvtPendingUrbCancel handles completion
+    }
+
+    // Phase 2: Drain matching requests from PendingUrbQueue (intercepted URBs not yet fetched)
+    if (ControlData->PendingUrbQueue != NULL) {
+        WDFREQUEST retainedRequests[ANYUSB_MAX_PENDING_URBS];
+        ULONG retainedCount = 0;
+        WDFREQUEST queueReq = NULL;
+
+        while (NT_SUCCESS(WdfIoQueueRetrieveNextRequest(ControlData->PendingUrbQueue, &queueReq)) && queueReq != NULL) {
+            ULONG reqDevId = AnyUsbFilter_GetRequestDeviceId(queueReq);
+            if (TargetDeviceId == 0 || reqDevId == TargetDeviceId) {
+                WdfRequestComplete(queueReq, CompletionStatus);
+            } else {
+                if (retainedCount < ANYUSB_MAX_PENDING_URBS) {
+                    retainedRequests[retainedCount++] = queueReq;
+                } else {
+                    // Queue overflow safety: complete to prevent resource leak
+                    WdfRequestComplete(queueReq, CompletionStatus);
+                }
+            }
+            queueReq = NULL;
+        }
+
+        // Re-forward retained requests back to PendingUrbQueue in FIFO order
+        for (ULONG i = 0; i < retainedCount; i++) {
+            NTSTATUS fwdStatus = WdfRequestForwardToIoQueue(retainedRequests[i], ControlData->PendingUrbQueue);
+            if (!NT_SUCCESS(fwdStatus)) {
+                WdfRequestComplete(retainedRequests[i], fwdStatus);
+            }
+        }
+    }
+}
+
+VOID
+AnyUsbFilter_EvtControlFileCleanup(
+    _In_ WDFFILEOBJECT FileObject
+)
+{
+    WDFDEVICE device = WdfFileObjectGetDevice(FileObject);
+    PCONTROL_DEVICE_DATA controlData = GetControlData(device);
+
+    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
+        "USB Master Pro Filter: CDO file cleanup triggered. Resetting capture and draining pending requests.\n"));
+
+    if (controlData != NULL) {
+        // Reset capture state for control device and all registered filter devices
+        WdfSpinLockAcquire(controlData->ControlLock);
+        controlData->IsCaptured = FALSE;
+        PLIST_ENTRY entry = controlData->FilterDeviceList.Flink;
+        while (entry != &controlData->FilterDeviceList) {
+            PFILTER_DEVICE_DATA fData = CONTAINING_RECORD(entry, FILTER_DEVICE_DATA, Link);
+            fData->IsCaptured = FALSE;
+            entry = entry->Flink;
+        }
+        WdfSpinLockRelease(controlData->ControlLock);
+
+        // Drain all pending requests across all devices
+        AnyUsbFilter_DrainPendingRequests(controlData, 0, STATUS_CANCELLED);
+    }
+}
+
 VOID
 AnyUsbFilter_EvtDeviceCleanup(
     _In_ WDFOBJECT Object
@@ -255,12 +419,18 @@ AnyUsbFilter_EvtDeviceCleanup(
     PFILTER_DEVICE_DATA filterData = GetFilterData(device);
 
     if (g_ControlData != NULL && filterData != NULL) {
+        ULONG deviceId = filterData->DeviceId;
+        filterData->IsCaptured = FALSE;
+
         WdfSpinLockAcquire(g_ControlData->ControlLock);
         if (!IsListEmpty(&filterData->Link) && filterData->Link.Flink != NULL) {
             RemoveEntryList(&filterData->Link);
             InitializeListHead(&filterData->Link);
         }
         WdfSpinLockRelease(g_ControlData->ControlLock);
+
+        // Drain any pending intercepted URBs belonging to this removed device
+        AnyUsbFilter_DrainPendingRequests(g_ControlData, deviceId, STATUS_CANCELLED);
     }
 }
 
@@ -355,6 +525,9 @@ AnyUsbFilter_EvtControlIoDeviceControl(
             }
             WdfSpinLockRelease(controlData->ControlLock);
 
+            // Drain all matching in-flight and queued requests
+            AnyUsbFilter_DrainPendingRequests(controlData, targetDeviceId, STATUS_CANCELLED);
+
             KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                 "USB Master Pro Filter: Capture STOPPED for device %lu\n", targetDeviceId));
             status = STATUS_SUCCESS;
@@ -421,16 +594,7 @@ AnyUsbFilter_EvtControlIoDeviceControl(
                 RtlZeroMemory(msg, sizeof(ANYUSB_URB_MESSAGE));
                 msg->SequenceId = (ULONG64)(assignedSlot + 1);
 
-                WDFQUEUE reqQueue = WdfRequestGetIoQueue(pendingGuestRequest);
-                if (reqQueue != NULL) {
-                    WDFDEVICE fidoDev = WdfIoQueueGetDevice(reqQueue);
-                    if (fidoDev != NULL) {
-                        PFILTER_DEVICE_DATA fidoData = GetFilterData(fidoDev);
-                        if (fidoData != NULL) {
-                            msg->DeviceId = fidoData->DeviceId;
-                        }
-                    }
-                }
+                msg->DeviceId = AnyUsbFilter_GetRequestDeviceId(pendingGuestRequest);
 
                 USHORT urbFunc = urb->UrbHeader.Function;
                 if (urbFunc == URB_FUNCTION_CONTROL_TRANSFER) {
@@ -694,6 +858,9 @@ AnyUsbFilter_EvtIoDeviceControl(
 
         case IOCTL_ANYUSB_FILTER_STOP_CAPTURE:
             filterData->IsCaptured = FALSE;
+            if (g_ControlData != NULL) {
+                AnyUsbFilter_DrainPendingRequests(g_ControlData, filterData->DeviceId, STATUS_CANCELLED);
+            }
             KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "USB Master Pro: Physical USB device capture STOPPED.\n"));
             status = STATUS_SUCCESS;
             break;

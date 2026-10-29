@@ -300,3 +300,123 @@ async fn test_adaptive_backoff_timing() {
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_millis(100), pump_task).await;
 }
+
+#[test]
+fn test_filter_stop_capture_drains_pending_and_queued_urbs() {
+    let client = FilterDriverClient::open().expect("Open filter client");
+    let dev1: u32 = 101;
+    let dev2: u32 = 202;
+
+    client.start_capture(dev1).expect("start dev1");
+    client.start_capture(dev2).expect("start dev2");
+    assert!(client.is_capturing(dev1));
+    assert!(client.is_capturing(dev2));
+
+    // Queue 2 URBs for dev1, 1 for dev2
+    let mut msg1 = AnyUsbUrbMessage::default();
+    msg1.device_id = dev1;
+    msg1.sequence_id = 11;
+    client.queue_simulated_urb(msg1);
+
+    let mut msg2 = AnyUsbUrbMessage::default();
+    msg2.device_id = dev1;
+    msg2.sequence_id = 12;
+    client.queue_simulated_urb(msg2);
+
+    let mut msg3 = AnyUsbUrbMessage::default();
+    msg3.device_id = dev2;
+    msg3.sequence_id = 21;
+    client.queue_simulated_urb(msg3);
+
+    assert_eq!(client.pending_queue_len(), 3);
+
+    // Stop capture on dev1: must drain only dev1's requests with STATUS_CANCELLED
+    client.stop_capture(dev1).expect("stop capture dev1");
+    assert!(!client.is_capturing(dev1));
+    assert!(client.is_capturing(dev2));
+
+    // Verify dev1 requests were drained and completed as cancelled
+    assert_eq!(client.pending_queue_len(), 1);
+    let completed = client.get_completed_urbs();
+    assert_eq!(completed.len(), 2);
+    const STATUS_CANCELLED: i32 = -1073741536; // 0xC0000120 as i32
+    assert_eq!({ completed[0].device_id }, dev1);
+    assert_eq!({ completed[0].sequence_id }, 11);
+    assert_eq!({ completed[0].status }, STATUS_CANCELLED);
+    assert_eq!({ completed[1].device_id }, dev1);
+    assert_eq!({ completed[1].sequence_id }, 12);
+    assert_eq!({ completed[1].status }, STATUS_CANCELLED);
+
+    // Fetch remaining URB for dev2
+    let fetched = client.fetch_urb().expect("fetch").expect("URB for dev2 present");
+    assert_eq!({ fetched.device_id }, dev2);
+    assert_eq!({ fetched.sequence_id }, 21);
+
+    // Complete dev2 URB successfully
+    let mut comp2 = AnyUsbCompleteRequest::default();
+    comp2.device_id = dev2;
+    comp2.sequence_id = 21;
+    comp2.status = 0;
+    client.complete_urb(&comp2).expect("complete comp2");
+
+    // Stop capture on dev2
+    client.stop_capture(dev2).expect("stop capture dev2");
+    assert!(!client.is_capturing(dev2));
+    assert_eq!(client.pending_queue_len(), 0);
+}
+
+#[test]
+fn test_filter_stop_capture_all_devices_drains_everything() {
+    let client = FilterDriverClient::open().expect("Open filter client");
+    let dev1: u32 = 301;
+    let dev2: u32 = 302;
+
+    client.start_capture(dev1).expect("start dev1");
+    client.start_capture(dev2).expect("start dev2");
+
+    let mut msg1 = AnyUsbUrbMessage::default();
+    msg1.device_id = dev1;
+    msg1.sequence_id = 91;
+    client.queue_simulated_urb(msg1);
+
+    let mut msg2 = AnyUsbUrbMessage::default();
+    msg2.device_id = dev2;
+    msg2.sequence_id = 92;
+    client.queue_simulated_urb(msg2);
+
+    assert_eq!(client.pending_queue_len(), 2);
+
+    // TargetDeviceId = 0: drains all devices
+    client.stop_capture(0).expect("stop capture all");
+    assert!(!client.is_capturing(dev1));
+    assert!(!client.is_capturing(dev2));
+    assert_eq!(client.pending_queue_len(), 0);
+
+    let completed = client.get_completed_urbs();
+    assert_eq!(completed.len(), 2);
+    const STATUS_CANCELLED: i32 = -1073741536;
+    assert_eq!({ completed[0].status }, STATUS_CANCELLED);
+    assert_eq!({ completed[1].status }, STATUS_CANCELLED);
+}
+
+#[test]
+fn test_filter_client_drop_drains_all_pending_requests() {
+    let client = FilterDriverClient::open().expect("Open filter client");
+    client.start_capture(401).unwrap();
+    client.start_capture(402).unwrap();
+
+    let mut msg1 = AnyUsbUrbMessage::default();
+    msg1.device_id = 401;
+    msg1.sequence_id = 101;
+    client.queue_simulated_urb(msg1);
+
+    let mut msg2 = AnyUsbUrbMessage::default();
+    msg2.device_id = 402;
+    msg2.sequence_id = 102;
+    client.queue_simulated_urb(msg2);
+
+    assert_eq!(client.pending_queue_len(), 2);
+
+    // Explicit drop calls stop_capture(0) under Drop trait
+    drop(client);
+}

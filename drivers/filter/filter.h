@@ -102,5 +102,13 @@ EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL AnyUsbFilter_EvtIoInternalDeviceCont
 EVT_WDF_REQUEST_COMPLETION_ROUTINE AnyUsbFilter_EvtUrbComplete;
 EVT_WDF_REQUEST_CANCEL AnyUsbFilter_EvtPendingUrbCancel;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP AnyUsbFilter_EvtDeviceCleanup;
+EVT_WDF_FILE_CLEANUP AnyUsbFilter_EvtControlFileCleanup;
+
+VOID
+AnyUsbFilter_DrainPendingRequests(
+    _In_ PCONTROL_DEVICE_DATA ControlData,
+    _In_ ULONG                TargetDeviceId,
+    _In_ NTSTATUS             CompletionStatus
+);
 
 #endif // _ANYUSB_FILTER_H_

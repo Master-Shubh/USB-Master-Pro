@@ -869,8 +869,46 @@ impl FilterDriverClient {
 
     pub fn stop_capture(&self, device_id: u32) -> Result<(), DriverClientError> {
         let mut caps = self.captured_devices.lock().unwrap();
-        caps.remove(&device_id);
+        if device_id == 0 {
+            caps.clear();
+        } else {
+            caps.remove(&device_id);
+        }
+        drop(caps);
+
+        // Windows KMDF filter driver drains matching requests on stop_capture with STATUS_CANCELLED
+        const STATUS_CANCELLED: i32 = -1073741536; // 0xC0000120 as i32
+        self.drain_pending_requests(device_id, STATUS_CANCELLED);
         Ok(())
+    }
+
+    pub fn drain_pending_requests(&self, target_device_id: u32, completion_status: i32) -> usize {
+        let mut queue = self.pending_urb_queue.lock().unwrap();
+        let mut drained = 0;
+        let mut remaining = std::collections::VecDeque::new();
+        let mut completed = self.completed_urbs.lock().unwrap();
+
+        while let Some(msg) = queue.pop_front() {
+            if target_device_id == 0 || msg.device_id == target_device_id {
+                drained += 1;
+                completed.push(AnyUsbCompleteRequest {
+                    device_id: msg.device_id,
+                    sequence_id: msg.sequence_id,
+                    status: completion_status,
+                    actual_length: 0,
+                    data: [0u8; ANYUSB_MAX_URB_BUFFER_SIZE],
+                });
+            } else {
+                remaining.push_back(msg);
+            }
+        }
+        *queue = remaining;
+        drained
+    }
+
+    pub fn pending_queue_len(&self) -> usize {
+        let queue = self.pending_urb_queue.lock().unwrap();
+        queue.len()
     }
 
     pub fn is_capturing(&self, device_id: u32) -> bool {
@@ -948,6 +986,13 @@ impl Default for FilterDriverClient {
             pending_urb_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             completed_urbs: std::sync::Mutex::new(Vec::new()),
         })
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl Drop for FilterDriverClient {
+    fn drop(&mut self) {
+        let _ = self.stop_capture(0);
     }
 }
 
