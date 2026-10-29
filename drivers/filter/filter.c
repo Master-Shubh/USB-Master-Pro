@@ -466,8 +466,8 @@ AnyUsbFilter_CancelAndCompletePendingSlot(
     WdfSpinLockAcquire(ControlData->PendingUrbLock);
     if (Slot < ANYUSB_MAX_PENDING_URBS && ControlData->PendingRequests[Slot] == ExpectedRequest) {
         NTSTATUS unmarkStatus = WdfRequestUnmarkCancelable(ExpectedRequest);
-        ControlData->PendingRequests[Slot] = NULL;
         if (NT_SUCCESS(unmarkStatus)) {
+            ControlData->PendingRequests[Slot] = NULL;
             shouldComplete = TRUE;
         }
     }
