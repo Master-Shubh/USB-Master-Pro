@@ -1,5 +1,8 @@
 name: USB Master Pro — Windows Release Build & Driver Signing Pipeline
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [ main, master ]
@@ -223,6 +226,22 @@ jobs:
               }
               Write-Host "Verified valid Authenticode signature for $sf (Signer: $($sig.SignerCertificate.Subject))"
           }
+
+      - name: Execute Automated Core Test Suite (cargo test --workspace)
+        run: |
+          Write-Host "=================================================================="
+          Write-Host "Executing automated tests for x86_64-pc-windows-msvc..."
+          Write-Host "=================================================================="
+          cargo test --workspace --target x86_64-pc-windows-msvc
+
+      - name: Execute Signaling Security Regression Test Suite (npm test)
+        run: |
+          Write-Host "=================================================================="
+          Write-Host "Executing signaling security tests..."
+          Write-Host "=================================================================="
+          cd signaling
+          npm test
+          cd ..
 
       - name: Compile Rust Turbo-URB Engine (usb_master_daemon & usb_master_cli)
         run: |
