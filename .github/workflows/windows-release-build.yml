@@ -135,7 +135,7 @@ jobs:
           Write-Host "=================================================================="
           Write-Host "Compiling anyusb_vhci.vcxproj (Release | x64)..."
           Write-Host "=================================================================="
-          msbuild drivers/vhci/anyusb_vhci.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /p:SignMode=Off /p:EnableInfVerif=false /v:m
+          msbuild drivers/vhci/anyusb_vhci.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /p:SignMode=Off /p:EnableInfVerif=false /p:RunInf2Cat=false /v:m
           if ($LASTEXITCODE -ne 0) {
               throw "FATAL: MSBuild compilation of anyusb_vhci.vcxproj failed with exit code $LASTEXITCODE"
           }
@@ -157,7 +157,7 @@ jobs:
           Write-Host "=================================================================="
           Write-Host "Compiling anyusb_filter.vcxproj (Release | x64)..."
           Write-Host "=================================================================="
-          msbuild drivers/filter/anyusb_filter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /p:SignMode=Off /p:EnableInfVerif=false /v:m
+          msbuild drivers/filter/anyusb_filter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:TargetVersion=Windows10 /p:SignMode=Off /p:EnableInfVerif=false /p:RunInf2Cat=false /v:m
           if ($LASTEXITCODE -ne 0) {
               throw "FATAL: MSBuild compilation of anyusb_filter.vcxproj failed with exit code $LASTEXITCODE"
           }
