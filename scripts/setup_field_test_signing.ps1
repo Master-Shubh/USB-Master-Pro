@@ -160,10 +160,9 @@ if ($existingCert -and -not $ForceRegenerateCert) {
         KeyAlgorithm = "RSA"
         HashAlgorithm = "SHA256"
         CertStoreLocation = "Cert:\LocalMachine\My"
-        KeyUsage = "DigitalSignature", "CertSign", "CRLSign"
+        KeyUsage = "DigitalSignature"
         TextExtension = @(
-            "2.5.29.37={text}$($ekuExtensions -join ',')",
-            "2.5.29.19={critical}{text}ca=1"
+            "2.5.29.37={text}$($ekuExtensions -join ',')"
         )
         NotAfter = (Get-Date).AddYears(5)
     }
@@ -258,8 +257,8 @@ if ($inf2catPath) {
 Write-Header "Step 5: Generating Driver Catalog Files"
 
 $driverDirs = @(
-    Join-Path $DriverRootPath "vhci",
-    Join-Path $DriverRootPath "filter"
+    (Join-Path $DriverRootPath "vhci"),
+    (Join-Path $DriverRootPath "filter")
 )
 
 # Supported Windows OS Targets for Inf2Cat (x64 package targets)
@@ -276,7 +275,7 @@ foreach ($dir in $driverDirs) {
         Write-Info "Processing INF: $($inf.FullName)"
         if ($inf2catPath) {
             Write-Info "Running Inf2Cat for $($inf.Name)..."
-            $inf2catArgs = "/driver:`"$dir`" /os:$osTargets /verbose"
+            $inf2catArgs = @("/driver:$dir", "/os:$osTargets", "/verbose")
             $p = Start-Process -FilePath $inf2catPath -ArgumentList $inf2catArgs -Wait -NoNewWindow -PassThru
             if ($p.ExitCode -eq 0) {
                 Write-Success "Catalog generation succeeded for $($inf.Name)."
@@ -354,10 +353,10 @@ Write-Header "Step 7: Verifying Driver Signatures"
 
 foreach ($item in $filesToSign) {
     if ($signToolPath) {
-        $verifyArgs = "verify /v /kp `"$($item.FullName)`""
+        $verifyArgs = "verify /v /pa `"$($item.FullName)`""
         $vRes = Start-Process -FilePath $signToolPath -ArgumentList $verifyArgs -Wait -NoNewWindow -PassThru
         if ($vRes.ExitCode -eq 0) {
-            Write-Success "Signature VALID (Kernel Policy): $($item.Name)"
+            Write-Success "Signature VALID (Authenticode Policy): $($item.Name)"
         } else {
             Write-Warn "Signature verification returned code $($vRes.ExitCode) for $($item.Name)"
         }
