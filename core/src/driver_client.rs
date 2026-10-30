@@ -363,7 +363,7 @@ impl VhciDriverClient {
 
             let err = unsafe { GetLastError() };
             return Err(DriverClientError::DeviceNotFound(format!(
-                "KMDF driver '{}' is not accessible. Ensure anyusb_vhci driver is installed and running. (error: {})",
+                "Failed to open KMDF driver '{}'. Ensure anyusb_vhci driver is installed and running. (GetLastError: {})",
                 path, err
             )));
         }
@@ -651,7 +651,7 @@ impl FilterDriverClient {
 
             let err = unsafe { GetLastError() };
             return Err(DriverClientError::DeviceNotFound(format!(
-                "KMDF driver '{}' is not accessible. Ensure anyusb_filter driver is installed and running. (error: {})",
+                "Failed to open KMDF driver '{}'. Ensure anyusb_filter driver is installed and running. (GetLastError: {})",
                 path, err
             )));
         }
