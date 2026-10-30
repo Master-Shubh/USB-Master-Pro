@@ -476,6 +476,8 @@ async fn test_execute_session_disconnect_cleans_remote_and_local_mounts() {
         driver_client,
         filter_client: Arc::new(FilterDriverClient::default()),
         session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        dynamic_pin: Arc::new(tokio::sync::RwLock::new("123 456".to_string())),
+        failed_pin_attempts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     });
 
     let (data_tx, _) = tokio::sync::mpsc::channel(16);
@@ -578,6 +580,8 @@ async fn test_execute_session_disconnect_idempotency_and_missing_session() {
         driver_client,
         filter_client: Arc::new(FilterDriverClient::default()),
         session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        dynamic_pin: Arc::new(tokio::sync::RwLock::new("123 456".to_string())),
+        failed_pin_attempts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     });
 
     // 1. Disconnect on non-existent peer must return false safely without panic

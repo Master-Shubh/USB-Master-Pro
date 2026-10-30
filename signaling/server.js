@@ -20,6 +20,65 @@ const connectionsByIp = new Map();        // ip -> Set<ws>
 const activeChannels = new Map();         // channelId -> { senderId, receiverId, deviceId }
 const activePeerPairs = new Map();        // ws -> targetWs (Zero-copy binary Turbo-URB routing)
 
+// Rate limit / Lockout map for failed connection challenges / PIN attempts (max 5 per 15 min per IP/ID)
+const failedAttemptsByPeer = new Map(); // identifier (peerId or remoteIp) -> { count, lastFailure }
+const LOCKOUT_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const MAX_FAILED_ATTEMPTS = 5;
+
+function isLoopbackIp(ip) {
+  return !ip || ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' || ip === 'localhost';
+}
+
+function cleanupExpiredLockouts() {
+  const now = Date.now();
+  for (const [key, entry] of failedAttemptsByPeer.entries()) {
+    if (now - entry.lastFailure >= LOCKOUT_WINDOW_MS) {
+      failedAttemptsByPeer.delete(key);
+    }
+  }
+}
+
+function isPeerLockedOut(id, ip) {
+  cleanupExpiredLockouts();
+  const now = Date.now();
+  const keys = [];
+  if (id) keys.push(String(id).replace(/\s+/g, ''));
+  if (ip && !isLoopbackIp(ip)) keys.push(ip);
+
+  for (const k of keys) {
+    const entry = failedAttemptsByPeer.get(k);
+    if (entry && entry.count >= MAX_FAILED_ATTEMPTS && (now - entry.lastFailure < LOCKOUT_WINDOW_MS)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function recordFailedAttempt(id, ip) {
+  cleanupExpiredLockouts();
+  const now = Date.now();
+  const keys = [];
+  if (id) keys.push(String(id).replace(/\s+/g, ''));
+  if (ip && !isLoopbackIp(ip)) keys.push(ip);
+
+  for (const k of keys) {
+    const entry = failedAttemptsByPeer.get(k) || { count: 0, lastFailure: now };
+    entry.count += 1;
+    entry.lastFailure = now;
+    failedAttemptsByPeer.set(k, entry);
+  }
+}
+
+function resetFailedAttempts(id, ip) {
+  cleanupExpiredLockouts();
+  if (id) failedAttemptsByPeer.delete(String(id).replace(/\s+/g, ''));
+  if (ip && !isLoopbackIp(ip)) failedAttemptsByPeer.delete(ip);
+}
+
+// Periodic cleanup of expired lockout entries every 5 minutes to prevent memory leaks
+const lockoutCleanupTimer = setInterval(cleanupExpiredLockouts, 5 * 60 * 1000);
+if (lockoutCleanupTimer.unref) lockoutCleanupTimer.unref();
+
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -171,7 +230,7 @@ wss.on('connection', (ws, req) => {
 
     try {
       const msg = JSON.parse(data.toString());
-      handleMessage(ws, msg);
+      handleMessage(ws, msg, remoteIp);
     } catch (err) {
       console.error('[Broker] Malformed message received:', err.message);
       ws.send(JSON.stringify({ type: 'ERROR', error: 'Malformed JSON payload' }));
@@ -270,7 +329,7 @@ function verifyEd25519Proof(publicKeyHex, messageStr, signatureHex) {
   }
 }
 
-function handleMessage(ws, msg) {
+function handleMessage(ws, msg, remoteIp = 'unknown') {
   switch (msg.type) {
     case 'REGISTER_INIT': {
       // msg: { type: 'REGISTER_INIT', id: '482190334', publicKey: '<64-hex>' }
@@ -278,6 +337,15 @@ function handleMessage(ws, msg) {
       const peerId = rawId.replace(/\s+/g, '');
       if (!peerId || peerId.length !== 9 || !/^\d{9}$/.test(peerId)) {
         ws.send(JSON.stringify({ type: 'REGISTER_RESP', success: false, error: 'Invalid 9-digit ID format' }));
+        return;
+      }
+      if (isPeerLockedOut(peerId, remoteIp)) {
+        console.warn(`[Broker] REGISTER_INIT blocked for locked-out node [${peerId}] (IP: ${remoteIp})`);
+        ws.send(JSON.stringify({
+          type: 'REGISTER_RESP',
+          success: false,
+          error: 'Security lockout: Too many failed registration attempts. Locked out for 15 minutes.'
+        }));
         return;
       }
       if (!msg.publicKey || typeof msg.publicKey !== 'string' || msg.publicKey.length !== 64) {
@@ -339,6 +407,16 @@ function handleMessage(ws, msg) {
         return;
       }
 
+      if (isPeerLockedOut(peerId, remoteIp)) {
+        console.warn(`[Broker] REGISTER_PROOF blocked for locked-out node [${peerId}] (IP: ${remoteIp})`);
+        ws.send(JSON.stringify({
+          type: 'REGISTER_RESP',
+          success: false,
+          error: 'Security lockout: Too many failed registration attempts. Locked out for 15 minutes.'
+        }));
+        return;
+      }
+
       const challenge = pendingChallenges.get(peerId);
       if (!challenge) {
         ws.send(JSON.stringify({
@@ -381,6 +459,7 @@ function handleMessage(ws, msg) {
         || (rawId !== peerId && verifyEd25519Proof(publicKey, `USB_MASTER_REGISTER:${rawId}:${challenge.nonce}`, signatureHex));
 
       if (!valid) {
+        recordFailedAttempt(peerId, remoteIp);
         console.warn(`[Broker] Cryptographic proof FAILED for node [${peerId}]`);
         ws.send(JSON.stringify({
           type: 'REGISTER_RESP',
@@ -389,6 +468,8 @@ function handleMessage(ws, msg) {
         }));
         return;
       }
+
+      resetFailedAttempts(peerId, remoteIp);
 
       const peerRecord = {
         ws,
@@ -537,6 +618,15 @@ function handleMessage(ws, msg) {
         ws.send(JSON.stringify({ type: 'ERROR', error: 'Unregistered peer cannot initiate connections' }));
         return;
       }
+      if (isPeerLockedOut(fromId, remoteIp)) {
+        console.warn(`[Broker] Blocked CONNECT_REQUEST from locked-out peer [${fromId}] (IP: ${remoteIp})`);
+        ws.send(JSON.stringify({
+          type: 'CONNECT_RESPONSE',
+          success: false,
+          error: 'Security lockout: Too many failed connection attempts. Locked out for 15 minutes.'
+        }));
+        return;
+      }
       const targetId = String(msg.targetId || '').replace(/\s+/g, '');
       const target = peersById.get(targetId);
 
@@ -609,6 +699,7 @@ function handleMessage(ws, msg) {
 
       console.log(`[Broker] Routing connection decision: [${fromId}] -> [${toId}]: Accepted=${msg.accepted}`);
       if (msg.accepted) {
+        resetFailedAttempts(toId);
         activePeerPairs.set(ws, client.ws);
         activePeerPairs.set(client.ws, ws);
         const chanId = `${toId}:${fromId}`;
@@ -618,6 +709,10 @@ function handleMessage(ws, msg) {
           createdAt: Date.now()
         });
         console.log(`[Broker] Active binary data bridge established between [${fromId}] <--> [${toId}]`);
+      } else {
+        const clientIp = client.ws?._socket?.remoteAddress;
+        recordFailedAttempt(toId, clientIp);
+        console.warn(`[Broker] Failed connection / PIN rejection recorded for requesting peer [${toId}]. Attempts: ${failedAttemptsByPeer.get(toId)?.count}`);
       }
       client.ws.send(JSON.stringify({
         type: 'CONNECT_DECISION',
@@ -689,5 +784,12 @@ module.exports = {
   pendingChallenges,
   pendingConnectRequests,
   connectionsByIp,
-  activePeerPairs
+  activePeerPairs,
+  failedAttemptsByPeer,
+  isPeerLockedOut,
+  recordFailedAttempt,
+  resetFailedAttempts,
+  cleanupExpiredLockouts,
+  LOCKOUT_WINDOW_MS,
+  MAX_FAILED_ATTEMPTS
 };

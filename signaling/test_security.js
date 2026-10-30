@@ -22,7 +22,14 @@ const {
   verifiedPeers,
   pendingChallenges,
   pendingConnectRequests,
-  connectionsByIp
+  connectionsByIp,
+  failedAttemptsByPeer,
+  isPeerLockedOut,
+  recordFailedAttempt,
+  resetFailedAttempts,
+  cleanupExpiredLockouts,
+  LOCKOUT_WINDOW_MS,
+  MAX_FAILED_ATTEMPTS
 } = require('./server');
 
 const TEST_PORT = 18443;
@@ -474,12 +481,69 @@ async function runTests() {
       console.log('   ✅ Test 7 Passed: Binary frame burst rate limit strictly enforced (excess dropped).');
     }
 
-    // Cleanup sockets
+    // Cleanup sockets from relay tests
     if (registeredWsA) registeredWsA.close();
     if (registeredWsB) registeredWsB.close();
 
+    // -------------------------------------------------------------------------
+    // Test 8: 5-Try Brute-Force Lockout Guard on Failed Connection / PIN Attempts
+    // -------------------------------------------------------------------------
+    console.log('👉 [Test 8] 5-Try brute-force lockout guard and expired entry cleanup...');
+    {
+      const attackerId = '987654321';
+
+      // 1. Initial state: attacker is not locked out
+      assert.strictEqual(isPeerLockedOut(attackerId), false, 'Attacker should not be locked out initially');
+
+      // 2. Simulate 4 failed connection / PIN rejection attempts
+      for (let i = 1; i <= 4; i++) {
+        recordFailedAttempt(attackerId);
+        assert.strictEqual(failedAttemptsByPeer.get(attackerId)?.count, i);
+        assert.strictEqual(isPeerLockedOut(attackerId), false, `Attempt ${i} must not yet trigger lockout`);
+      }
+
+      // 3. 5th failed attempt must trigger lockout
+      recordFailedAttempt(attackerId);
+      assert.strictEqual(failedAttemptsByPeer.get(attackerId)?.count, 5);
+      assert.strictEqual(isPeerLockedOut(attackerId), true, '5th failed attempt must trigger active lockout');
+
+      // 4. Verify connection from locked-out peer is blocked on REGISTER_INIT
+      const attackerWs = await connectWs();
+      const attackerKey = createEd25519Key();
+
+      attackerWs.send(JSON.stringify({
+        type: 'REGISTER_INIT',
+        id: attackerId,
+        publicKey: attackerKey.publicKeyHex
+      }));
+
+      const regResp = await waitForMessage(attackerWs, m => m.type === 'REGISTER_RESP');
+      assert.strictEqual(regResp.success, false);
+      assert.ok(regResp.error.includes('Security lockout'), `Expected lockout error, got: ${regResp.error}`);
+
+      attackerWs.close();
+
+      // 5. Test expiration cleanup: artificially age the record past LOCKOUT_WINDOW_MS
+      const entry = failedAttemptsByPeer.get(attackerId);
+      entry.lastFailure = Date.now() - (LOCKOUT_WINDOW_MS + 1000);
+      failedAttemptsByPeer.set(attackerId, entry);
+
+      assert.strictEqual(isPeerLockedOut(attackerId), false, 'Expired lockout entry must not lock out peer');
+      cleanupExpiredLockouts();
+      assert.strictEqual(failedAttemptsByPeer.has(attackerId), false, 'Expired entry must be pruned from map');
+
+      // 6. Test reset on successful connection
+      recordFailedAttempt('test-reset-node');
+      recordFailedAttempt('test-reset-node');
+      assert.strictEqual(failedAttemptsByPeer.get('test-reset-node')?.count, 2);
+      resetFailedAttempts('test-reset-node');
+      assert.strictEqual(failedAttemptsByPeer.has('test-reset-node'), false, 'Reset must clear failure records');
+
+      console.log('   ✅ Test 8 Passed: 5-Try lockout counter, blocked requests, and expired cleanup verified.');
+    }
+
     console.log('\n================================================================================');
-    console.log('  🎉 ALL 7 SECURITY REGRESSION TESTS PASSED CLEANLY (100% PASS)');
+    console.log('  🎉 ALL 8 SECURITY REGRESSION TESTS PASSED CLEANLY (100% PASS)');
     console.log('================================================================================\n');
 
   } finally {

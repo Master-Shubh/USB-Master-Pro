@@ -38,7 +38,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,6 +168,12 @@ pub struct DisconnectRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinVerifyRequest {
+    pub peer_id: String,
+    pub pin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonTelemetry {
     pub status: String,
     pub uptime_secs: u64,
@@ -207,6 +213,115 @@ pub struct DaemonState {
     pub driver_client: Arc<VhciDriverClient>,
     pub filter_client: Arc<FilterDriverClient>,
     pub session_pumps: Arc<tokio::sync::Mutex<HashMap<String, SessionPumpHandles>>>,
+    pub dynamic_pin: Arc<RwLock<String>>,
+    pub failed_pin_attempts: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
+}
+
+pub const PIN_LOCKOUT_MAX_ATTEMPTS: u32 = 5;
+pub const PIN_LOCKOUT_DURATION_SECS: u64 = 900; // 15 minutes (900 seconds)
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PinVerificationResult {
+    Success,
+    InvalidPin { attempts: u32, remaining: u32 },
+    LockedOut { message: String },
+}
+
+/// Generates a cryptographically secure 6-digit one-time session PIN using CSPRNG.
+/// Formatted as "XXX XXX" (e.g., "482 190").
+pub fn generate_csprng_pin() -> String {
+    use rand::Rng;
+    let pin_num: u32 = rand::thread_rng().gen_range(100_000..=999_999);
+    let s = pin_num.to_string();
+    format!("{} {}", &s[0..3], &s[3..6])
+}
+
+/// Resolves initial session PIN from environment (for test overrides) or CSPRNG.
+pub fn get_initial_session_pin() -> String {
+    if let Ok(pin) = std::env::var("USB_MASTER_SESSION_PIN") {
+        let trimmed = pin.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(pin) = std::env::var("USB_MASTER_PIN") {
+        let trimmed = pin.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    generate_csprng_pin()
+}
+
+impl DaemonState {
+    /// Returns the active dynamic session PIN
+    pub async fn get_pin(&self) -> String {
+        self.dynamic_pin.read().await.clone()
+    }
+
+    /// Generates a fresh dynamic CSPRNG session PIN, updates state, and broadcasts PIN_ROTATED event
+    pub async fn rotate_pin(&self) -> String {
+        let new_pin = generate_csprng_pin();
+        {
+            let mut pin_w = self.dynamic_pin.write().await;
+            *pin_w = new_pin.clone();
+        }
+        let _ = self.ui_events_tx.send(serde_json::json!({
+            "type": "PIN_ROTATED",
+            "pin": new_pin
+        }));
+        new_pin
+    }
+
+    /// Verifies an incoming candidate PIN against the active CSPRNG session PIN,
+    /// enforcing the 5-try lockout policy (15-minute cooldown) and cleaning expired entries.
+    pub async fn verify_incoming_pin(&self, peer_id: &str, candidate_pin: &str) -> PinVerificationResult {
+        let clean_peer = peer_id.replace(' ', "");
+        let clean_candidate = candidate_pin.replace(' ', "");
+        let now = Instant::now();
+        let lockout_duration = Duration::from_secs(PIN_LOCKOUT_DURATION_SECS);
+
+        let mut attempts_map = self.failed_pin_attempts.lock().await;
+
+        // 1. Clean up expired lockout entries (> 15 minutes)
+        attempts_map.retain(|_, (_, last_failure)| now.duration_since(*last_failure) < lockout_duration);
+
+        // 2. Check if peer is currently locked out
+        if let Some((count, last_failure)) = attempts_map.get(&clean_peer) {
+            if *count >= PIN_LOCKOUT_MAX_ATTEMPTS && now.duration_since(*last_failure) < lockout_duration {
+                return PinVerificationResult::LockedOut {
+                    message: "Security lockout: Too many failed PIN attempts. Locked out for 15 minutes.".to_string(),
+                };
+            }
+        }
+
+        // 3. Compare candidate PIN with active CSPRNG dynamic PIN
+        let active_pin = self.dynamic_pin.read().await;
+        let clean_active = active_pin.replace(' ', "");
+
+        if !clean_candidate.is_empty() && clean_candidate == clean_active {
+            // Success: Reset failure counter for this peer
+            attempts_map.remove(&clean_peer);
+            PinVerificationResult::Success
+        } else {
+            // Failure: Increment failed attempts counter and update last_failure timestamp
+            let entry = attempts_map.entry(clean_peer.clone()).or_insert((0, now));
+            entry.0 += 1;
+            entry.1 = now;
+            let count = entry.0;
+
+            if count >= PIN_LOCKOUT_MAX_ATTEMPTS {
+                PinVerificationResult::LockedOut {
+                    message: "Security lockout: Too many failed PIN attempts. Locked out for 15 minutes.".to_string(),
+                }
+            } else {
+                PinVerificationResult::InvalidPin {
+                    attempts: count,
+                    remaining: PIN_LOCKOUT_MAX_ATTEMPTS.saturating_sub(count),
+                }
+            }
+        }
+    }
 }
 
 /// Generates a 256-bit cryptographically secure local API authorization token from the OS CSPRNG.
@@ -625,6 +740,9 @@ pub fn create_router(state: Arc<DaemonState>) -> Router {
         .route("/api/license/activate", post(handle_post_license_activate))
         .route("/api/license/status", get(handle_get_license_status))
         .route("/api/system/drivers", get(handle_get_system_drivers))
+        .route("/api/pin", get(handle_get_pin))
+        .route("/api/pin/rotate", post(handle_post_pin_rotate))
+        .route("/api/pin/verify", post(handle_post_pin_verify))
         .route("/api/events", get(handle_ws_events))
         .layer(cors)
         .with_state(state)
@@ -696,6 +814,8 @@ impl DaemonServer {
             driver_client,
             filter_client,
             session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            dynamic_pin: Arc::new(RwLock::new(get_initial_session_pin())),
+            failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
         });
 
         // 1. Spawn Outbound Signaling Client task
@@ -773,6 +893,52 @@ async fn handle_get_identity(
         obj.remove("default_pin");
     }
     Ok(Json(val))
+}
+
+async fn handle_get_pin(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_request_token_or_origin(&headers, &state)?;
+    let pin = state.get_pin().await;
+    Ok(Json(serde_json::json!({
+        "pin": pin,
+        "dynamic": true
+    })))
+}
+
+async fn handle_post_pin_rotate(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_request_origin_and_auth(&headers, &state)?;
+    let new_pin = state.rotate_pin().await;
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "pin": new_pin
+    })))
+}
+
+async fn handle_post_pin_verify(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(payload): Json<PinVerifyRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_request_origin_and_auth(&headers, &state)?;
+    match state.verify_incoming_pin(&payload.peer_id, &payload.pin).await {
+        PinVerificationResult::Success => Ok(Json(serde_json::json!({
+            "valid": true,
+            "peer_id": payload.peer_id
+        }))),
+        PinVerificationResult::InvalidPin { attempts, remaining } => Err((
+            StatusCode::BAD_REQUEST,
+            format!("Invalid PIN. Attempt {} of 5 before lockout ({} remaining).", attempts, remaining),
+        )),
+        PinVerificationResult::LockedOut { message } => Err((
+            StatusCode::FORBIDDEN,
+            message,
+        )),
+    }
 }
 
 /// Rotates the local daemon API authorization token, persisting the fresh 256-bit CSPRNG token to disk
@@ -2248,7 +2414,49 @@ async fn handle_broker_message(state: &Arc<DaemonState>, raw_json: &str) {
             "INCOMING_CONNECTION" => {
                 let from_id = msg["fromId"].as_str().unwrap_or_default();
                 let dev_id = msg["deviceId"].as_str().unwrap_or("auto");
+                let candidate_pin = msg.get("pin").and_then(|p| p.as_str()).unwrap_or_default();
                 println!("  🔔 Incoming connection request from [{}]", from_id);
+
+                // Enforce 5-try lockout counter and dynamic PIN verification
+                match state.verify_incoming_pin(from_id, candidate_pin).await {
+                    PinVerificationResult::LockedOut { message } => {
+                        eprintln!("  🛡️ [Security] Blocked incoming connection from [{}]: {}", from_id, message);
+                        let reject_msg = serde_json::json!({
+                            "type": "CONNECT_RESPONSE",
+                            "toId": from_id,
+                            "accepted": false,
+                            "reason": message
+                        });
+                        let _ = state.broker_tx.send(reject_msg).await;
+                        let _ = state.ui_events_tx.send(serde_json::json!({
+                            "type": "SECURITY_LOCKOUT",
+                            "peer_id": from_id,
+                            "reason": message
+                        }));
+                        return;
+                    }
+                    PinVerificationResult::InvalidPin { attempts, remaining } => {
+                        let err_msg = format!("Security verification failed: Invalid PIN. Attempt {} of 5 before lockout.", attempts);
+                        eprintln!("  🛡️ [Security] Rejected incoming connection from [{}]: {}", from_id, err_msg);
+                        let reject_msg = serde_json::json!({
+                            "type": "CONNECT_RESPONSE",
+                            "toId": from_id,
+                            "accepted": false,
+                            "reason": err_msg
+                        });
+                        let _ = state.broker_tx.send(reject_msg).await;
+                        let _ = state.ui_events_tx.send(serde_json::json!({
+                            "type": "PIN_VERIFICATION_FAILED",
+                            "peer_id": from_id,
+                            "attempts": attempts,
+                            "remaining": remaining
+                        }));
+                        return;
+                    }
+                    PinVerificationResult::Success => {
+                        println!("  🔐 PIN successfully verified for incoming peer [{}]", from_id);
+                    }
+                }
 
                 let session_id = format!("sess-{}", from_id);
                 let mut session = ActiveSession::new(session_id, from_id.to_string(), dev_id.to_string());
@@ -2756,6 +2964,8 @@ mod tests {
             driver_client,
             filter_client,
             session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            dynamic_pin: Arc::new(RwLock::new(get_initial_session_pin())),
+            failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
         });
 
         // Set up session 1 (device 101) and session 2 (device 102)
@@ -2828,6 +3038,8 @@ mod tests {
             driver_client,
             filter_client,
             session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            dynamic_pin: Arc::new(RwLock::new(get_initial_session_pin())),
+            failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
         });
 
         // Setup an unsupported vendor URB submit frame (non-GET_DESCRIPTOR)
@@ -2847,5 +3059,211 @@ mod tests {
         assert_eq!(resp_hdr.sequence_id, 42);
         assert_eq!(resp_hdr.status, 0xC00000BB_u32 as i32, "Unsupported URB must return STATUS_NOT_SUPPORTED");
         assert_eq!(resp_hdr.actual_length, 0);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_csprng_pin_generation_and_rotation() {
+        let pin1 = generate_csprng_pin();
+        let pin2 = generate_csprng_pin();
+
+        assert_eq!(pin1.len(), 7, "PIN must be formatted as 'XXX XXX'");
+        assert_eq!(pin2.len(), 7, "PIN must be formatted as 'XXX XXX'");
+        assert_eq!(&pin1[3..4], " ", "PIN must contain space at index 3");
+
+        let clean1: u32 = pin1.replace(' ', "").parse().expect("PIN 1 must be numeric");
+        let clean2: u32 = pin2.replace(' ', "").parse().expect("PIN 2 must be numeric");
+        assert!(clean1 >= 100_000 && clean1 <= 999_999);
+        assert!(clean2 >= 100_000 && clean2 <= 999_999);
+
+        // Over 10 iterations, generated PINs must demonstrate entropy
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..10 {
+            distinct.insert(generate_csprng_pin());
+        }
+        assert!(distinct.len() > 1, "CSPRNG PIN generation must produce distinct values");
+
+        // Verify rotation on state
+        let (broker_tx, _) = mpsc::channel(16);
+        let (binary_outbound_tx, _) = mpsc::channel(16);
+        let (ui_events_tx, mut ui_rx) = broadcast::channel(16);
+        let state = Arc::new(DaemonState {
+            identity: NodeIdentity::load_or_generate(),
+            devices: RwLock::new(vec![]),
+            remote_devices: RwLock::new(vec![]),
+            active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            broker_tx,
+            binary_outbound_tx,
+            ui_events_tx,
+            broker_connected: AtomicBool::new(true),
+            start_time: Instant::now(),
+            broker_url: "ws://127.0.0.1:8080".to_string(),
+            active_license: RwLock::new(None),
+            local_api_token: std::sync::RwLock::new("test-token".to_string()),
+            driver_client: Arc::new(VhciDriverClient::default()),
+            filter_client: Arc::new(FilterDriverClient::default()),
+            session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            dynamic_pin: Arc::new(RwLock::new("111 222".to_string())),
+            failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
+        });
+
+        assert_eq!(state.get_pin().await, "111 222");
+        let rotated = state.rotate_pin().await;
+        assert_ne!(rotated, "111 222");
+        assert_eq!(state.get_pin().await, rotated);
+
+        // Check broadcast event
+        let evt = ui_rx.recv().await.expect("PIN_ROTATED event must be broadcast");
+        assert_eq!(evt["type"], "PIN_ROTATED");
+        assert_eq!(evt["pin"], rotated);
+    }
+
+    #[tokio::test]
+    async fn test_pin_5_try_lockout_and_6th_attempt_blocked() {
+        let (broker_tx, _) = mpsc::channel(16);
+        let (binary_outbound_tx, _) = mpsc::channel(16);
+        let (ui_events_tx, _) = broadcast::channel(16);
+        let state = Arc::new(DaemonState {
+            identity: NodeIdentity::load_or_generate(),
+            devices: RwLock::new(vec![]),
+            remote_devices: RwLock::new(vec![]),
+            active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            broker_tx,
+            binary_outbound_tx,
+            ui_events_tx,
+            broker_connected: AtomicBool::new(true),
+            start_time: Instant::now(),
+            broker_url: "ws://127.0.0.1:8080".to_string(),
+            active_license: RwLock::new(None),
+            local_api_token: std::sync::RwLock::new("test-token".to_string()),
+            driver_client: Arc::new(VhciDriverClient::default()),
+            filter_client: Arc::new(FilterDriverClient::default()),
+            session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            dynamic_pin: Arc::new(RwLock::new("999 888".to_string())),
+            failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
+        });
+
+        let attacker_id = "attacker-node-1";
+
+        // Attempts 1 to 4 must return InvalidPin with decrementing remaining counts
+        for i in 1..=4 {
+            let res = state.verify_incoming_pin(attacker_id, "000 000").await;
+            match res {
+                PinVerificationResult::InvalidPin { attempts, remaining } => {
+                    assert_eq!(attempts, i);
+                    assert_eq!(remaining, 5 - i);
+                }
+                other => panic!("Expected InvalidPin on attempt {}, got {:?}", i, other),
+            }
+        }
+
+        // 5th attempt must trigger LockOut
+        let res5 = state.verify_incoming_pin(attacker_id, "000 000").await;
+        match res5 {
+            PinVerificationResult::LockedOut { message } => {
+                assert!(message.contains("Security lockout"));
+                assert!(message.contains("15 minutes"));
+            }
+            other => panic!("Expected LockedOut on 5th attempt, got {:?}", other),
+        }
+
+        // 6th attempt (even with CORRECT PIN!) must be strictly blocked due to active lockout
+        let res6 = state.verify_incoming_pin(attacker_id, "999 888").await;
+        match res6 {
+            PinVerificationResult::LockedOut { message } => {
+                assert!(message.contains("Security lockout"));
+            }
+            other => panic!("Expected LockedOut on 6th attempt, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pin_successful_verification_resets_counter() {
+        let (broker_tx, _) = mpsc::channel(16);
+        let (binary_outbound_tx, _) = mpsc::channel(16);
+        let (ui_events_tx, _) = broadcast::channel(16);
+        let state = Arc::new(DaemonState {
+            identity: NodeIdentity::load_or_generate(),
+            devices: RwLock::new(vec![]),
+            remote_devices: RwLock::new(vec![]),
+            active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            broker_tx,
+            binary_outbound_tx,
+            ui_events_tx,
+            broker_connected: AtomicBool::new(true),
+            start_time: Instant::now(),
+            broker_url: "ws://127.0.0.1:8080".to_string(),
+            active_license: RwLock::new(None),
+            local_api_token: std::sync::RwLock::new("test-token".to_string()),
+            driver_client: Arc::new(VhciDriverClient::default()),
+            filter_client: Arc::new(FilterDriverClient::default()),
+            session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            dynamic_pin: Arc::new(RwLock::new("555 444".to_string())),
+            failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
+        });
+
+        let peer = "peer-reset-test";
+
+        // 3 failed attempts
+        for _ in 0..3 {
+            let res = state.verify_incoming_pin(peer, "111 111").await;
+            assert!(matches!(res, PinVerificationResult::InvalidPin { .. }));
+        }
+
+        {
+            let map = state.failed_pin_attempts.lock().await;
+            assert_eq!(map.get(peer).unwrap().0, 3);
+        }
+
+        // Valid attempt resets counter
+        let valid_res = state.verify_incoming_pin(peer, "555 444").await;
+        assert_eq!(valid_res, PinVerificationResult::Success);
+
+        {
+            let map = state.failed_pin_attempts.lock().await;
+            assert!(!map.contains_key(peer), "Successful PIN verification must remove failure record");
+        }
+
+        // Subsequent failure starts from attempt 1
+        let next_fail = state.verify_incoming_pin(peer, "000 000").await;
+        assert_eq!(next_fail, PinVerificationResult::InvalidPin { attempts: 1, remaining: 4 });
+    }
+
+    #[tokio::test]
+    async fn test_pin_lockout_expired_cleanup() {
+        let (broker_tx, _) = mpsc::channel(16);
+        let (binary_outbound_tx, _) = mpsc::channel(16);
+        let (ui_events_tx, _) = broadcast::channel(16);
+        let state = Arc::new(DaemonState {
+            identity: NodeIdentity::load_or_generate(),
+            devices: RwLock::new(vec![]),
+            remote_devices: RwLock::new(vec![]),
+            active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            broker_tx,
+            binary_outbound_tx,
+            ui_events_tx,
+            broker_connected: AtomicBool::new(true),
+            start_time: Instant::now(),
+            broker_url: "ws://127.0.0.1:8080".to_string(),
+            active_license: RwLock::new(None),
+            local_api_token: std::sync::RwLock::new("test-token".to_string()),
+            driver_client: Arc::new(VhciDriverClient::default()),
+            filter_client: Arc::new(FilterDriverClient::default()),
+            session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            dynamic_pin: Arc::new(RwLock::new("777 888".to_string())),
+            failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
+        });
+
+        let peer = "expired-peer";
+
+        // Seed with 5 failed attempts from 901 seconds ago (> 900s timeout)
+        {
+            let mut map = state.failed_pin_attempts.lock().await;
+            let past = Instant::now() - Duration::from_secs(901);
+            map.insert(peer.to_string(), (5, past));
+        }
+
+        // Calling verify with correct PIN after expiration should prune expired entry and succeed
+        let res = state.verify_incoming_pin(peer, "777 888").await;
+        assert_eq!(res, PinVerificationResult::Success, "Expired lockout must be pruned and valid PIN accepted");
     }
 }

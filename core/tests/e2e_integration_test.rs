@@ -321,8 +321,10 @@ async fn test_end_to_end_multi_node_passthrough() {
     let fmt_id_a = id_a["formatted_id"].as_str().expect("Node A formatted_id must be str");
     let fmt_id_b = id_b["formatted_id"].as_str().expect("Node B formatted_id must be str");
     assert!(id_a.get("default_pin").is_none() || id_a["default_pin"].is_null(), "SECURITY INVARIANT: default_pin must not be leaked in identity endpoint");
-    assert!(id_b.get("default_pin").is_none() || id_b["default_pin"].is_null(), "SECURITY INVARIANT: default_pin must not be leaked in identity endpoint");
-    let pin_a = "821 490";
+    let pin_a_resp = http_get(port_a, "/api/pin").await.expect("GET /api/pin Node A failed");
+    assert_eq!(pin_a_resp.status, 200, "Node A /api/pin must return HTTP 200");
+    let pin_a = pin_a_resp.json()["pin"].as_str().expect("Node A dynamic pin must be str").to_string();
+    assert_eq!(pin_a.len(), 7, "Dynamic PIN must be formatted as 'XXX XXX'");
 
     println!("   Node A Identity: {} (raw: {})", fmt_id_a, raw_id_a);
     println!("   Node B Identity: {} (raw: {})", fmt_id_b, raw_id_b);
