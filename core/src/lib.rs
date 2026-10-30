@@ -41,8 +41,8 @@ pub use driver_client::{
 pub use enumerator::{HardwareEnumerator, UsbDeviceInfo};
 pub use hardware_db::{DeviceCategory, HardwareClassifier};
 pub use identity::{
-    validate_connection_id_format, verify_registration_proof, Ed25519Keypair, InstallationKeypair,
-    NodeIdentity,
+    derive_id_from_public_key, is_dummy_uuid, validate_connection_id_format,
+    verify_registration_proof, Ed25519Keypair, InstallationKeypair, NodeIdentity,
 };
 pub use licensing::{
     LicenseClaims, LicenseEngine, LicenseError, BHARTX_PRODUCTION_ROOT_LICENSE_PUBKEY,

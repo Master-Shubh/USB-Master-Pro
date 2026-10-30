@@ -109,25 +109,19 @@ impl LicenseEngine {
         InstallationKeypair::from_seed(&BHARTX_TEST_ROOT_SEED)
     }
 
-    /// Obtains the BhartX Root CA keypair for testing and synthetic token generation.
-    /// Prefers the offline production keypair if present at `/home/shubh/.config/bhartx/licensing/production_root_ca.key`
-    /// (or custom path via BHARTX_PRODUCTION_ROOT_KEY_PATH).
-    /// Falls back to the test CA keypair.
+    /// Obtains the BhartX Test Root CA keypair for hermetic in-tree testing.
+    /// Strictly isolated from the Production Root CA.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn root_ca_keypair() -> InstallationKeypair {
-        if let Some(kp) = Self::load_offline_production_keypair() {
-            kp
-        } else {
-            Self::test_ca_keypair()
-        }
+        Self::test_ca_keypair()
     }
 
-    /// Loads the offline production root keypair from the filesystem if present.
+    /// Loads the offline production root keypair from the filesystem if explicitly provided via env var.
     /// Gated exclusively to test / test-utils. NEVER compiled into production client builds.
+    /// SECURITY INVARIANT: No dev-box local paths (~/.config/...) may ever be hardcoded in repository code.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn load_offline_production_keypair() -> Option<InstallationKeypair> {
-        let key_path = std::env::var("BHARTX_PRODUCTION_ROOT_KEY_PATH")
-            .unwrap_or_else(|_| "/home/shubh/.config/bhartx/licensing/production_root_ca.key".to_string());
+        let key_path = std::env::var("BHARTX_PRODUCTION_ROOT_KEY_PATH").ok()?;
         if let Ok(bytes) = std::fs::read(&key_path) {
             if bytes.len() == 32 {
                 let mut seed = [0u8; 32];
@@ -387,6 +381,16 @@ mod tests {
         // Production verifier MUST strictly reject tokens signed by the compromised test seed
         let result = LicenseEngine::verify_token(&token, hw_hash);
         assert_eq!(result, Err(LicenseError::CryptographicSignatureFailed));
+    }
+
+    #[test]
+    fn test_hermetic_ca_isolation() {
+        let test_kp = LicenseEngine::test_ca_keypair();
+        let root_kp = LicenseEngine::root_ca_keypair();
+        // root_ca_keypair strictly delegates to test_ca_keypair
+        assert_eq!(test_kp.public_key, root_kp.public_key);
+        // Test CA public key must NEVER match the production root public key
+        assert_ne!(*test_kp.public_key(), BHARTX_PRODUCTION_ROOT_LICENSE_PUBKEY);
     }
 
     #[test]

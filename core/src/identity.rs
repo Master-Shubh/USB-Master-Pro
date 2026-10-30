@@ -117,6 +117,282 @@ pub fn validate_connection_id_format(id_str: &str) -> bool {
     clean.len() == 9 && clean.chars().all(|c| c.is_ascii_digit())
 }
 
+/// Sanitizes and checks whether an SMBIOS UUID or hardware identifier is an invalid or dummy string.
+pub fn is_dummy_uuid(uuid: &str) -> bool {
+    let s = uuid.trim().to_lowercase();
+    if s.is_empty() {
+        return true;
+    }
+    const BLACKLIST: &[&str] = &[
+        "00000000-0000-0000-0000-000000000000",
+        "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "to be filled by o.e.m.",
+        "default string",
+        "none",
+        "unknown",
+    ];
+    if BLACKLIST.iter().any(|&b| s == b || s.contains(b)) {
+        return true;
+    }
+    let stripped: String = s.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if !stripped.is_empty() && (stripped.chars().all(|c| c == '0') || stripped.chars().all(|c| c == 'f')) {
+        return true;
+    }
+    false
+}
+
+/// Derives raw 9-digit ID, formatted 9-digit ID, and default pin from an InstallationKeypair's public key.
+/// Derives ID from SHA-256 of the 32-byte Ed25519 public key, cryptographically anchoring the node identity
+/// to prevent ID squatting while maintaining the standard 9-digit human-readable format.
+pub fn derive_id_from_public_key(public_key: &[u8; 32]) -> (u32, String, String) {
+    let mut id_hasher = Sha256::new();
+    id_hasher.update(b"USB_MASTER_NODE_ID_V1");
+    id_hasher.update(public_key);
+    let id_hash = id_hasher.finalize();
+
+    // Derive 9-digit integer in range [100_000_000 .. 999_999_999]
+    let slice = &id_hash[0..4];
+    let num = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
+    let raw_id = 100_000_000 + (num % 900_000_000);
+
+    let s = raw_id.to_string();
+    let formatted_id = format!("{} {} {}", &s[0..3], &s[3..6], &s[6..9]);
+
+    // Derive 6-digit pin from bytes 4..8
+    let pin_slice = &id_hash[4..8];
+    let pin_num = u32::from_be_bytes([pin_slice[0], pin_slice[1], pin_slice[2], pin_slice[3]]);
+    let pin_val = 100_000 + (pin_num % 900_000);
+    let pin_s = pin_val.to_string();
+    let default_pin = format!("{} {}", &pin_s[0..3], &pin_s[3..6]);
+
+    (raw_id, formatted_id, default_pin)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn collect_platform_hardware_ids() -> (String, String) {
+    let hostname = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "Host".to_string());
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "User".to_string());
+    let arch_info = std::env::consts::ARCH;
+
+    let machine_id = fs::read_to_string("/etc/machine-id")
+        .or_else(|_| fs::read_to_string("/var/lib/dbus/machine-id"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| format!("{}-{}-{}", hostname, username, arch_info));
+
+    let bios_uuid = fs::read_to_string("/sys/class/dmi/id/product_uuid")
+        .or_else(|_| fs::read_to_string("/sys/devices/virtual/dmi/id/product_uuid"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    let bios_uuid = if is_dummy_uuid(&bios_uuid) {
+        String::new()
+    } else {
+        bios_uuid
+    };
+
+    (machine_id, bios_uuid)
+}
+
+#[cfg(target_os = "windows")]
+fn query_windows_machine_guid_reg() -> Option<String> {
+    use std::process::Command;
+    let output = Command::new("reg")
+        .args(["query", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("MachineGuid") {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let guid = parts[2].trim();
+                if !guid.is_empty() && !is_dummy_uuid(guid) {
+                    return Some(guid.to_string());
+                }
+            } else if let Some(val) = parts.last() {
+                if !val.is_empty() && *val != "MachineGuid" && *val != "REG_SZ" && !is_dummy_uuid(val) {
+                    return Some((*val).to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn query_windows_machine_guid_powershell() -> Option<String> {
+    use std::process::Command;
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            r"(Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography').MachineGuid",
+        ])
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !val.is_empty() && !is_dummy_uuid(&val) {
+            return Some(val);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn query_windows_machine_guid() -> Option<String> {
+    query_windows_machine_guid_reg().or_else(query_windows_machine_guid_powershell)
+}
+
+#[cfg(target_os = "windows")]
+fn query_windows_smbios_uuid() -> Option<String> {
+    use std::process::Command;
+    if let Ok(output) = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_ComputerSystemProduct).UUID",
+        ])
+        .output()
+    {
+        if output.status.success() {
+            let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !val.is_empty() && !is_dummy_uuid(&val) {
+                return Some(val);
+            }
+        }
+    }
+
+    if let Ok(output) = Command::new("wmic")
+        .args(["csproduct", "get", "uuid"])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.eq_ignore_ascii_case("uuid")
+                    && !is_dummy_uuid(trimmed)
+                {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn query_windows_fallback_hardware_id() -> Option<String> {
+    use std::process::Command;
+    // BaseBoard Serial via PowerShell
+    if let Ok(output) = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_BaseBoard).SerialNumber",
+        ])
+        .output()
+    {
+        if output.status.success() {
+            let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !val.is_empty() && !is_dummy_uuid(&val) {
+                return Some(format!("baseboard:{}", val));
+            }
+        }
+    }
+
+    // BaseBoard Serial via wmic
+    if let Ok(output) = Command::new("wmic")
+        .args(["baseboard", "get", "serialnumber"])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.eq_ignore_ascii_case("serialnumber")
+                    && !is_dummy_uuid(trimmed)
+                {
+                    return Some(format!("baseboard:{}", trimmed));
+                }
+            }
+        }
+    }
+
+    // Processor ID via PowerShell
+    if let Ok(output) = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_Processor).ProcessorId",
+        ])
+        .output()
+    {
+        if output.status.success() {
+            let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !val.is_empty() && !is_dummy_uuid(&val) {
+                return Some(format!("cpu:{}", val));
+            }
+        }
+    }
+
+    // Processor ID via wmic
+    if let Ok(output) = Command::new("wmic")
+        .args(["cpu", "get", "processorid"])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.eq_ignore_ascii_case("processorid")
+                    && !is_dummy_uuid(trimmed)
+                {
+                    return Some(format!("cpu:{}", trimmed));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn collect_platform_hardware_ids() -> (String, String) {
+    let hostname = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "Host".to_string());
+    let username = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "User".to_string());
+    let arch_info = std::env::consts::ARCH;
+
+    let machine_id = query_windows_machine_guid()
+        .unwrap_or_else(|| format!("{}-{}-{}", hostname, username, arch_info));
+
+    let bios_uuid = query_windows_smbios_uuid()
+        .or_else(query_windows_fallback_hardware_id)
+        .unwrap_or_default();
+
+    (machine_id, bios_uuid)
+}
+
 impl NodeIdentity {
     /// Discovers or generates the node's persistent 9-digit identity
     pub fn load_or_generate() -> Self {
@@ -131,20 +407,8 @@ impl NodeIdentity {
                     hasher.finalize().to_vec()
                 });
 
-                let slice = if hash_bytes.len() >= 4 { &hash_bytes[0..4] } else { &[0u8; 4] };
-                let num = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
-                let raw_id = 100_000_000 + (num % 900_000_000);
-
-                let s = raw_id.to_string();
-                let formatted_id = format!("{} {} {}", &s[0..3], &s[3..6], &s[6..9]);
-
-                let pin_slice = if hash_bytes.len() >= 8 { &hash_bytes[4..8] } else { &[0u8; 4] };
-                let pin_num = u32::from_be_bytes([pin_slice[0], pin_slice[1], pin_slice[2], pin_slice[3]]);
-                let pin_val = 100_000 + (pin_num % 900_000);
-                let pin_s = pin_val.to_string();
-                let default_pin = format!("{} {}", &pin_s[0..3], &pin_s[3..6]);
-
                 let keypair = InstallationKeypair::from_hardware_entropy(&hash_bytes);
+                let (raw_id, formatted_id, default_pin) = derive_id_from_public_key(keypair.public_key());
 
                 return Self {
                     raw_id,
@@ -157,39 +421,24 @@ impl NodeIdentity {
         }
 
         // Collect hardware characteristics
+        let (machine_id, bios_uuid) = collect_platform_hardware_ids();
         let hostname = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")).unwrap_or_else(|_| "Host".to_string());
-        let username = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "User".to_string());
         let os_info = std::env::consts::OS;
         let arch_info = std::env::consts::ARCH;
 
-        // Try reading machine-id on Linux, or computer UUID on Windows
-        let machine_id = fs::read_to_string("/etc/machine-id")
-            .or_else(|_| fs::read_to_string("/var/lib/dbus/machine-id"))
-            .unwrap_or_else(|_| format!("{}-{}-{}", hostname, username, arch_info));
-
+        // Hash combination: SHA-256 of (machine_id + bios_uuid + os + arch) + hostname for single-host multi-node test isolation
         let mut hasher = Sha256::new();
         hasher.update(machine_id.trim().as_bytes());
-        hasher.update(hostname.as_bytes());
+        hasher.update(bios_uuid.trim().as_bytes());
         hasher.update(os_info.as_bytes());
+        hasher.update(arch_info.as_bytes());
+        hasher.update(hostname.as_bytes());
         let hash = hasher.finalize();
         let hardware_hash = hex::encode(hash);
 
-        // Derive 9-digit integer in range [100_000_000 .. 999_999_999]
-        let slice = &hash[0..4];
-        let num = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
-        let raw_id = 100_000_000 + (num % 900_000_000);
-
-        let s = raw_id.to_string();
-        let formatted_id = format!("{} {} {}", &s[0..3], &s[3..6], &s[6..9]);
-
-        // Derive 6-digit pin
-        let pin_slice = &hash[4..8];
-        let pin_num = u32::from_be_bytes([pin_slice[0], pin_slice[1], pin_slice[2], pin_slice[3]]);
-        let pin_val = 100_000 + (pin_num % 900_000);
-        let pin_s = pin_val.to_string();
-        let default_pin = format!("{} {}", &pin_s[0..3], &pin_s[3..6]);
-
+        // Derive InstallationKeypair and anchor the 9-digit ID to the keypair's public key
         let keypair = InstallationKeypair::from_hardware_entropy(hash.as_slice());
+        let (raw_id, formatted_id, default_pin) = derive_id_from_public_key(keypair.public_key());
 
         Self {
             raw_id,
@@ -398,6 +647,59 @@ mod tests {
             nonce,
             "deadbeef"
         ));
+    }
+
+    #[test]
+    fn test_dummy_uuid_sanitization() {
+        assert!(is_dummy_uuid("00000000-0000-0000-0000-000000000000"));
+        assert!(is_dummy_uuid("FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"));
+        assert!(is_dummy_uuid("ffffffff-ffff-ffff-ffff-ffffffffffff"));
+        assert!(is_dummy_uuid("to be filled by o.e.m."));
+        assert!(is_dummy_uuid("To Be Filled By O.E.M."));
+        assert!(is_dummy_uuid("default string"));
+        assert!(is_dummy_uuid("Default String"));
+        assert!(is_dummy_uuid("none"));
+        assert!(is_dummy_uuid("unknown"));
+        assert!(is_dummy_uuid(""));
+        assert!(is_dummy_uuid("   "));
+        assert!(is_dummy_uuid("00000000000000000000000000000000"));
+
+        // Valid UUIDs must not be blacklisted
+        assert!(!is_dummy_uuid("d1681ba1-512c-473d-82d2-ca4b1a41e974"));
+        assert!(!is_dummy_uuid("4C4C4544-004A-4810-8053-C7C04F475632"));
+    }
+
+    #[test]
+    fn test_derive_id_from_public_key_cryptographic_properties() {
+        let kp1 = InstallationKeypair::generate();
+        let kp2 = InstallationKeypair::generate();
+
+        let (raw1, fmt1, pin1) = derive_id_from_public_key(kp1.public_key());
+        let (raw2, fmt2, pin2) = derive_id_from_public_key(kp2.public_key());
+
+        // Range checks
+        assert!(raw1 >= 100_000_000 && raw1 <= 999_999_999);
+        assert!(raw2 >= 100_000_000 && raw2 <= 999_999_999);
+        assert_eq!(fmt1.len(), 11);
+        assert_eq!(fmt2.len(), 11);
+        assert_eq!(pin1.len(), 7);
+        assert_eq!(pin2.len(), 7);
+
+        // Validation format
+        assert!(validate_connection_id_format(&fmt1));
+        assert!(validate_connection_id_format(&raw1.to_string()));
+        assert!(validate_connection_id_format(&fmt2));
+        assert!(validate_connection_id_format(&raw2.to_string()));
+
+        // Distinct keypairs must produce distinct IDs
+        assert_ne!(raw1, raw2);
+        assert_ne!(fmt1, fmt2);
+
+        // Determinism: same keypair public key produces identical ID
+        let (raw1_repeat, fmt1_repeat, pin1_repeat) = derive_id_from_public_key(kp1.public_key());
+        assert_eq!(raw1, raw1_repeat);
+        assert_eq!(fmt1, fmt1_repeat);
+        assert_eq!(pin1, pin1_repeat);
     }
 }
 
