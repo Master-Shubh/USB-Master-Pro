@@ -444,12 +444,42 @@ async function runTests() {
       console.log('   ✅ Test 6 Passed: Binary Turbo-URB zero-copy frame relay verified.');
     }
 
+    // -------------------------------------------------------------------------
+    // Test 7: Binary frame rate limit (500 fps flood guard) drops excess frames
+    // -------------------------------------------------------------------------
+    console.log('👉 [Test 7] Binary frame rate limit (500 fps flood guard)...');
+    {
+      // Wait for rate limit window to roll over cleanly
+      await new Promise(r => setTimeout(r, 1100));
+
+      let receivedCount = 0;
+      const onMessage = (data, isBinary) => {
+        if (isBinary || (Buffer.isBuffer(data) && data.length >= 4 && (data[0] !== 0x7B && data[0] !== 0x20))) {
+          receivedCount++;
+        }
+      };
+      registeredWsA.on('message', onMessage);
+
+      // Send 505 binary frames from B in a tight burst
+      const frame = Buffer.from('TURB_FLOOD_TEST');
+      for (let i = 0; i < 505; i++) {
+        registeredWsB.send(frame, { binary: true });
+      }
+
+      // Wait 300ms for network queue draining
+      await new Promise(r => setTimeout(r, 300));
+      registeredWsA.removeListener('message', onMessage);
+
+      assert.strictEqual(receivedCount, 500, `Expected exactly 500 frames delivered (5 dropped), got ${receivedCount}`);
+      console.log('   ✅ Test 7 Passed: Binary frame burst rate limit strictly enforced (excess dropped).');
+    }
+
     // Cleanup sockets
     if (registeredWsA) registeredWsA.close();
     if (registeredWsB) registeredWsB.close();
 
     console.log('\n================================================================================');
-    console.log('  🎉 ALL 6 SECURITY REGRESSION TESTS PASSED CLEANLY (100% PASS)');
+    console.log('  🎉 ALL 7 SECURITY REGRESSION TESTS PASSED CLEANLY (100% PASS)');
     console.log('================================================================================\n');
 
   } finally {

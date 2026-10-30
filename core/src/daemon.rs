@@ -182,12 +182,13 @@ pub struct DaemonTelemetry {
 
 /// Async Tokio URB pump worker task handles and data channels for an active session
 pub struct SessionPumpHandles {
+    pub peer_id: String,
+    pub device_id: u32,
     pub vhci_to_net_task: tokio::task::JoinHandle<()>,
     pub net_to_vhci_task: tokio::task::JoinHandle<()>,
     pub net_fwd_task: tokio::task::JoinHandle<()>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub session_data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    pub vhci_out_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
 }
 
 pub struct DaemonState {
@@ -1346,14 +1347,15 @@ pub async fn spawn_session_pumps(
     });
 
     pumps.insert(
-        clean_peer_id,
+        clean_peer_id.clone(),
         SessionPumpHandles {
+            peer_id: clean_peer_id,
+            device_id,
             vhci_to_net_task,
             net_to_vhci_task,
             net_fwd_task,
             shutdown_tx,
             session_data_tx: net_to_vhci_tx,
-            vhci_out_rx: Arc::new(tokio::sync::Mutex::new(tokio::sync::mpsc::channel(1).1)),
         },
     );
 }
@@ -1415,6 +1417,7 @@ pub async fn execute_session_disconnect(
         let _ = handles.shutdown_tx.send(true);
         handles.vhci_to_net_task.abort();
         handles.net_to_vhci_task.abort();
+        handles.net_fwd_task.abort();
         println!("  🛑 Aborted URB pump tasks for peer [{}]", clean_peer_id);
     }
     drop(pumps);
@@ -1927,11 +1930,19 @@ async fn handle_incoming_binary_urb_frame(state: &Arc<DaemonState>, bytes: Vec<u
 
     if let Ok(header) = TurboUrbHeader::deserialize_single_urb(&bytes[..TurboUrbHeader::SIZE]) {
         if header.command == CMD_COMPLETE_URB {
-            // Guest side: Completed URB from remote Host!
-            // Dispatch to active session pump to complete in anyusb_vhci.sys
-            let pumps = state.session_pumps.lock().await;
-            for pump in pumps.values() {
-                let _ = pump.session_data_tx.send(bytes.clone()).await;
+            // Lookup target session_data_tx while holding the lock briefly
+            let target_tx = {
+                let pumps = state.session_pumps.lock().await;
+                pumps.values()
+                    .find(|p| p.device_id == header.device_id)
+                    .or_else(|| if pumps.len() == 1 { pumps.values().next() } else { None })
+                    .map(|p| p.session_data_tx.clone())
+            }; // Mutex lock is explicitly dropped here! (Solves N-06)
+
+            if let Some(tx) = target_tx {
+                let _ = tx.send(bytes).await; // Sent outside the lock! (Solves N-04 and N-06)
+            } else {
+                eprintln!("[Daemon] Dropping orphaned CMD_COMPLETE_URB for device_id {}", header.device_id);
             }
         } else if header.command == CMD_SUBMIT_URB {
             // Host side: Submitted URB from remote Guest!
@@ -2016,6 +2027,9 @@ async fn handle_host_urb_submission(
         actual_len,
     );
     resp_header.actual_length = actual_len;
+    if response_data.is_empty() {
+        resp_header.status = 0xC00000BB_u32 as i32; // STATUS_NOT_SUPPORTED
+    }
 
     let mut wire_frame = resp_header.serialize();
     wire_frame.extend_from_slice(&response_data);
@@ -2511,5 +2525,122 @@ mod tests {
         let loaded_raw = parse_and_verify_persisted_license(token, hw_hash)
             .expect("Valid raw token string must be accepted");
         assert_eq!(loaded_raw.license_id, "LIC-2026-BHARTX-CERTIFIED");
+    }
+
+    #[tokio::test]
+    async fn test_targeted_session_routing_and_orphaned_handling() {
+        let (broker_tx, _) = mpsc::channel(16);
+        let (binary_outbound_tx, _) = mpsc::channel(16);
+        let (ui_events_tx, _) = broadcast::channel(16);
+        let driver_client = Arc::new(VhciDriverClient::default());
+        let filter_client = Arc::new(FilterDriverClient::default());
+
+        let state = Arc::new(DaemonState {
+            identity: NodeIdentity::load_or_generate(),
+            devices: RwLock::new(vec![]),
+            remote_devices: RwLock::new(vec![]),
+            active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            broker_tx,
+            binary_outbound_tx,
+            ui_events_tx,
+            broker_connected: AtomicBool::new(true),
+            start_time: Instant::now(),
+            broker_url: "ws://127.0.0.1:8080".to_string(),
+            active_license: RwLock::new(None),
+            local_api_token: std::sync::RwLock::new("test-token".to_string()),
+            driver_client,
+            filter_client,
+            session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        });
+
+        // Set up session 1 (device 101) and session 2 (device 102)
+        let (tx1, mut rx1) = tokio::sync::mpsc::channel(16);
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(16);
+        let (shut_tx1, _) = tokio::sync::watch::channel(false);
+        let (shut_tx2, _) = tokio::sync::watch::channel(false);
+
+        {
+            let mut pumps = state.session_pumps.lock().await;
+            pumps.insert("peer1".to_string(), SessionPumpHandles {
+                peer_id: "peer1".to_string(),
+                device_id: 101,
+                vhci_to_net_task: tokio::spawn(async {}),
+                net_to_vhci_task: tokio::spawn(async {}),
+                net_fwd_task: tokio::spawn(async {}),
+                shutdown_tx: shut_tx1,
+                session_data_tx: tx1,
+            });
+            pumps.insert("peer2".to_string(), SessionPumpHandles {
+                peer_id: "peer2".to_string(),
+                device_id: 102,
+                vhci_to_net_task: tokio::spawn(async {}),
+                net_to_vhci_task: tokio::spawn(async {}),
+                net_fwd_task: tokio::spawn(async {}),
+                shutdown_tx: shut_tx2,
+                session_data_tx: tx2,
+            });
+        }
+
+        // 1. Send CMD_COMPLETE_URB targeting device 101
+        let hdr1 = TurboUrbHeader::new(CMD_COMPLETE_URB, 1, 101, 0x81, TransferType::Bulk, 0);
+        let bytes1 = hdr1.serialize();
+        handle_incoming_binary_urb_frame(&state, bytes1.clone()).await;
+
+        let res1 = rx1.try_recv().expect("Session 1 must receive frame for device 101");
+        assert_eq!(res1, bytes1);
+        assert!(rx2.try_recv().is_err(), "Session 2 must NOT receive frame for device 101");
+
+        // 2. Send CMD_COMPLETE_URB targeting unknown device 999 (orphaned)
+        let hdr_orphan = TurboUrbHeader::new(CMD_COMPLETE_URB, 2, 999, 0x81, TransferType::Bulk, 0);
+        let bytes_orphan = hdr_orphan.serialize();
+        handle_incoming_binary_urb_frame(&state, bytes_orphan).await;
+
+        assert!(rx1.try_recv().is_err(), "Session 1 must not receive orphaned frame");
+        assert!(rx2.try_recv().is_err(), "Session 2 must not receive orphaned frame");
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_urb_returns_status_not_supported() {
+        let (broker_tx, _) = mpsc::channel(16);
+        let (binary_outbound_tx, mut binary_outbound_rx) = mpsc::channel(16);
+        let (ui_events_tx, _) = broadcast::channel(16);
+        let driver_client = Arc::new(VhciDriverClient::default());
+        let filter_client = Arc::new(FilterDriverClient::default());
+
+        let state = Arc::new(DaemonState {
+            identity: NodeIdentity::load_or_generate(),
+            devices: RwLock::new(vec![]),
+            remote_devices: RwLock::new(vec![]),
+            active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            broker_tx,
+            binary_outbound_tx,
+            ui_events_tx,
+            broker_connected: AtomicBool::new(true),
+            start_time: Instant::now(),
+            broker_url: "ws://127.0.0.1:8080".to_string(),
+            active_license: RwLock::new(None),
+            local_api_token: std::sync::RwLock::new("test-token".to_string()),
+            driver_client,
+            filter_client,
+            session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        });
+
+        // Setup an unsupported vendor URB submit frame (non-GET_DESCRIPTOR)
+        let submit_hdr = TurboUrbHeader::new(CMD_SUBMIT_URB, 42, 101, 0x00, TransferType::Control, 8);
+        let mut frame = submit_hdr.serialize();
+        // Setup packet: Vendor Request 0xFF (not GET_DESCRIPTOR)
+        let setup_packet = [0x40, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        frame.extend_from_slice(&setup_packet);
+
+        handle_host_urb_submission(&state, &submit_hdr, &frame).await;
+
+        let resp_frame = binary_outbound_rx.recv().await.expect("Must produce response");
+        let resp_hdr = TurboUrbHeader::deserialize_single_urb(&resp_frame[..TurboUrbHeader::SIZE])
+            .expect("Valid header");
+
+        assert_eq!(resp_hdr.command, CMD_COMPLETE_URB);
+        assert_eq!(resp_hdr.sequence_id, 42);
+        assert_eq!(resp_hdr.status, 0xC00000BB_u32 as i32, "Unsupported URB must return STATUS_NOT_SUPPORTED");
+        assert_eq!(resp_hdr.actual_length, 0);
     }
 }

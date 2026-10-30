@@ -16,7 +16,7 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use usb_master_core::daemon::{
     derive_numeric_device_id, execute_session_disconnect, ActiveSession, DaemonServer,
-    DaemonState, RemoteMountedDevice,
+    DaemonState, RemoteMountedDevice, SessionPumpHandles,
 };
 #[allow(unused_imports)]
 use usb_master_core::driver_client::{
@@ -478,6 +478,29 @@ async fn test_execute_session_disconnect_cleans_remote_and_local_mounts() {
         session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     });
 
+    let (data_tx, _) = tokio::sync::mpsc::channel(16);
+    let (shut_tx, _) = tokio::sync::watch::channel(false);
+    let t1 = tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await; });
+    let t2 = tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await; });
+    let t3 = tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(60)).await; });
+
+    let t1_handle = t1.abort_handle();
+    let t2_handle = t2.abort_handle();
+    let t3_handle = t3.abort_handle();
+
+    {
+        let mut pumps = state.session_pumps.lock().await;
+        pumps.insert(clean_peer.to_string(), SessionPumpHandles {
+            peer_id: clean_peer.to_string(),
+            device_id: 12345,
+            vhci_to_net_task: t1,
+            net_to_vhci_task: t2,
+            net_fwd_task: t3,
+            shutdown_tx: shut_tx,
+            session_data_tx: data_tx,
+        });
+    }
+
     // Execute disconnect using spaced peer ID
     let disconnected = execute_session_disconnect(
         &state,
@@ -485,6 +508,9 @@ async fn test_execute_session_disconnect_cleans_remote_and_local_mounts() {
         Some("Operator test disconnect".to_string()),
     ).await;
     assert!(disconnected, "execute_session_disconnect must return true when active mounts exist");
+    assert!(t1_handle.is_finished(), "vhci_to_net_task must be aborted on disconnect");
+    assert!(t2_handle.is_finished(), "net_to_vhci_task must be aborted on disconnect");
+    assert!(t3_handle.is_finished(), "net_fwd_task must be aborted on disconnect");
 
     // 1. Verify remote device unmounted
     let rem_devices = state.remote_devices.read().await;

@@ -129,10 +129,27 @@ wss.on('connection', (ws, req) => {
     resetTime: Date.now() + 10000
   };
 
+  // Binary Flood Guard: Max 500 binary frames per second burst cap per peer connection
+  const binaryRateLimit = {
+    count: 0,
+    resetTime: Date.now() + 1000
+  };
+
   ws.on('message', (data, isBinary) => {
     // Zero-overhead binary data relay for active USB forwarding tunnels
     const isBin = isBinary || (Buffer.isBuffer(data) && data.length >= 4 && (data[0] !== 0x7B && data[0] !== 0x20));
     if (isBin) {
+      const now = Date.now();
+      if (now > binaryRateLimit.resetTime) {
+        binaryRateLimit.count = 0;
+        binaryRateLimit.resetTime = now + 1000;
+      }
+      binaryRateLimit.count++;
+      if (binaryRateLimit.count > 500) {
+        console.warn(`[Broker] Binary frame burst limit exceeded (max 500 fps) for socket from ${remoteIp}`);
+        return;
+      }
+
       const targetWs = activePeerPairs.get(ws);
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
         targetWs.send(data, { binary: true });

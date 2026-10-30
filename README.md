@@ -273,7 +273,11 @@ USB Master Pro implements a zero-trust, hardware-anchored cryptographic licensin
 - **Hardware Binding**: Each token cryptographically binds the licensed features to the machine's hardware hash (`hardware_hash`), derived via SHA-256 over platform Motherboard UUID, CPU ID, and BIOS Serial Number. Licenses cannot be cloned or transferred to unauthorized machines.
 - **Air-Gapped Operation**: Zero internet connectivity or phone-home requests required. Ideal for UIDAI Aadhaar Seva Kendras, banking kiosks, and defense workstations.
 
-### 2. Pre-Signed Production Fixture (`core/license.json`)
+### 4. Hardware-Bound Cryptographic License (Synthetic Test Fixture)
+
+> [!NOTE]
+> The fixture below is a synthetic test license used in CI regression suites to verify Ed25519 signature checks and hardware hash binding. It is an automated test fixture, not a commercial deployment or endorsement by any government agency.
+
 Every deployment bundle includes a pre-signed, production-verified license fixture for hermetic evaluation and enterprise validation:
 - **License ID**: `LIC-2026-BHARTX-CERTIFIED`
 - **Customer**: `UIDAI Aadhaar Seva Kendra`
@@ -483,7 +487,7 @@ usb_master_cli.exe gui
 # Query active license details from local daemon:
 curl -s http://127.0.0.1:19842/api/license/status | jq .
 ```
-Expected output:
+Expected output (synthetic CI test fixture):
 ```json
 {
   "active": true,
