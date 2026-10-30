@@ -14,11 +14,17 @@ const PORT = process.env.PORT || 8443;
 const peersById = new Map();              // idString -> { ws, publicKey, verified, info, registeredAt, lastPing }
 const peersByWs = new Map();              // ws -> idString
 const verifiedPeers = new Map();          // idString -> { ws, publicKey, info, registeredAt, lastPing }
-const pendingChallenges = new Map();      // idString -> { nonce, publicKey, timestamp, timer }
+const peerOwnerKeys = new Map();          // idString -> publicKeyHex (Persistent cryptographic identity binding)
+const pendingChallenges = new Map();      // ws -> { peerId, nonce, publicKey, timestamp, timer }
 const pendingConnectRequests = new Map(); // reqKey ("fromId:targetId") -> { timestamp, fromId, targetId }
 const connectionsByIp = new Map();        // ip -> Set<ws>
 const activeChannels = new Map();         // channelId -> { senderId, receiverId, deviceId }
 const activePeerPairs = new Map();        // ws -> targetWs (Zero-copy binary Turbo-URB routing)
+
+// Aggressive Rate Limiting for Public Installation Lookups (max 5 per minute per IP)
+const installationLookupsByIp = new Map(); // ip -> { count, resetTime }
+const INSTALLATION_LOOKUP_LIMIT = 5;
+const INSTALLATION_LOOKUP_WINDOW_MS = 60 * 1000;
 
 // Rate limit / Lockout map for failed connection challenges / PIN attempts (max 5 per 15 min per IP/ID)
 const failedAttemptsByPeer = new Map(); // identifier (peerId or remoteIp) -> { count, lastFailure }
@@ -29,6 +35,35 @@ function isLoopbackIp(ip) {
   return !ip || ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1' || ip === 'localhost';
 }
 
+function getClientIp(req) {
+  const socketIp = req?.socket?.remoteAddress || req?.connection?.remoteAddress || 'unknown';
+  const trustProxy = process.env.TRUST_PROXY === 'true' ||
+                     process.env.TRUST_PROXY === '1' ||
+                     isLoopbackIp(socketIp);
+
+  if (trustProxy && req?.headers) {
+    const forwardedFor = req.headers['x-forwarded-for'];
+    if (forwardedFor && typeof forwardedFor === 'string') {
+      const candidate = forwardedFor.split(',')[0].trim();
+      if (candidate) return candidate;
+    }
+    const realIp = req.headers['x-real-ip'];
+    if (realIp && typeof realIp === 'string' && realIp.trim()) {
+      return realIp.trim();
+    }
+  }
+  return socketIp;
+}
+
+function cleanupExpiredInstallationLookups() {
+  const now = Date.now();
+  for (const [ip, entry] of installationLookupsByIp.entries()) {
+    if (now >= entry.resetTime) {
+      installationLookupsByIp.delete(ip);
+    }
+  }
+}
+
 function cleanupExpiredLockouts() {
   const now = Date.now();
   for (const [key, entry] of failedAttemptsByPeer.entries()) {
@@ -36,6 +71,7 @@ function cleanupExpiredLockouts() {
       failedAttemptsByPeer.delete(key);
     }
   }
+  cleanupExpiredInstallationLookups();
 }
 
 function isPeerLockedOut(id, ip) {
@@ -108,9 +144,41 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Section 9.1: GET /v1/installations/:id -> returns verified public metadata
+  // Section 9.1: GET /v1/installations/:id -> returns verified public metadata (Protected against enumeration)
   const installMatch = req.url.match(/^\/v1\/installations\/([a-zA-Z0-9\s_-]+)$/);
   if (installMatch && req.method === 'GET') {
+    const clientIp = getClientIp(req);
+
+    // Optional Bearer token check
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+    const isAuthorized = Boolean(process.env.ADMIN_BEARER_TOKEN && token === process.env.ADMIN_BEARER_TOKEN);
+
+    if (process.env.REQUIRE_INSTALLATION_AUTH === 'true' && !isAuthorized) {
+      res.writeHead(401);
+      res.end(JSON.stringify({ error: 'Unauthorized: Bearer token required for installation lookup' }));
+      return;
+    }
+
+    if (!isAuthorized) {
+      // Aggressive Rate Limiting: Max 5 queries per minute per IP to prevent ID enumeration
+      cleanupExpiredInstallationLookups();
+      const now = Date.now();
+      let record = installationLookupsByIp.get(clientIp);
+      if (!record || now >= record.resetTime) {
+        record = { count: 0, resetTime: now + INSTALLATION_LOOKUP_WINDOW_MS };
+      }
+      record.count += 1;
+      installationLookupsByIp.set(clientIp, record);
+
+      if (record.count > INSTALLATION_LOOKUP_LIMIT) {
+        const retryAfter = Math.max(1, Math.ceil((record.resetTime - now) / 1000));
+        res.writeHead(429, { 'Retry-After': String(retryAfter) });
+        res.end(JSON.stringify({ error: 'Rate limit exceeded: max 5 installation lookups per minute' }));
+        return;
+      }
+    }
+
     const rawId = installMatch[1];
     const cleanId = rawId.replace(/\s+/g, '');
     const peer = peersById.get(cleanId);
@@ -168,7 +236,8 @@ const wss = new WebSocket.Server({ server, maxPayload: 1024 * 1024 }); // 1MB fr
 console.log(`[USB Master Pro Broker] Initializing P2P Rendezvous Fabric on port ${PORT}...`);
 
 wss.on('connection', (ws, req) => {
-  const remoteIp = req.socket.remoteAddress || 'unknown';
+  const remoteIp = getClientIp(req);
+  ws._clientIp = remoteIp;
 
   // DoS Hardening: Max 10 concurrent WebSocket connections per remote IP
   const ipConns = connectionsByIp.get(remoteIp) || new Set();
@@ -254,6 +323,13 @@ wss.on('connection', (ws, req) => {
       activePeerPairs.delete(ws);
     }
 
+    // Clean up any pending challenge bound to this socket
+    if (pendingChallenges.has(ws)) {
+      const c = pendingChallenges.get(ws);
+      if (c && c.timer) clearTimeout(c.timer);
+      pendingChallenges.delete(ws);
+    }
+
     const peerId = peersByWs.get(ws);
     // Always clean up the ws->peerId mapping, regardless of ownership
     peersByWs.delete(ws);
@@ -265,11 +341,7 @@ wss.on('connection', (ws, req) => {
         console.log(`[Broker] Active peer disconnected: ${peerId}`);
         peersById.delete(peerId);
         verifiedPeers.delete(peerId);
-        if (pendingChallenges.has(peerId)) {
-          const c = pendingChallenges.get(peerId);
-          if (c.timer) clearTimeout(c.timer);
-          pendingChallenges.delete(peerId);
-        }
+        // Note: peerOwnerKeys is intentionally preserved to prevent ID squatting
         // Clean up any pending connect requests involving this peer
         for (const [key, reqObj] of pendingConnectRequests.entries()) {
           if (reqObj.fromId === peerId || reqObj.targetId === peerId) {
@@ -353,10 +425,23 @@ function handleMessage(ws, msg, remoteIp = 'unknown') {
         return;
       }
 
+      const pubKeyLower = msg.publicKey.toLowerCase();
+
+      // ID Squatting Prevention: check if ID is permanently pinned to another public key
+      if (peerOwnerKeys.has(peerId) && peerOwnerKeys.get(peerId) !== pubKeyLower) {
+        console.warn(`[Broker] ID squatting rejected for node [${peerId}]. Bound to another public key.`);
+        ws.send(JSON.stringify({
+          type: 'REGISTER_RESP',
+          success: false,
+          error: 'ID squatting rejected: Peer ID is cryptographically bound to another public key.'
+        }));
+        return;
+      }
+
       // Hijacking prevention: if already verified by another active socket with different key
       if (verifiedPeers.has(peerId)) {
         const existing = verifiedPeers.get(peerId);
-        if (existing.ws !== ws && existing.ws.readyState === WebSocket.OPEN && existing.publicKey !== msg.publicKey.toLowerCase()) {
+        if (existing.ws !== ws && existing.ws.readyState === WebSocket.OPEN && existing.publicKey !== pubKeyLower) {
           console.warn(`[Broker] REGISTER_INIT rejected: ID [${peerId}] is cryptographically owned by another active node.`);
           ws.send(JSON.stringify({
             type: 'REGISTER_RESP',
@@ -367,23 +452,25 @@ function handleMessage(ws, msg, remoteIp = 'unknown') {
         }
       }
 
-      if (pendingChallenges.has(peerId)) {
-        const prior = pendingChallenges.get(peerId);
-        if (prior.timer) clearTimeout(prior.timer);
+      // Challenge Isolation: bind pending challenge directly to the WebSocket connection ws
+      if (pendingChallenges.has(ws)) {
+        const prior = pendingChallenges.get(ws);
+        if (prior && prior.timer) clearTimeout(prior.timer);
       }
 
       const nonce = crypto.randomBytes(32).toString('hex');
       const timestamp = Date.now();
 
       const timer = setTimeout(() => {
-        if (pendingChallenges.get(peerId)?.nonce === nonce) {
-          pendingChallenges.delete(peerId);
+        if (pendingChallenges.get(ws)?.nonce === nonce) {
+          pendingChallenges.delete(ws);
         }
       }, 10000); // 10s TTL
 
-      pendingChallenges.set(peerId, {
+      pendingChallenges.set(ws, {
+        peerId,
         nonce,
-        publicKey: msg.publicKey.toLowerCase(),
+        publicKey: pubKeyLower,
         timestamp,
         timer
       });
@@ -417,8 +504,9 @@ function handleMessage(ws, msg, remoteIp = 'unknown') {
         return;
       }
 
-      const challenge = pendingChallenges.get(peerId);
-      if (!challenge) {
+      // Retrieve challenge bound to THIS WebSocket connection
+      const challenge = pendingChallenges.get(ws);
+      if (!challenge || challenge.peerId !== peerId) {
         ws.send(JSON.stringify({
           type: 'REGISTER_RESP',
           success: false,
@@ -429,7 +517,7 @@ function handleMessage(ws, msg, remoteIp = 'unknown') {
 
       // Single-use challenge deletion: immediately clear timer and delete challenge
       if (challenge.timer) clearTimeout(challenge.timer);
-      pendingChallenges.delete(peerId);
+      pendingChallenges.delete(ws);
 
       if (Date.now() - challenge.timestamp > 10000) {
         ws.send(JSON.stringify({
@@ -446,6 +534,16 @@ function handleMessage(ws, msg, remoteIp = 'unknown') {
           type: 'REGISTER_RESP',
           success: false,
           error: 'Public key mismatch: does not match challenge key'
+        }));
+        return;
+      }
+
+      // ID Squatting double-check: ensure ID is not bound to a different key
+      if (peerOwnerKeys.has(peerId) && peerOwnerKeys.get(peerId) !== challenge.publicKey) {
+        ws.send(JSON.stringify({
+          type: 'REGISTER_RESP',
+          success: false,
+          error: 'ID squatting rejected: Peer ID is cryptographically bound to another public key.'
         }));
         return;
       }
@@ -470,6 +568,9 @@ function handleMessage(ws, msg, remoteIp = 'unknown') {
       }
 
       resetFailedAttempts(peerId, remoteIp);
+
+      // Pin ID to public key permanently in peerOwnerKeys
+      peerOwnerKeys.set(peerId, publicKey);
 
       const peerRecord = {
         ws,
@@ -514,18 +615,15 @@ function handleMessage(ws, msg, remoteIp = 'unknown') {
         return;
       }
 
-      // Hijack prevention: reject unauthenticated claim if peerId is currently held by active verified session
-      if (verifiedPeers.has(peerId)) {
-        const active = verifiedPeers.get(peerId);
-        if (active.ws !== ws && active.ws.readyState === WebSocket.OPEN) {
-          console.warn(`[Broker] Unauthenticated REGISTER rejected for verified node [${peerId}].`);
-          ws.send(JSON.stringify({
-            type: 'REGISTER_RESP',
-            success: false,
-            error: 'Peer ID is cryptographically secured by an active verified session'
-          }));
-          return;
-        }
+      // Hijack prevention: reject unauthenticated claim if peerId is currently held by active verified session or bound
+      if (verifiedPeers.has(peerId) || peerOwnerKeys.has(peerId)) {
+        console.warn(`[Broker] Unauthenticated REGISTER rejected for verified or bound node [${peerId}].`);
+        ws.send(JSON.stringify({
+          type: 'REGISTER_RESP',
+          success: false,
+          error: 'Peer ID is cryptographically secured by an active verified session'
+        }));
+        return;
       }
 
       console.warn(`[Broker] WARNING: Node [${peerId}] registered via unauthenticated legacy REGISTER protocol. Upgrade to REGISTER_INIT challenge-response.`);
@@ -781,15 +879,20 @@ module.exports = {
   verifyEd25519Proof,
   peersById,
   verifiedPeers,
+  peerOwnerKeys,
   pendingChallenges,
   pendingConnectRequests,
   connectionsByIp,
   activePeerPairs,
   failedAttemptsByPeer,
+  installationLookupsByIp,
+  getClientIp,
   isPeerLockedOut,
   recordFailedAttempt,
   resetFailedAttempts,
   cleanupExpiredLockouts,
   LOCKOUT_WINDOW_MS,
-  MAX_FAILED_ATTEMPTS
+  MAX_FAILED_ATTEMPTS,
+  INSTALLATION_LOOKUP_LIMIT,
+  INSTALLATION_LOOKUP_WINDOW_MS
 };

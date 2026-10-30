@@ -17,19 +17,25 @@ const WebSocket = require('ws');
 // Import server module
 const {
   server,
+  wss,
   verifyEd25519Proof,
   peersById,
   verifiedPeers,
+  peerOwnerKeys,
   pendingChallenges,
   pendingConnectRequests,
   connectionsByIp,
   failedAttemptsByPeer,
+  installationLookupsByIp,
+  getClientIp,
   isPeerLockedOut,
   recordFailedAttempt,
   resetFailedAttempts,
   cleanupExpiredLockouts,
   LOCKOUT_WINDOW_MS,
-  MAX_FAILED_ATTEMPTS
+  MAX_FAILED_ATTEMPTS,
+  INSTALLATION_LOOKUP_LIMIT,
+  INSTALLATION_LOOKUP_WINDOW_MS
 } = require('./server');
 
 const TEST_PORT = 18443;
@@ -61,19 +67,28 @@ function createForgedSha256Signature(publicKeyHex, messageStr) {
   return Buffer.concat([rPart, sPart]).toString('hex');
 }
 
-function httpGet(path) {
+function httpGet(path, headers = {}) {
   return new Promise((resolve, reject) => {
-    http.get(`${HTTP_BASE}${path}`, (res) => {
+    const url = new URL(`${HTTP_BASE}${path}`);
+    const req = http.request({
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname + url.search,
+      method: 'GET',
+      headers
+    }, (res) => {
       let data = '';
       res.on('data', chunk => { data += chunk; });
       res.on('end', () => {
         try {
-          resolve({ status: res.statusCode, body: JSON.parse(data) });
+          resolve({ status: res.statusCode, headers: res.headers, body: JSON.parse(data) });
         } catch (e) {
-          resolve({ status: res.statusCode, raw: data });
+          resolve({ status: res.statusCode, headers: res.headers, raw: data });
         }
       });
-    }).on('error', reject);
+    });
+    req.on('error', reject);
+    req.end();
   });
 }
 
@@ -542,11 +557,251 @@ async function runTests() {
       console.log('   ✅ Test 8 Passed: 5-Try lockout counter, blocked requests, and expired cleanup verified.');
     }
 
+    // -------------------------------------------------------------------------
+    // TEST 9: ID Squatting Prevention (Persistent ID-to-PubKey Pinning)
+    // -------------------------------------------------------------------------
+    console.log('\n👉 [Test 9] ID squatting prevention (persistent ID-to-PubKey pinning)...');
+    {
+      const victimId = '777888999';
+      const keyA = createEd25519Key();
+      const wsA = await connectWs();
+
+      // Step 1: Node A registers victimId with Key A
+      wsA.send(JSON.stringify({
+        type: 'REGISTER_INIT',
+        id: victimId,
+        publicKey: keyA.publicKeyHex
+      }));
+      const challengeA = await waitForMessage(wsA, m => m.type === 'REGISTER_CHALLENGE');
+      assert.strictEqual(challengeA.id, victimId);
+
+      const sigA = crypto.sign(
+        null,
+        Buffer.from(`USB_MASTER_REGISTER:${victimId}:${challengeA.nonce}`, 'utf8'),
+        keyA.privateKey
+      ).toString('hex');
+
+      wsA.send(JSON.stringify({
+        type: 'REGISTER_PROOF',
+        id: victimId,
+        signature: sigA,
+        publicKey: keyA.publicKeyHex,
+        info: { hostname: 'legit-node-a', os: 'Linux', version: '1.0.0' }
+      }));
+      const regRespA = await waitForMessage(wsA, m => m.type === 'REGISTER_RESP');
+      assert.strictEqual(regRespA.success, true);
+      assert.strictEqual(regRespA.verified, true);
+      assert.strictEqual(peerOwnerKeys.get(victimId), keyA.publicKeyHex.toLowerCase());
+
+      // Step 2: Node A disconnects (goes offline)
+      wsA.close();
+      await new Promise(r => setTimeout(r, 100)); // allow close event to propagate
+
+      assert.strictEqual(peersById.has(victimId), false, 'Disconnected node must be removed from peersById');
+      assert.strictEqual(verifiedPeers.has(victimId), false, 'Disconnected node must be removed from verifiedPeers');
+      assert.strictEqual(peerOwnerKeys.get(victimId), keyA.publicKeyHex.toLowerCase(), 'peerOwnerKeys must remain pinned after disconnect');
+
+      // Step 3: Attacker Node B connects with Key B and attempts to claim Node A's victimId
+      const keyB = createEd25519Key();
+      const wsB = await connectWs();
+
+      wsB.send(JSON.stringify({
+        type: 'REGISTER_INIT',
+        id: victimId,
+        publicKey: keyB.publicKeyHex
+      }));
+
+      const squattingResp = await waitForMessage(wsB, m => m.type === 'REGISTER_RESP');
+      assert.strictEqual(squattingResp.success, false, 'ID squatting attempt MUST be rejected!');
+      assert(
+        squattingResp.error.includes('ID squatting rejected: Peer ID is cryptographically bound to another public key.'),
+        `Expected ID squatting rejection message, got: ${squattingResp.error}`
+      );
+
+      // Also verify unauthenticated legacy REGISTER cannot squat on victimId
+      wsB.send(JSON.stringify({
+        type: 'REGISTER',
+        id: victimId,
+        info: { hostname: 'attacker-legacy' }
+      }));
+      const legacySquatResp = await waitForMessage(wsB, m => m.type === 'REGISTER_RESP');
+      assert.strictEqual(legacySquatResp.success, false);
+
+      // Step 4: Legitimate Node A reconnects with Key A -> must be allowed to register
+      const wsA2 = await connectWs();
+      wsA2.send(JSON.stringify({
+        type: 'REGISTER_INIT',
+        id: victimId,
+        publicKey: keyA.publicKeyHex
+      }));
+
+      const challengeA2 = await waitForMessage(wsA2, m => m.type === 'REGISTER_CHALLENGE');
+      assert.strictEqual(challengeA2.id, victimId);
+
+      const sigA2 = crypto.sign(
+        null,
+        Buffer.from(`USB_MASTER_REGISTER:${victimId}:${challengeA2.nonce}`, 'utf8'),
+        keyA.privateKey
+      ).toString('hex');
+
+      wsA2.send(JSON.stringify({
+        type: 'REGISTER_PROOF',
+        id: victimId,
+        signature: sigA2,
+        publicKey: keyA.publicKeyHex,
+        info: { hostname: 'legit-node-a-reconnected', os: 'Linux', version: '1.0.0' }
+      }));
+      const regRespA2 = await waitForMessage(wsA2, m => m.type === 'REGISTER_RESP');
+      assert.strictEqual(regRespA2.success, true);
+      assert.strictEqual(regRespA2.verified, true);
+
+      wsB.close();
+      wsA2.close();
+      console.log('   ✅ Test 9 Passed: ID squatting strictly rejected; persistent cryptographic pinning verified.');
+    }
+
+    // -------------------------------------------------------------------------
+    // TEST 10: Challenge Isolation (WebSocket-bound Pending Challenge Defense)
+    // -------------------------------------------------------------------------
+    console.log('\n👉 [Test 10] Challenge isolation (attacker cannot overwrite victim challenge)...');
+    {
+      const freshId = '555666777';
+      const victimKey = createEd25519Key();
+      const attackerKey = createEd25519Key();
+
+      const wsVictim = await connectWs();
+      const wsAttacker = await connectWs();
+
+      // Step 1: Victim initiates registration
+      wsVictim.send(JSON.stringify({
+        type: 'REGISTER_INIT',
+        id: freshId,
+        publicKey: victimKey.publicKeyHex
+      }));
+      const challengeVictim = await waitForMessage(wsVictim, m => m.type === 'REGISTER_CHALLENGE');
+      assert.strictEqual(challengeVictim.id, freshId);
+      assert.ok(challengeVictim.nonce);
+
+      // Verify challenge is stored in pendingChallenges
+      const victimChallengeEntry = Array.from(pendingChallenges.values()).find(c => c.nonce === challengeVictim.nonce);
+      assert.ok(victimChallengeEntry, 'Challenge must be stored bound to victim socket');
+      assert.strictEqual(victimChallengeEntry.peerId, freshId);
+      assert.strictEqual(victimChallengeEntry.publicKey, victimKey.publicKeyHex.toLowerCase());
+
+      // Step 2: Attacker attempts to hijack or overwrite victim's challenge
+      // Attacker sends REGISTER_INIT on wsAttacker with attacker's key for freshId
+      // (Even before victim proves ownership, attacker cannot clobber victim's pending challenge on wsVictim)
+      wsAttacker.send(JSON.stringify({
+        type: 'REGISTER_INIT',
+        id: freshId,
+        publicKey: attackerKey.publicKeyHex
+      }));
+      const challengeAttacker = await waitForMessage(wsAttacker, m => m.type === 'REGISTER_CHALLENGE');
+      assert.strictEqual(challengeAttacker.id, freshId);
+
+      // Assert isolation: both challenges coexist independently on their respective WebSocket instances
+      assert.strictEqual(pendingChallenges.size, 2, 'Both challenges must coexist independently on separate sockets');
+      const victimChallengeStill = Array.from(pendingChallenges.values()).find(c => c.nonce === challengeVictim.nonce);
+      assert.ok(victimChallengeStill, 'Victim challenge must NOT be deleted or overwritten by attacker');
+      assert.strictEqual(victimChallengeStill.nonce, challengeVictim.nonce, 'Victim nonce must remain unchanged');
+      assert.strictEqual(victimChallengeStill.publicKey, victimKey.publicKeyHex.toLowerCase());
+
+      const attackerChallengeEntry = Array.from(pendingChallenges.values()).find(c => c.nonce === challengeAttacker.nonce);
+      assert.ok(attackerChallengeEntry, 'Attacker challenge must exist on attacker socket');
+      assert.strictEqual(attackerChallengeEntry.nonce, challengeAttacker.nonce);
+      assert.strictEqual(attackerChallengeEntry.publicKey, attackerKey.publicKeyHex.toLowerCase());
+
+      // Step 3: Victim completes registration with victimKey using victim's nonce
+      const sigVictim = crypto.sign(
+        null,
+        Buffer.from(`USB_MASTER_REGISTER:${freshId}:${challengeVictim.nonce}`, 'utf8'),
+        victimKey.privateKey
+      ).toString('hex');
+
+      wsVictim.send(JSON.stringify({
+        type: 'REGISTER_PROOF',
+        id: freshId,
+        signature: sigVictim,
+        publicKey: victimKey.publicKeyHex,
+        info: { hostname: 'victim-workstation', os: 'Windows 11', version: '1.0.0' }
+      }));
+      const victimRegResp = await waitForMessage(wsVictim, m => m.type === 'REGISTER_RESP');
+      assert.strictEqual(victimRegResp.success, true, 'Victim registration must succeed despite attacker attempt');
+      assert.strictEqual(victimRegResp.verified, true);
+
+      // Step 4: Attacker tries to complete proof with attacker's key -> rejected because freshId is now owned by victimKey!
+      const sigAttacker = crypto.sign(
+        null,
+        Buffer.from(`USB_MASTER_REGISTER:${freshId}:${challengeAttacker.nonce}`, 'utf8'),
+        attackerKey.privateKey
+      ).toString('hex');
+
+      wsAttacker.send(JSON.stringify({
+        type: 'REGISTER_PROOF',
+        id: freshId,
+        signature: sigAttacker,
+        publicKey: attackerKey.publicKeyHex
+      }));
+      const attackerRegResp = await waitForMessage(wsAttacker, m => m.type === 'REGISTER_RESP');
+      assert.strictEqual(attackerRegResp.success, false, 'Attacker registration must be rejected by ID squatting guard');
+      assert(attackerRegResp.error.includes('ID squatting rejected'), `Expected squatting error, got: ${attackerRegResp.error}`);
+
+      wsVictim.close();
+      wsAttacker.close();
+      console.log('   ✅ Test 10 Passed: Challenge isolation enforced; attacker cannot overwrite or hijack in-flight challenges.');
+    }
+
+    // -------------------------------------------------------------------------
+    // TEST 11: Reverse-Proxy IP Extraction & Public Endpoint Rate-Limiting Guard
+    // -------------------------------------------------------------------------
+    console.log('\n👉 [Test 11] Reverse-proxy client IP extraction and installation rate limiting...');
+    {
+      // 1. Verify getClientIp extracts X-Forwarded-For when from trusted proxy / loopback
+      const mockReqProxied = {
+        socket: { remoteAddress: '127.0.0.1' },
+        headers: { 'x-forwarded-for': '198.51.100.42, 10.0.0.1' }
+      };
+      assert.strictEqual(getClientIp(mockReqProxied), '198.51.100.42');
+
+      const mockReqUntrusted = {
+        socket: { remoteAddress: '203.0.113.88' },
+        headers: { 'x-forwarded-for': '1.2.3.4' }
+      };
+      assert.strictEqual(getClientIp(mockReqUntrusted), '203.0.113.88', 'Direct non-loopback socket must ignore untrusted headers');
+
+      // 2. Test /v1/installations/:id rate limiting (max 5 per minute per IP)
+      const testLookupId = '111222333';
+      const proxyHeaders = { 'X-Forwarded-For': '198.51.100.99' };
+
+      // Queries 1-5 should return 200 or 404 (not 429)
+      for (let i = 1; i <= 5; i++) {
+        const resp = await httpGet(`/v1/installations/${testLookupId}`, proxyHeaders);
+        assert.notStrictEqual(resp.status, 429, `Query ${i} must not be rate limited`);
+      }
+
+      // Query 6 from the same IP must be rejected with 429 Too Many Requests
+      const rateLimitedResp = await httpGet(`/v1/installations/${testLookupId}`, proxyHeaders);
+      assert.strictEqual(rateLimitedResp.status, 429, '6th query must be rejected with HTTP 429');
+      assert.ok(rateLimitedResp.body.error.includes('Rate limit exceeded: max 5 installation lookups per minute'));
+      assert.ok(rateLimitedResp.headers['retry-after'], 'Retry-After header must be present');
+
+      // Query from a different IP must succeed (not throttled by other IP)
+      const differentIpResp = await httpGet(`/v1/installations/${testLookupId}`, { 'X-Forwarded-For': '198.51.100.100' });
+      assert.notStrictEqual(differentIpResp.status, 429, 'Different client IP must not be throttled');
+
+      console.log('   ✅ Test 11 Passed: Reverse-proxy IP extraction and aggressive rate limiting verified.');
+    }
+
     console.log('\n================================================================================');
-    console.log('  🎉 ALL 8 SECURITY REGRESSION TESTS PASSED CLEANLY (100% PASS)');
+    console.log('  🎉 ALL 11 SECURITY REGRESSION TESTS PASSED CLEANLY (100% PASS)');
     console.log('================================================================================\n');
 
   } finally {
+    if (wss && wss.clients) {
+      for (const client of wss.clients) {
+        client.terminate();
+      }
+    }
     await new Promise((resolve) => {
       server.close(() => resolve());
     });
