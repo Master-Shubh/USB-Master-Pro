@@ -10,6 +10,7 @@ description = "High-performance Turbo-URB USB-over-IP core engine for USB Master
 [features]
 default = []
 test-utils = []
+driver-simulation = []
 
 [dev-dependencies]
 usb-master-core = { path = ".", features = ["test-utils"] }

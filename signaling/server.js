@@ -161,38 +161,46 @@ wss.on('connection', (ws, req) => {
     }
 
     const peerId = peersByWs.get(ws);
-    if (peerId) {
-      console.log(`[Broker] Peer disconnected: ${peerId}`);
-      peersById.delete(peerId);
-      verifiedPeers.delete(peerId);
-      if (pendingChallenges.has(peerId)) {
-        const c = pendingChallenges.get(peerId);
-        if (c.timer) clearTimeout(c.timer);
-        pendingChallenges.delete(peerId);
-      }
-      // Clean up any pending connect requests involving this peer
-      for (const [key, reqObj] of pendingConnectRequests.entries()) {
-        if (reqObj.fromId === peerId || reqObj.targetId === peerId) {
-          pendingConnectRequests.delete(key);
-        }
-      }
-      peersByWs.delete(ws);
+    // Always clean up the ws->peerId mapping, regardless of ownership
+    peersByWs.delete(ws);
 
-      // Clean up active channels and notify peers
-      for (const [chanId, chan] of activeChannels.entries()) {
-        if (chan.senderId === peerId || chan.receiverId === peerId) {
-          const otherId = chan.senderId === peerId ? chan.receiverId : chan.senderId;
-          const otherPeer = peersById.get(otherId);
-          if (otherPeer && otherPeer.ws.readyState === WebSocket.OPEN) {
-            otherPeer.ws.send(JSON.stringify({
-              type: 'PEER_DISCONNECTED',
-              peerId,
-              channelId: chanId,
-              reason: 'Remote node disconnected abruptly'
-            }));
-          }
-          activeChannels.delete(chanId);
+    if (peerId) {
+      const currentRecord = peersById.get(peerId);
+      // Only clean up global registry if THIS socket is still the active registration
+      if (currentRecord && currentRecord.ws === ws) {
+        console.log(`[Broker] Active peer disconnected: ${peerId}`);
+        peersById.delete(peerId);
+        verifiedPeers.delete(peerId);
+        if (pendingChallenges.has(peerId)) {
+          const c = pendingChallenges.get(peerId);
+          if (c.timer) clearTimeout(c.timer);
+          pendingChallenges.delete(peerId);
         }
+        // Clean up any pending connect requests involving this peer
+        for (const [key, reqObj] of pendingConnectRequests.entries()) {
+          if (reqObj.fromId === peerId || reqObj.targetId === peerId) {
+            pendingConnectRequests.delete(key);
+          }
+        }
+
+        // Clean up active channels and notify peers
+        for (const [chanId, chan] of activeChannels.entries()) {
+          if (chan.senderId === peerId || chan.receiverId === peerId) {
+            const otherId = chan.senderId === peerId ? chan.receiverId : chan.senderId;
+            const otherPeer = peersById.get(otherId);
+            if (otherPeer && otherPeer.ws.readyState === WebSocket.OPEN) {
+              otherPeer.ws.send(JSON.stringify({
+                type: 'PEER_DISCONNECTED',
+                peerId,
+                channelId: chanId,
+                reason: 'Remote node disconnected abruptly'
+              }));
+            }
+            activeChannels.delete(chanId);
+          }
+        }
+      } else {
+        console.log(`[Broker] Stale socket closed for peer [${peerId}]; active registration preserved.`);
       }
     }
   });
@@ -579,6 +587,18 @@ function handleMessage(ws, msg) {
       // Relay STUN/TURN ICE candidate
       // msg: { type: 'ICE_CANDIDATE', targetId, candidate }
       const fromId = peersByWs.get(ws);
+      if (!fromId || !verifiedPeers.has(fromId)) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Unregistered socket cannot relay ICE candidates' }));
+        return;
+      }
+
+      // Candidate size guard
+      const candidateStr = typeof msg.candidate === 'string' ? msg.candidate : JSON.stringify(msg.candidate || '');
+      if (candidateStr.length > 4096) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'ICE candidate payload too large' }));
+        return;
+      }
+
       const targetId = String(msg.targetId).replace(/\s+/g, '');
       const target = peersById.get(targetId);
 

@@ -3,6 +3,7 @@
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
+use std::convert::TryFrom;
 use std::io::Cursor;
 
 pub const TURBO_USB_MAGIC: u32 = 0x54555242; // "TURB" in ASCII
@@ -28,7 +29,7 @@ pub fn classify_operation(command: u16, transfer_type: u8, endpoint: u8) -> Oper
         }
         CMD_SUBMIT_URB | CMD_COMPLETE_URB => {
             let is_in = (endpoint & 0x80) != 0;
-            match TransferType::from(transfer_type) {
+            match TransferType::try_from(transfer_type).unwrap_or(TransferType::Bulk) {
                 TransferType::Isochronous => OperationSafety::NonIdempotentUncertain,
                 TransferType::Bulk => {
                     if is_in {
@@ -77,14 +78,15 @@ pub enum TransferType {
     Interrupt = 3,
 }
 
-impl From<u8> for TransferType {
-    fn from(val: u8) -> Self {
+impl TryFrom<u8> for TransferType {
+    type Error = String;
+    fn try_from(val: u8) -> Result<Self, Self::Error> {
         match val {
-            0 => TransferType::Control,
-            1 => TransferType::Isochronous,
-            2 => TransferType::Bulk,
-            3 => TransferType::Interrupt,
-            _ => TransferType::Bulk,
+            0 => Ok(TransferType::Control),
+            1 => Ok(TransferType::Isochronous),
+            2 => Ok(TransferType::Bulk),
+            3 => Ok(TransferType::Interrupt),
+            other => Err(format!("Invalid USB transfer type byte: 0x{:02X}", other)),
         }
     }
 }
@@ -169,6 +171,12 @@ impl TurboUrbHeader {
         }
 
         let version = rdr.read_u16::<LittleEndian>().map_err(|e| e.to_string())?;
+        if version != PROTOCOL_VERSION {
+            return Err(format!(
+                "Protocol version mismatch: expected 0x{:04X}, got 0x{:04X}",
+                PROTOCOL_VERSION, version
+            ));
+        }
         let command = rdr.read_u16::<LittleEndian>().map_err(|e| e.to_string())?;
         let sequence_id = rdr.read_u64::<LittleEndian>().map_err(|e| e.to_string())?;
         let device_id = rdr.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
@@ -190,7 +198,8 @@ impl TurboUrbHeader {
             sequence_id,
             device_id,
             endpoint_address,
-            transfer_type: TransferType::from(transfer_type_raw),
+            transfer_type: TransferType::try_from(transfer_type_raw)
+                .map_err(|e| format!("Bad transfer type: {}", e))?,
             flags,
             status,
             buffer_length,

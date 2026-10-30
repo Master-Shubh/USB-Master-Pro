@@ -33,6 +33,7 @@ const EMBEDDED_LUCIDE_JS: &[u8] = include_bytes!("../../ui/assets/lucide.min.js"
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -665,8 +666,14 @@ impl DaemonServer {
         // Ensure token is stored in ~/.usb-master-pro/daemon.token with owner-only access (0600 on Unix)
         let _ = save_secure_token_to_disk(&local_api_token);
 
-        let driver_client = Arc::new(VhciDriverClient::open().unwrap_or_default());
-        let filter_client = Arc::new(FilterDriverClient::open().unwrap_or_default());
+        let driver_client = Arc::new(VhciDriverClient::open().unwrap_or_else(|e| {
+            eprintln!("⚠️  WARNING: VHCI driver not available ({}). USB attach/detach operations will fail. Install anyusb_vhci driver.", e);
+            VhciDriverClient::default()
+        }));
+        let filter_client = Arc::new(FilterDriverClient::open().unwrap_or_else(|e| {
+            eprintln!("⚠️  WARNING: Filter driver not available ({}). Physical USB capture will not function. Install anyusb_filter driver.", e);
+            FilterDriverClient::default()
+        }));
 
         let state = Arc::new(DaemonState {
             identity,
@@ -929,6 +936,19 @@ async fn handle_post_connect(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     validate_request_origin_and_auth(&headers, &state)?;
 
+    // Fail-closed: reject connect request on Windows release builds if VHCI kernel driver is not installed.
+    // Bypassed on non-Windows (Linux development/testing) and test builds.
+    #[cfg(all(target_os = "windows", not(any(test, feature = "driver-simulation"))))]
+    if !state.driver_client.is_real() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "success": false,
+                "error": "KMDF kernel driver not installed. Please install anyusb_vhci driver and restart daemon."
+            }).to_string(),
+        ));
+    }
+
     let clean_target_id = payload.target_id.replace(' ', "");
     if clean_target_id.len() != 9 {
         return Err((
@@ -1130,7 +1150,7 @@ pub async fn run_vhci_to_network_pump(
                     continue;
                 }
 
-                let xfer_type = TransferType::from(urb_msg.transfer_type);
+                let xfer_type = TransferType::try_from(urb_msg.transfer_type).unwrap_or(TransferType::Bulk);
                 let mut header = TurboUrbHeader::new(
                     CMD_SUBMIT_URB,
                     urb_msg.sequence_id,

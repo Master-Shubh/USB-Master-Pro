@@ -350,6 +350,7 @@ impl VhciDriverClient {
         };
 
         if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            #[cfg(any(test, feature = "driver-simulation"))]
             if path == Self::DEVICE_PATH {
                 return Ok(Self {
                     handle: INVALID_HANDLE_VALUE,
@@ -362,9 +363,8 @@ impl VhciDriverClient {
 
             let err = unsafe { GetLastError() };
             return Err(DriverClientError::DeviceNotFound(format!(
-                "Failed to open '{}' (GetLastError: {})",
-                path,
-                err
+                "KMDF driver '{}' is not accessible. Ensure anyusb_vhci driver is installed and running. (error: {})",
+                path, err
             )));
         }
 
@@ -638,6 +638,7 @@ impl FilterDriverClient {
         };
 
         if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+            #[cfg(any(test, feature = "driver-simulation"))]
             if path == Self::DEVICE_PATH {
                 return Ok(Self {
                     handle: INVALID_HANDLE_VALUE,
@@ -650,9 +651,8 @@ impl FilterDriverClient {
 
             let err = unsafe { GetLastError() };
             return Err(DriverClientError::DeviceNotFound(format!(
-                "Failed to open '{}' (GetLastError: {})",
-                path,
-                err
+                "KMDF driver '{}' is not accessible. Ensure anyusb_filter driver is installed and running. (error: {})",
+                path, err
             )));
         }
 
@@ -932,6 +932,10 @@ impl VhciDriverClient {
         })
     }
 
+    /// Non-Windows builds are always simulated — no real KMDF driver present.
+    pub fn is_real(&self) -> bool {
+        false
+    }
     pub fn set_simulate_attach_failure(&self, fail: bool) {
         self.simulated_attach_failure.store(fail, std::sync::atomic::Ordering::SeqCst);
     }
@@ -1027,6 +1031,11 @@ impl FilterDriverClient {
             pending_urb_queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
             completed_urbs: std::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Non-Windows builds are always simulated — no real KMDF filter driver present.
+    pub fn is_real(&self) -> bool {
+        false
     }
 
     pub fn set_simulate_capture_failure(&self, fail: bool) {

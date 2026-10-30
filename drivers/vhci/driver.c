@@ -14,6 +14,9 @@ EVT_WDF_IO_QUEUE_IO_INTERNAL_DEVICE_CONTROL AnyUsbVhci_EvtIoInternalDeviceContro
 EVT_WDF_DEVICE_PROCESS_QUERY_INTERFACE_REQUEST AnyUsb_EvtDeviceProcessQueryInterfaceRequest;
 EVT_WDF_REQUEST_CANCEL AnyUsbVhci_EvtPendingUrbCancel;
 
+// Monotonically increasing 64-bit sequence counter (prevents ABA slot reuse races)
+static volatile LONG64 g_VhciSequenceCounter = 1;
+
 NTSTATUS
 DriverEntry(
     _In_ PDRIVER_OBJECT  DriverObject,
@@ -164,11 +167,15 @@ AnyUsb_GetUSBDIVersion(
     _Out_opt_ PULONG                      HcdCapabilities
 )
 {
-    UNREFERENCED_PARAMETER(BusContext);
-
     if (VersionInformation != NULL) {
+        PPDO_DEVICE_DATA pdoData = (PPDO_DEVICE_DATA)BusContext;
         VersionInformation->USBDI_Version = USB_BUSIF_USBDI_VERSION_3;
-        VersionInformation->Supported_USB_Version = 0x0200; // USB 2.0 High-Speed
+        // Dynamically report SuperSpeed (USB 3.0) capability if child PDO is SuperSpeed
+        if (pdoData != NULL && pdoData->Speed >= 4) {
+            VersionInformation->Supported_USB_Version = 0x0300;
+        } else {
+            VersionInformation->Supported_USB_Version = 0x0200;
+        }
     }
 
     if (HcdCapabilities != NULL) {
@@ -324,7 +331,8 @@ AnyUsb_EvtDeviceProcessQueryInterfaceRequest(
         v0->BusContext = pdoData;
         v0->GetUSBDIVersion = AnyUsb_GetUSBDIVersion;
         v0->QueryBusTime = AnyUsb_QueryBusTime;
-        v0->SubmitIsoOutUrb = AnyUsb_SubmitIsoOutUrb;
+        // Setting SubmitIsoOutUrb to NULL forces usbaudio.sys to dispatch isochronous transfers via standard WDM IRPs
+        v0->SubmitIsoOutUrb = NULL;
         v0->QueryBusInformation = AnyUsb_QueryBusInformation;
     }
 
@@ -359,8 +367,10 @@ AnyUsbVhci_EvtPendingUrbCancel(
     if (fdoData != NULL) {
         WdfSpinLockAcquire(fdoData->PendingUrbLock);
         for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
-            if (fdoData->PendingRequests[i] == Request) {
-                fdoData->PendingRequests[i] = NULL;
+            if (fdoData->PendingRequests[i].Request == Request) {
+                fdoData->PendingRequests[i].Request = NULL;
+                fdoData->PendingRequests[i].SequenceId = 0;
+                fdoData->PendingRequests[i].DeviceId = 0;
                 break;
             }
         }
@@ -513,7 +523,8 @@ AnyUsbVhci_EvtIoDeviceControl(
             pdoData->BusInterface.InterfaceDereference = AnyUsb_BusInterfaceDereference;
             pdoData->BusInterface.GetUSBDIVersion = AnyUsb_GetUSBDIVersion;
             pdoData->BusInterface.QueryBusTime = AnyUsb_QueryBusTime;
-            pdoData->BusInterface.SubmitIsoOutUrb = AnyUsb_SubmitIsoOutUrb;
+            // Setting SubmitIsoOutUrb to NULL forces usbaudio.sys to dispatch isochronous transfers via standard WDM IRPs
+            pdoData->BusInterface.SubmitIsoOutUrb = NULL;
             pdoData->BusInterface.QueryBusInformation = AnyUsb_QueryBusInformation;
             pdoData->BusInterface.IsDeviceHighSpeed = AnyUsb_IsDeviceHighSpeed;
             pdoData->BusInterface.EnumLogEntry = AnyUsb_EnumLogEntry;
@@ -588,11 +599,13 @@ AnyUsbVhci_EvtIoDeviceControl(
                 // Cancel any in-flight pending requests belonging to this child device
                 WdfSpinLockAcquire(fdoData->PendingUrbLock);
                 for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
-                    WDFREQUEST pendingReq = fdoData->PendingRequests[i];
+                    WDFREQUEST pendingReq = fdoData->PendingRequests[i].Request;
                     if (pendingReq != NULL) {
                         WDFDEVICE reqDev = WdfIoQueueGetDevice(WdfRequestGetIoQueue(pendingReq));
                         if (reqDev == targetChildDevice) {
-                            fdoData->PendingRequests[i] = NULL;
+                            fdoData->PendingRequests[i].Request = NULL;
+                            fdoData->PendingRequests[i].SequenceId = 0;
+                            fdoData->PendingRequests[i].DeviceId = 0;
                             if (NT_SUCCESS(WdfRequestUnmarkCancelable(pendingReq))) {
                                 WdfRequestComplete(pendingReq, STATUS_CANCELLED);
                             }
@@ -647,45 +660,8 @@ AnyUsbVhci_EvtIoDeviceControl(
                     break;
                 }
 
-                // Find a free slot in the bounded sequence table
-                ULONG assignedSlot = ANYUSB_MAX_PENDING_URBS;
-                WdfSpinLockAcquire(fdoData->PendingUrbLock);
-                for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
-                    if (fdoData->PendingRequests[i] == NULL) {
-                        fdoData->PendingRequests[i] = pendingGuestRequest;
-                        assignedSlot = i;
-                        break;
-                    }
-                }
-                WdfSpinLockRelease(fdoData->PendingUrbLock);
-
-                if (assignedSlot == ANYUSB_MAX_PENDING_URBS) {
-                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                        "USB Master Pro: Pending URB sequence table is full (max %d)\n", ANYUSB_MAX_PENDING_URBS));
-                    WdfRequestComplete(pendingGuestRequest, STATUS_INSUFFICIENT_RESOURCES);
-                    bytesReturned = 0;
-                    status = STATUS_INSUFFICIENT_RESOURCES;
-                    break;
-                }
-
-                // Mark the pending guest request as cancelable so caller or OS can cancel it without deadlock
-                NTSTATUS markStatus = WdfRequestMarkCancelableEx(pendingGuestRequest, AnyUsbVhci_EvtPendingUrbCancel);
-                if (!NT_SUCCESS(markStatus)) {
-                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
-                        "USB Master Pro: WdfRequestMarkCancelableEx returned 0x%08X (already cancelled)\n", markStatus));
-                    WdfSpinLockAcquire(fdoData->PendingUrbLock);
-                    fdoData->PendingRequests[assignedSlot] = NULL;
-                    WdfSpinLockRelease(fdoData->PendingUrbLock);
-                    WdfRequestComplete(pendingGuestRequest, STATUS_CANCELLED);
-                    bytesReturned = 0;
-                    status = STATUS_CANCELLED;
-                    break;
-                }
-
                 PANYUSB_URB_MESSAGE msg = (PANYUSB_URB_MESSAGE)outputBuffer;
                 RtlZeroMemory(msg, sizeof(ANYUSB_URB_MESSAGE));
-                // Safe 1-based bounded sequence ID (never leaks raw kernel pointer)
-                msg->SequenceId = (ULONG64)(assignedSlot + 1);
 
                 // Populate DeviceId from the request's originating queue/device if available
                 WDFQUEUE reqQueue = WdfRequestGetIoQueue(pendingGuestRequest);
@@ -699,7 +675,7 @@ AnyUsbVhci_EvtIoDeviceControl(
                     }
                 }
 
-                // Inspect urb->UrbHeader.Function and extract buffer / setup data
+                // Inspect urb->UrbHeader.Function and extract buffer / setup data FIRST (before marking cancelable)
                 USHORT urbFunc = urb->UrbHeader.Function;
                 if (urbFunc == URB_FUNCTION_CONTROL_TRANSFER) {
                     msg->TransferType = 0;
@@ -712,10 +688,6 @@ AnyUsbVhci_EvtIoDeviceControl(
                         KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                             "USB Master Pro VHCI: Control transfer size %lu exceeds 64 KB limit. Request rejected.\n",
                             msg->TransferBufferLength));
-                        WdfRequestUnmarkCancelable(pendingGuestRequest);
-                        WdfSpinLockAcquire(fdoData->PendingUrbLock);
-                        fdoData->PendingRequests[assignedSlot] = NULL;
-                        WdfSpinLockRelease(fdoData->PendingUrbLock);
                         WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
                         bytesReturned = 0;
                         status = STATUS_BUFFER_OVERFLOW;
@@ -741,10 +713,6 @@ AnyUsbVhci_EvtIoDeviceControl(
                         KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                             "USB Master Pro VHCI: Control Ex transfer size %lu exceeds 64 KB limit. Request rejected.\n",
                             msg->TransferBufferLength));
-                        WdfRequestUnmarkCancelable(pendingGuestRequest);
-                        WdfSpinLockAcquire(fdoData->PendingUrbLock);
-                        fdoData->PendingRequests[assignedSlot] = NULL;
-                        WdfSpinLockRelease(fdoData->PendingUrbLock);
                         WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
                         bytesReturned = 0;
                         status = STATUS_BUFFER_OVERFLOW;
@@ -769,10 +737,6 @@ AnyUsbVhci_EvtIoDeviceControl(
                         KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                             "USB Master Pro VHCI: Bulk transfer size %lu exceeds 64 KB limit. Rejecting without truncation.\n",
                             msg->TransferBufferLength));
-                        WdfRequestUnmarkCancelable(pendingGuestRequest);
-                        WdfSpinLockAcquire(fdoData->PendingUrbLock);
-                        fdoData->PendingRequests[assignedSlot] = NULL;
-                        WdfSpinLockRelease(fdoData->PendingUrbLock);
                         WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
                         bytesReturned = 0;
                         status = STATUS_BUFFER_OVERFLOW;
@@ -797,10 +761,6 @@ AnyUsbVhci_EvtIoDeviceControl(
                         KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                             "USB Master Pro VHCI: Isochronous transfer size %lu exceeds 64 KB limit. Rejecting.\n",
                             msg->TransferBufferLength));
-                        WdfRequestUnmarkCancelable(pendingGuestRequest);
-                        WdfSpinLockAcquire(fdoData->PendingUrbLock);
-                        fdoData->PendingRequests[assignedSlot] = NULL;
-                        WdfSpinLockRelease(fdoData->PendingUrbLock);
                         WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
                         bytesReturned = 0;
                         status = STATUS_BUFFER_OVERFLOW;
@@ -815,8 +775,55 @@ AnyUsbVhci_EvtIoDeviceControl(
                         }
                     }
                 } else {
-                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                        "USB Master Pro: Pending URB function 0x%04X fetched\n", urbFunc));
+                    // Reject unsupported URB function cleanly instead of returning bogus zeroed success
+                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                        "USB Master Pro VHCI: Unsupported URB function 0x%04X rejected with NOT_SUPPORTED\n", urbFunc));
+                    urb->UrbHeader.Status = USBD_STATUS_NOT_SUPPORTED;
+                    WdfRequestComplete(pendingGuestRequest, STATUS_NOT_SUPPORTED);
+                    bytesReturned = 0;
+                    status = STATUS_NOT_SUPPORTED;
+                    break;
+                }
+
+                // Allocate monotonic 64-bit sequence ID (prevents ABA slot reuse races)
+                ULONG64 seqId = (ULONG64)InterlockedIncrement64(&g_VhciSequenceCounter);
+                msg->SequenceId = seqId;
+
+                // Find a free slot in the bounded sequence table and mark cancelable at the very end
+                ULONG assignedSlot = ANYUSB_MAX_PENDING_URBS;
+                WdfSpinLockAcquire(fdoData->PendingUrbLock);
+                for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
+                    if (fdoData->PendingRequests[i].Request == NULL) {
+                        assignedSlot = i;
+                        break;
+                    }
+                }
+
+                if (assignedSlot < ANYUSB_MAX_PENDING_URBS) {
+                    NTSTATUS markStatus = WdfRequestMarkCancelableEx(pendingGuestRequest, AnyUsbVhci_EvtPendingUrbCancel);
+                    if (NT_SUCCESS(markStatus)) {
+                        fdoData->PendingRequests[assignedSlot].Request = pendingGuestRequest;
+                        fdoData->PendingRequests[assignedSlot].SequenceId = seqId;
+                        fdoData->PendingRequests[assignedSlot].DeviceId = msg->DeviceId;
+                    } else {
+                        // Request was cancelled while attempting to mark
+                        assignedSlot = ANYUSB_MAX_PENDING_URBS;
+                        WdfRequestComplete(pendingGuestRequest, markStatus);
+                        WdfSpinLockRelease(fdoData->PendingUrbLock);
+                        bytesReturned = 0;
+                        status = markStatus;
+                        break;
+                    }
+                }
+                WdfSpinLockRelease(fdoData->PendingUrbLock);
+
+                if (assignedSlot == ANYUSB_MAX_PENDING_URBS) {
+                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                        "USB Master Pro: Pending URB sequence table is full (max %d)\n", ANYUSB_MAX_PENDING_URBS));
+                    WdfRequestComplete(pendingGuestRequest, STATUS_INSUFFICIENT_RESOURCES);
+                    bytesReturned = 0;
+                    status = STATUS_INSUFFICIENT_RESOURCES;
+                    break;
                 }
 
                 bytesReturned = sizeof(ANYUSB_URB_MESSAGE);
@@ -837,15 +844,6 @@ AnyUsbVhci_EvtIoDeviceControl(
                     compReq->SequenceId, compReq->Status, compReq->ActualLength));
 
                 ULONG64 seqId = compReq->SequenceId;
-                if (seqId < 1 || seqId > ANYUSB_MAX_PENDING_URBS) {
-                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                        "USB Master Pro: Invalid SequenceId %llu (out of bounds [1, %d])\n",
-                        seqId, ANYUSB_MAX_PENDING_URBS));
-                    status = STATUS_INVALID_PARAMETER;
-                    break;
-                }
-
-                ULONG slot = (ULONG)(seqId - 1);
                 WDFREQUEST targetRequest = NULL;
 
                 // Explicitly reject completion if ActualLength exceeds buffer capacity to prevent truncation
@@ -858,19 +856,43 @@ AnyUsbVhci_EvtIoDeviceControl(
                 }
 
                 WdfSpinLockAcquire(fdoData->PendingUrbLock);
-                targetRequest = fdoData->PendingRequests[slot];
-                fdoData->PendingRequests[slot] = NULL;
-                WdfSpinLockRelease(fdoData->PendingUrbLock);
+                for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
+                    if (fdoData->PendingRequests[i].Request != NULL &&
+                        fdoData->PendingRequests[i].SequenceId == seqId) {
+                        
+                        // Verify DeviceId binding to prevent cross-device memory corruption
+                        if (compReq->DeviceId != 0 && fdoData->PendingRequests[i].DeviceId != 0 &&
+                            compReq->DeviceId != fdoData->PendingRequests[i].DeviceId) {
+                            KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                                "USB Master Pro: DeviceId mismatch for Seq %llu (Expected %lu, Got %lu)\n",
+                                seqId, fdoData->PendingRequests[i].DeviceId, compReq->DeviceId));
+                            break;
+                        }
 
-                if (targetRequest != NULL) {
-                    // Unmark cancelability before completing to avoid race with cancel routine
-                    NTSTATUS unmarkStatus = WdfRequestUnmarkCancelable(targetRequest);
-                    if (unmarkStatus == STATUS_CANCELLED) {
-                        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                            "USB Master Pro: SequenceId %llu was cancelled concurrently\n", seqId));
-                        status = STATUS_CANCELLED;
+                        WDFREQUEST candidate = fdoData->PendingRequests[i].Request;
+                        NTSTATUS unmarkStatus = WdfRequestUnmarkCancelable(candidate);
+                        if (NT_SUCCESS(unmarkStatus)) {
+                            targetRequest = candidate;
+                            fdoData->PendingRequests[i].Request = NULL;
+                            fdoData->PendingRequests[i].SequenceId = 0;
+                            fdoData->PendingRequests[i].DeviceId = 0;
+                        } else {
+                            // Cancel routine already owns completion; drop slot cleanly
+                            fdoData->PendingRequests[i].Request = NULL;
+                            fdoData->PendingRequests[i].SequenceId = 0;
+                            fdoData->PendingRequests[i].DeviceId = 0;
+                        }
                         break;
                     }
+                }
+                WdfSpinLockRelease(fdoData->PendingUrbLock);
+
+                if (targetRequest == NULL) {
+                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                        "USB Master Pro: Stale, duplicate, or cancelled SequenceId %llu dropped\n", seqId));
+                    status = STATUS_NOT_FOUND;
+                    break;
+                }
 
                     // Retrieve guest WDM IRP and URB from targetRequest
                     PIRP irp = WdfRequestWdmGetIrp(targetRequest);

@@ -66,13 +66,20 @@ typedef struct _ANYUSB_URB_MESSAGE {
 
 #pragma pack(pop)
 
+// Pending URB tracking slot with sequence token & device binding to prevent ABA stale mismatches
+typedef struct _ANYUSB_PENDING_SLOT {
+    WDFREQUEST  Request;
+    ULONG64     SequenceId;
+    ULONG       DeviceId;
+} ANYUSB_PENDING_SLOT, *PANYUSB_PENDING_SLOT;
+
 // Control Device Object (CDO) Context for user-mode daemon interface (\Device\AnyUsbFilter)
 typedef struct _CONTROL_DEVICE_DATA {
     WDFDEVICE               ControlDevice;
     WDFQUEUE                IoctlQueue;
     WDFQUEUE                PendingUrbQueue; // Holds intercepted URBs for daemon extraction
     WDFSPINLOCK             PendingUrbLock;  // Protects PendingRequests table
-    WDFREQUEST              PendingRequests[ANYUSB_MAX_PENDING_URBS];
+    ANYUSB_PENDING_SLOT     PendingRequests[ANYUSB_MAX_PENDING_URBS];
     WDFSPINLOCK             ControlLock;
     LIST_ENTRY              FilterDeviceList;
     BOOLEAN                 IsCaptured;

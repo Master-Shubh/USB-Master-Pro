@@ -128,15 +128,22 @@ fn test_boundary_conditions() {
 
 #[test]
 fn test_all_transfer_types_and_fallback() {
-    assert_eq!(TransferType::from(0), TransferType::Control);
-    assert_eq!(TransferType::from(1), TransferType::Isochronous);
-    assert_eq!(TransferType::from(2), TransferType::Bulk);
-    assert_eq!(TransferType::from(3), TransferType::Interrupt);
+    use std::convert::TryFrom;
 
-    // Any invalid/unknown transfer type defaults safely to Bulk
-    assert_eq!(TransferType::from(4), TransferType::Bulk);
-    assert_eq!(TransferType::from(42), TransferType::Bulk);
-    assert_eq!(TransferType::from(255), TransferType::Bulk);
+    // Valid transfer type bytes must parse correctly
+    assert_eq!(TransferType::try_from(0u8).unwrap(), TransferType::Control);
+    assert_eq!(TransferType::try_from(1u8).unwrap(), TransferType::Isochronous);
+    assert_eq!(TransferType::try_from(2u8).unwrap(), TransferType::Bulk);
+    assert_eq!(TransferType::try_from(3u8).unwrap(), TransferType::Interrupt);
+
+    // Invalid/unknown transfer type bytes must now return Err (no silent fallback)
+    assert!(TransferType::try_from(4u8).is_err());
+    assert!(TransferType::try_from(42u8).is_err());
+    assert!(TransferType::try_from(255u8).is_err());
+
+    // Error message must contain the invalid byte value
+    let err = TransferType::try_from(0xABu8).unwrap_err();
+    assert!(err.contains("0xAB"), "Error should include hex value: {}", err);
 }
 
 #[test]

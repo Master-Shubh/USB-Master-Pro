@@ -34,6 +34,15 @@ AddService = anyusb_filter,,AnyUsbFilter_Service_Inst
 [DefaultInstall.NTarm64.Services]
 AddService = anyusb_filter,,AnyUsbFilter_Service_Inst
 
+[DefaultInstall.NTamd64.Filters]
+AddFilter = anyusb_filter,,AnyUsbFilter_Filter_Inst
+
+[DefaultInstall.NTarm64.Filters]
+AddFilter = anyusb_filter,,AnyUsbFilter_Filter_Inst
+
+[AnyUsbFilter_Filter_Inst]
+FilterPosition = Upper
+
 [AnyUsbFilter_Service_Inst]
 DisplayName    = %AnyUsbFilter.SVCDESC%
 ServiceType    = 1               ; SERVICE_KERNEL_DRIVER

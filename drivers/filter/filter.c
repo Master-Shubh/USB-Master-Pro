@@ -24,6 +24,9 @@ AnyUsb_GetTransferBuffer(
     return NULL;
 }
 
+// Monotonically increasing 64-bit sequence counter (prevents ABA slot reuse races)
+static volatile LONG64 g_FilterSequenceCounter = 1;
+
 static NTSTATUS
 AnyUsbFilter_CreateControlDevice(
     _In_ WDFDRIVER Driver
@@ -330,13 +333,15 @@ AnyUsbFilter_DrainPendingRequests(
 
     WdfSpinLockAcquire(ControlData->PendingUrbLock);
     for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
-        WDFREQUEST req = ControlData->PendingRequests[i];
+        WDFREQUEST req = ControlData->PendingRequests[i].Request;
         if (req != NULL) {
             ULONG reqDevId = AnyUsbFilter_GetRequestDeviceId(req);
             if (TargetDeviceId == 0 || reqDevId == TargetDeviceId) {
                 NTSTATUS unmarkStatus = WdfRequestUnmarkCancelable(req);
                 if (NT_SUCCESS(unmarkStatus)) {
-                    ControlData->PendingRequests[i] = NULL;
+                    ControlData->PendingRequests[i].Request = NULL;
+                    ControlData->PendingRequests[i].SequenceId = 0;
+                    ControlData->PendingRequests[i].DeviceId = 0;
                     requestsToComplete[countToComplete++] = req;
                 }
                 // If unmarkStatus == STATUS_CANCELLED:
@@ -442,8 +447,10 @@ AnyUsbFilter_EvtPendingUrbCancel(
     if (g_ControlData != NULL) {
         WdfSpinLockAcquire(g_ControlData->PendingUrbLock);
         for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
-            if (g_ControlData->PendingRequests[i] == Request) {
-                g_ControlData->PendingRequests[i] = NULL;
+            if (g_ControlData->PendingRequests[i].Request == Request) {
+                g_ControlData->PendingRequests[i].Request = NULL;
+                g_ControlData->PendingRequests[i].SequenceId = 0;
+                g_ControlData->PendingRequests[i].DeviceId = 0;
                 break;
             }
         }
@@ -464,10 +471,12 @@ AnyUsbFilter_CancelAndCompletePendingSlot(
 {
     BOOLEAN shouldComplete = FALSE;
     WdfSpinLockAcquire(ControlData->PendingUrbLock);
-    if (Slot < ANYUSB_MAX_PENDING_URBS && ControlData->PendingRequests[Slot] == ExpectedRequest) {
+    if (Slot < ANYUSB_MAX_PENDING_URBS && ControlData->PendingRequests[Slot].Request == ExpectedRequest) {
         NTSTATUS unmarkStatus = WdfRequestUnmarkCancelable(ExpectedRequest);
         if (NT_SUCCESS(unmarkStatus)) {
-            ControlData->PendingRequests[Slot] = NULL;
+            ControlData->PendingRequests[Slot].Request = NULL;
+            ControlData->PendingRequests[Slot].SequenceId = 0;
+            ControlData->PendingRequests[Slot].DeviceId = 0;
             shouldComplete = TRUE;
         }
     }
@@ -583,45 +592,8 @@ AnyUsbFilter_EvtControlIoDeviceControl(
                     break;
                 }
 
-                ULONG assignedSlot = ANYUSB_MAX_PENDING_URBS;
-                NTSTATUS markStatus = STATUS_SUCCESS;
-
-                WdfSpinLockAcquire(controlData->PendingUrbLock);
-                for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
-                    if (controlData->PendingRequests[i] == NULL) {
-                        assignedSlot = i;
-                        break;
-                    }
-                }
-
-                if (assignedSlot < ANYUSB_MAX_PENDING_URBS) {
-                    markStatus = WdfRequestMarkCancelableEx(pendingGuestRequest, AnyUsbFilter_EvtPendingUrbCancel);
-                    if (NT_SUCCESS(markStatus)) {
-                        controlData->PendingRequests[assignedSlot] = pendingGuestRequest;
-                    } else {
-                        assignedSlot = ANYUSB_MAX_PENDING_URBS;
-                    }
-                }
-                WdfSpinLockRelease(controlData->PendingUrbLock);
-
-                if (assignedSlot == ANYUSB_MAX_PENDING_URBS) {
-                    if (!NT_SUCCESS(markStatus)) {
-                        WdfRequestComplete(pendingGuestRequest, markStatus);
-                        bytesReturned = 0;
-                        status = markStatus;
-                    } else {
-                        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                            "USB Master Pro Filter: Pending URB sequence table is full (max %d)\n", ANYUSB_MAX_PENDING_URBS));
-                        WdfRequestComplete(pendingGuestRequest, STATUS_INSUFFICIENT_RESOURCES);
-                        bytesReturned = 0;
-                        status = STATUS_INSUFFICIENT_RESOURCES;
-                    }
-                    break;
-                }
-
                 PANYUSB_URB_MESSAGE msg = (PANYUSB_URB_MESSAGE)outputBuffer;
                 RtlZeroMemory(msg, sizeof(ANYUSB_URB_MESSAGE));
-                msg->SequenceId = (ULONG64)(assignedSlot + 1);
 
                 msg->DeviceId = AnyUsbFilter_GetRequestDeviceId(pendingGuestRequest);
 
@@ -636,7 +608,7 @@ AnyUsbFilter_EvtControlIoDeviceControl(
                         KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                             "USB Master Pro Filter: Control transfer %lu exceeds 64 KB limit. Rejected.\n",
                             msg->TransferBufferLength));
-                        AnyUsbFilter_CancelAndCompletePendingSlot(controlData, assignedSlot, pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
+                        WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
                         bytesReturned = 0;
                         status = STATUS_BUFFER_OVERFLOW;
                         break;
@@ -659,7 +631,7 @@ AnyUsbFilter_EvtControlIoDeviceControl(
                         KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                             "USB Master Pro Filter: Control Ex transfer %lu exceeds 64 KB limit. Rejected.\n",
                             msg->TransferBufferLength));
-                        AnyUsbFilter_CancelAndCompletePendingSlot(controlData, assignedSlot, pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
+                        WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
                         bytesReturned = 0;
                         status = STATUS_BUFFER_OVERFLOW;
                         break;
@@ -681,7 +653,7 @@ AnyUsbFilter_EvtControlIoDeviceControl(
                         KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                             "USB Master Pro Filter: Bulk transfer %lu exceeds 64 KB limit. Rejected.\n",
                             msg->TransferBufferLength));
-                        AnyUsbFilter_CancelAndCompletePendingSlot(controlData, assignedSlot, pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
+                        WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
                         bytesReturned = 0;
                         status = STATUS_BUFFER_OVERFLOW;
                         break;
@@ -703,7 +675,7 @@ AnyUsbFilter_EvtControlIoDeviceControl(
                         KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                             "USB Master Pro Filter: Isoch transfer %lu exceeds 64 KB limit. Rejected.\n",
                             msg->TransferBufferLength));
-                        AnyUsbFilter_CancelAndCompletePendingSlot(controlData, assignedSlot, pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
+                        WdfRequestComplete(pendingGuestRequest, STATUS_BUFFER_OVERFLOW);
                         bytesReturned = 0;
                         status = STATUS_BUFFER_OVERFLOW;
                         break;
@@ -717,8 +689,52 @@ AnyUsbFilter_EvtControlIoDeviceControl(
                         }
                     }
                 } else {
-                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
-                        "USB Master Pro Filter: URB function 0x%04X fetched\n", urbFunc));
+                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                        "USB Master Pro Filter: Unsupported URB function 0x%04X rejected\n", urbFunc));
+                    urb->UrbHeader.Status = USBD_STATUS_NOT_SUPPORTED;
+                    WdfRequestComplete(pendingGuestRequest, STATUS_NOT_SUPPORTED);
+                    bytesReturned = 0;
+                    status = STATUS_NOT_SUPPORTED;
+                    break;
+                }
+
+                // Allocate monotonic 64-bit sequence ID
+                ULONG64 seqId = (ULONG64)InterlockedIncrement64(&g_FilterSequenceCounter);
+                msg->SequenceId = seqId;
+
+                ULONG assignedSlot = ANYUSB_MAX_PENDING_URBS;
+                WdfSpinLockAcquire(controlData->PendingUrbLock);
+                for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
+                    if (controlData->PendingRequests[i].Request == NULL) {
+                        assignedSlot = i;
+                        break;
+                    }
+                }
+
+                if (assignedSlot < ANYUSB_MAX_PENDING_URBS) {
+                    NTSTATUS markStatus = WdfRequestMarkCancelableEx(pendingGuestRequest, AnyUsbFilter_EvtPendingUrbCancel);
+                    if (NT_SUCCESS(markStatus)) {
+                        controlData->PendingRequests[assignedSlot].Request = pendingGuestRequest;
+                        controlData->PendingRequests[assignedSlot].SequenceId = seqId;
+                        controlData->PendingRequests[assignedSlot].DeviceId = msg->DeviceId;
+                    } else {
+                        assignedSlot = ANYUSB_MAX_PENDING_URBS;
+                        WdfRequestComplete(pendingGuestRequest, markStatus);
+                        WdfSpinLockRelease(controlData->PendingUrbLock);
+                        bytesReturned = 0;
+                        status = markStatus;
+                        break;
+                    }
+                }
+                WdfSpinLockRelease(controlData->PendingUrbLock);
+
+                if (assignedSlot == ANYUSB_MAX_PENDING_URBS) {
+                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                        "USB Master Pro Filter: Pending URB sequence table is full (max %d)\n", ANYUSB_MAX_PENDING_URBS));
+                    WdfRequestComplete(pendingGuestRequest, STATUS_INSUFFICIENT_RESOURCES);
+                    bytesReturned = 0;
+                    status = STATUS_INSUFFICIENT_RESOURCES;
+                    break;
                 }
 
                 bytesReturned = sizeof(ANYUSB_URB_MESSAGE);
@@ -735,12 +751,7 @@ AnyUsbFilter_EvtControlIoDeviceControl(
             status = WdfRequestRetrieveInputBuffer(Request, sizeof(ANYUSB_COMPLETE_REQUEST), (PVOID*)&compReq, NULL);
             if (NT_SUCCESS(status) && compReq != NULL) {
                 ULONG64 seqId = compReq->SequenceId;
-                if (seqId < 1 || seqId > ANYUSB_MAX_PENDING_URBS) {
-                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                        "USB Master Pro Filter: Invalid SequenceId %llu\n", seqId));
-                    status = STATUS_INVALID_PARAMETER;
-                    break;
-                }
+                WDFREQUEST targetRequest = NULL;
 
                 if (compReq->ActualLength > sizeof(compReq->Data)) {
                     KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -749,23 +760,42 @@ AnyUsbFilter_EvtControlIoDeviceControl(
                     break;
                 }
 
-                ULONG slot = (ULONG)(seqId - 1);
-                WDFREQUEST targetRequest = NULL;
-
                 WdfSpinLockAcquire(controlData->PendingUrbLock);
-                targetRequest = controlData->PendingRequests[slot];
-                if (targetRequest != NULL) {
-                    NTSTATUS unmarkStatus = WdfRequestUnmarkCancelable(targetRequest);
-                    if (NT_SUCCESS(unmarkStatus)) {
-                        controlData->PendingRequests[slot] = NULL;
-                    } else {
-                        targetRequest = NULL; // STATUS_CANCELLED: cancel routine owns it
+                for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
+                    if (controlData->PendingRequests[i].Request != NULL &&
+                        controlData->PendingRequests[i].SequenceId == seqId) {
+                        
+                        // Verify DeviceId binding to prevent cross-device memory corruption
+                        if (compReq->DeviceId != 0 && controlData->PendingRequests[i].DeviceId != 0 &&
+                            compReq->DeviceId != controlData->PendingRequests[i].DeviceId) {
+                            KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
+                                "USB Master Pro Filter: DeviceId mismatch for Seq %llu (Expected %lu, Got %lu)\n",
+                                seqId, controlData->PendingRequests[i].DeviceId, compReq->DeviceId));
+                            break;
+                        }
+
+                        WDFREQUEST candidate = controlData->PendingRequests[i].Request;
+                        NTSTATUS unmarkStatus = WdfRequestUnmarkCancelable(candidate);
+                        if (NT_SUCCESS(unmarkStatus)) {
+                            targetRequest = candidate;
+                            controlData->PendingRequests[i].Request = NULL;
+                            controlData->PendingRequests[i].SequenceId = 0;
+                            controlData->PendingRequests[i].DeviceId = 0;
+                        } else {
+                            // Cancel routine already owns completion; drop slot cleanly
+                            controlData->PendingRequests[i].Request = NULL;
+                            controlData->PendingRequests[i].SequenceId = 0;
+                            controlData->PendingRequests[i].DeviceId = 0;
+                        }
+                        break;
                     }
                 }
                 WdfSpinLockRelease(controlData->PendingUrbLock);
 
                 if (targetRequest == NULL) {
-                    status = STATUS_CANCELLED;
+                    KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_WARNING_LEVEL,
+                        "USB Master Pro Filter: Stale, duplicate, or cancelled SequenceId %llu dropped\n", seqId));
+                    status = STATUS_NOT_FOUND;
                     break;
                 }
 

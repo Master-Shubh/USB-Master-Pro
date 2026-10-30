@@ -100,6 +100,13 @@ typedef struct _ANYUSB_URB_MESSAGE {
 
 #define ANYUSB_MAX_PENDING_URBS 256
 
+// Pending URB tracking slot with sequence token & device binding to prevent ABA stale mismatches
+typedef struct _ANYUSB_PENDING_SLOT {
+    WDFREQUEST  Request;
+    ULONG64     SequenceId;
+    ULONG       DeviceId;
+} ANYUSB_PENDING_SLOT, *PANYUSB_PENDING_SLOT;
+
 // Bus FDO Device Context
 typedef struct _FDO_DEVICE_DATA {
     WDFDEVICE               WdfDevice;
@@ -109,7 +116,7 @@ typedef struct _FDO_DEVICE_DATA {
     WDFSPINLOCK             DeviceListLock;
     LIST_ENTRY              ChildPdoList;
     WDFSPINLOCK             PendingUrbLock;  // Protects the pending requests sequence table
-    WDFREQUEST              PendingRequests[ANYUSB_MAX_PENDING_URBS];
+    ANYUSB_PENDING_SLOT     PendingRequests[ANYUSB_MAX_PENDING_URBS];
 } FDO_DEVICE_DATA, *PFDO_DEVICE_DATA;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FDO_DEVICE_DATA, GetFdoData)
