@@ -13,7 +13,7 @@ test-utils = []
 driver-simulation = []
 
 [dev-dependencies]
-usb-master-core = { path = ".", features = ["test-utils"] }
+usb-master-core = { path = ".", features = ["test-utils", "driver-simulation"] }
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
