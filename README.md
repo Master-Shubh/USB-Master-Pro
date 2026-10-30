@@ -1,11 +1,11 @@
 # ⚡ USB Master Pro — Experimental Field-Testing Engine for USB-over-IP
 
-[![Release](https://img.shields.io/badge/Release-v1.0.0_Experimental-blue.svg?style=flat-square)](https://github.com/bhartx/usb-master-pro)
-[![Windows CI/CD](https://img.shields.io/badge/Windows_Server_2022-100%25_Green_(Run_41038706487)-brightgreen.svg?style=flat-square)](https://github.com/bhartx/usb-master-pro/actions)
-[![Core Test Suite](https://img.shields.io/badge/Core_Tests-122%2F122_Passing_(12_Suites)-success.svg?style=flat-square)](https://github.com/bhartx/usb-master-pro)
-[![KMDF Drivers](https://img.shields.io/badge/KMDF_Drivers-1.33_Test--Signed_(Authenticode)-blueviolet.svg?style=flat-square)](https://github.com/bhartx/usb-master-pro)
-[![Installer](https://img.shields.io/badge/Inno_Setup-1--Click_Installer-orange.svg?style=flat-square)](https://github.com/bhartx/usb-master-pro)
-[![Architecture](https://img.shields.io/badge/Architecture-x64_AMD64_Native-informational.svg?style=flat-square)](https://github.com/bhartx/usb-master-pro)
+[![Release](https://img.shields.io/badge/Release-v1.0.0_Experimental-blue.svg?style=flat-square)](https://github.com/Master-Shubh/USB-Master-Pro)
+[![Windows CI/CD](https://github.com/Master-Shubh/USB-Master-Pro/actions/workflows/windows-release-build.yml/badge.svg)](https://github.com/Master-Shubh/USB-Master-Pro/actions)
+[![Core Test Suite](https://img.shields.io/badge/Core_Tests-133%2F133_Passing_(12_Suites)-success.svg?style=flat-square)](https://github.com/Master-Shubh/USB-Master-Pro)
+[![KMDF Drivers](https://img.shields.io/badge/KMDF_Drivers-1.33_Test--Signed_(Authenticode)-blueviolet.svg?style=flat-square)](https://github.com/Master-Shubh/USB-Master-Pro)
+[![Installer](https://img.shields.io/badge/Inno_Setup-1--Click_Installer-orange.svg?style=flat-square)](https://github.com/Master-Shubh/USB-Master-Pro)
+[![Architecture](https://img.shields.io/badge/Architecture-x64_AMD64_Native-informational.svg?style=flat-square)](https://github.com/Master-Shubh/USB-Master-Pro)
 [![Proprietary License](https://img.shields.io/badge/License-BhartX_Enterprise_Proprietary-red.svg?style=flat-square)](https://bhartx.in)
 
 **USB Master Pro v1.0.0 — Experimental Field-Testing Engine for USB-over-IP** is a single-binary, memory-safe USB-over-IP virtualization platform developed and owned by **BhartX Ecosystems Pvt Ltd**. Engineered to provide an **AnyDesk-style peer-to-peer user experience**, USB Master Pro delivers hardware-transparent peripheral redirection across Windows 10, Windows 11, and Windows Server 2022 without requiring manual router port forwarding, static IP allocation, or complex network reconfiguration.
@@ -107,7 +107,7 @@ USB Master Pro/
 │   │   ├── state.rs                   # Canonical 12-state session finite automaton
 │   │   ├── urb_engine.rs              # USBD URB state machine & Speculative Bulk Read Ring
 │   │   └── usb_descriptors.rs         # Zero-copy USB descriptor parser & configuration trees
-│   └── tests/                         # Automated End-to-End & Integration Suite (122 tests)
+│   └── tests/                         # Automated End-to-End & Integration Suite (133 tests)
 │       ├── biometric_simulation_test.rs    # Mantra & Morpho timing, raw optical extraction
 │       ├── concurrency_race_test.rs        # 100 parallel threads under 69,900+ URB ops/sec
 │       ├── daemon_ipc_test.rs              # REST API & local loopback token auth validation
@@ -158,6 +158,8 @@ USB Master Pro features two native Windows Kernel-Mode Driver Framework (KMDF 1.
 ### 1. Hardware Capture Upper Filter Driver (`anyusb_filter.sys`)
 The filter driver operates as an Upper Filter in the physical USB device stack, intercepting USB Request Blocks (URBs) before they reach the host controller.
 
+- **Targeted Device-Instance Filtering (Zero Global USB Class Interception)**:
+  To eliminate system-wide freeze and BSOD hazards, `anyusb_filter.inf` does not register global Class UpperFilters on the entire USB class (`{36FC9E60-C465-11CF-8056-444553540000}`). Instead, `anyusb_filter.sys` installs cleanly as a standalone kernel service (`SERVICE_DEMAND_START`), and UpperFilter attachment is performed dynamically and selectively per specific hardware device instance registry key (`HKLM\SYSTEM\CurrentControlSet\Enum\USB\<Vid_Pid>\<InstanceId>\UpperFilters`). For any device attached where `filterData->IsCaptured == FALSE`, the driver maintains transparent `WDF_REQUEST_SEND_OPTION_SEND_AND_FORGET` passthrough down the physical stack, ensuring zero interference with host mice, keyboards, webcams, or USB root hubs.
 - **Hardware ID Namespace Isolation (Self-Exclusion Invariant)**:
   To prevent infinite recursive driver attachment and system-crashing BSOD loops when a machine acts as both Sender and Receiver, the filter driver queries `DEVPKEY_Device_EnumeratorName` in `AnyUsbFilter_EvtDeviceAdd`. If the bus enumerator is `LOGOS_VUSB` or `ANYUSB`, the driver returns `STATUS_NOT_SUPPORTED` and refuses attachment. Synthetic virtual devices are never re-hooked by the physical capture driver.
 - **Selective Queue Draining via `WdfIoQueueFindRequest`**:
@@ -192,15 +194,15 @@ The VHCI driver operates as a root bus driver (`Class = System`, `ClassGUID = {4
 
 The user-mode Turbo-URB engine is implemented in memory-safe Rust (2021 edition), featuring zero unsafe blocks on the hot data path and zero heap allocations during steady-state transfers.
 
-### 1. Automated Test Suite (122 / 122 Tests Passing)
+### 1. Automated Test Suite (133 / 133 Tests Passing)
 Every commit and release is validated across 12 distinct integration and unit test suites:
 
 | Test Suite | File | Passing Tests | Domain Covered |
 | :--- | :--- | :---: | :--- |
-| **USBD & Core Engine** | `core/src/lib.rs` | **72** | USBD state machine, buffer pool reuse, token auth, descriptor parsing, crypto |
+| **USBD & Core Engine** | `core/src/lib.rs` | **81** | USBD state machine, buffer pool reuse, token auth, descriptor parsing, crypto |
 | **Real Driver Lifecycle** | `tests/real_driver_lifecycle_test.rs` | **15** | Attach/detach PDO cycles, pnputil exit codes, driver operational status |
 | **Protocol Verification** | `tests/protocol_verification_test.rs` | **9** | 36-byte framing, magic validation, payload bounds, stream reassembly |
-| **URB Data Plane** | `tests/urb_data_plane_test.rs` | **7** | 64 KB buffer boundary, selective queue draining, loopback pump |
+| **URB Data Plane** | `tests/urb_data_plane_test.rs` | **9** | 64 KB buffer boundary, selective queue draining, loopback pump |
 | **Device Adapters** | `tests/device_adapters_test.rs` | **5** | Mantra, Morpho, Iris, Slap 4-4-2, and GNSS protocol normalizers |
 | **Device Reset Machine** | `tests/device_reset_test.rs` | **4** | Soft reset stall clearing, hard reset address revert, surprise removal |
 | **Concurrency & Race** | `tests/concurrency_race_test.rs` | **4** | 100 concurrent threads, 69,900+ URB ops/sec, zero race conditions |
@@ -209,7 +211,7 @@ Every commit and release is validated across 12 distinct integration and unit te
 | **Milestone P0 Synthetic** | `tests/synthetic_session_test.rs` | **2** | End-to-end 5-phase session verification under artificial packet drops |
 | **Release Secret Gate** | `tests/release_leak_test.rs` | **1** | Automated verification that release binaries contain 0 private keys/seeds |
 | **Multi-Node E2E Integration** | `tests/e2e_integration_test.rs` | **1** | Multi-process Sender <-> Broker <-> Receiver full-stack passthrough |
-| **TOTAL** | **12 Test Suites** | **122 / 122** | **100% Green Telemetry** |
+| **TOTAL** | **12 Test Suites** | **133 / 133** | **100% Green Telemetry** |
 
 ### 2. 36-Byte Fixed Wire Framing (`TurboUrbHeader`)
 All network transmissions serialize URBs into a 36-byte packed binary header followed immediately by the payload:
@@ -329,7 +331,7 @@ USB Master Pro utilizes a continuous delivery pipeline executed on **Windows Ser
 2. **Driver Compilation**: Builds `drivers/vhci/anyusb_vhci.vcxproj` and `drivers/filter/anyusb_filter.vcxproj` in `Release | x64` configuration.
 3. **Inf2Cat & Authenticode Test-Signing**: Invokes `setup_field_test_signing.ps1` to generate cryptographic security catalogs (`.cat`) and test-sign drivers with `bhartx_test_ca.cer`.
 4. **Test Verification**:
-   - Executes 122 automated Rust tests via `cargo test --workspace --target x86_64-pc-windows-msvc`.
+   - Executes 133 automated Rust tests via `cargo test --workspace --target x86_64-pc-windows-msvc`.
    - Executes signaling security regression test suite via `npm test`.
 5. **Release Binaries**: Compiles optimized release binaries (`usb_master_daemon.exe` and `usb_master_cli.exe`).
 6. **Zero-Secret Leak Gate**: Executes `verify_no_leaks.ps1` across all compiled executables and kernel drivers.
@@ -538,7 +540,7 @@ cargo run --release --bin usb_master_daemon
 
 ## ✅ Production Verification & Test Status
 
-- **Automated Core Test Suite**: **122 / 122 Tests Passing** (100% Green across 12 integration suites)
+- **Automated Core Test Suite**: **133 / 133 Tests Passing** (100% Green across 12 integration suites)
 - **Windows Server 2022 CI/CD**: Run `41038706487` Verified Green
 - **Biometric Sensor Simulation**: Mantra MFS100 (`13.35 ms`) & Morpho MSO 1300 (`7.60 ms`)
 - **Concurrent Load**: 100 parallel threads executing `69,962.4` URB ops/sec with zero race conditions

@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2021"
 authors = ["BhartX Ecosystems Pvt Ltd <admin@bhartx.in>"]
 homepage = "https://bhartx.in"
-repository = "https://github.com/bhartx/usb-master-pro"
+repository = "https://github.com/Master-Shubh/USB-Master-Pro"
 description = "High-performance Turbo-URB USB-over-IP core engine for USB Master Pro — Owned & Developed by BhartX Ecosystems Pvt Ltd"
 
 [features]
