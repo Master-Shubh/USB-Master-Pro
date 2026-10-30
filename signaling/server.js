@@ -18,6 +18,7 @@ const pendingChallenges = new Map();      // idString -> { nonce, publicKey, tim
 const pendingConnectRequests = new Map(); // reqKey ("fromId:targetId") -> { timestamp, fromId, targetId }
 const connectionsByIp = new Map();        // ip -> Set<ws>
 const activeChannels = new Map();         // channelId -> { senderId, receiverId, deviceId }
+const activePeerPairs = new Map();        // ws -> targetWs (Zero-copy binary Turbo-URB routing)
 
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -128,7 +129,17 @@ wss.on('connection', (ws, req) => {
     resetTime: Date.now() + 10000
   };
 
-  ws.on('message', (data) => {
+  ws.on('message', (data, isBinary) => {
+    // Zero-overhead binary data relay for active USB forwarding tunnels
+    const isBin = isBinary || (Buffer.isBuffer(data) && data.length >= 4 && (data[0] !== 0x7B && data[0] !== 0x20));
+    if (isBin) {
+      const targetWs = activePeerPairs.get(ws);
+      if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        targetWs.send(data, { binary: true });
+      }
+      return;
+    }
+
     const now = Date.now();
     if (now > rateLimit.resetTime) {
       rateLimit.count = 0;
@@ -158,6 +169,13 @@ wss.on('connection', (ws, req) => {
       if (conns.size === 0) {
         connectionsByIp.delete(remoteIp);
       }
+    }
+
+    // Clean up active binary peer bridge
+    if (activePeerPairs.has(ws)) {
+      const partner = activePeerPairs.get(ws);
+      activePeerPairs.delete(partner);
+      activePeerPairs.delete(ws);
     }
 
     const peerId = peersByWs.get(ws);
@@ -573,6 +591,17 @@ function handleMessage(ws, msg) {
       }
 
       console.log(`[Broker] Routing connection decision: [${fromId}] -> [${toId}]: Accepted=${msg.accepted}`);
+      if (msg.accepted) {
+        activePeerPairs.set(ws, client.ws);
+        activePeerPairs.set(client.ws, ws);
+        const chanId = `${toId}:${fromId}`;
+        activeChannels.set(chanId, {
+          senderId: fromId,
+          receiverId: toId,
+          createdAt: Date.now()
+        });
+        console.log(`[Broker] Active binary data bridge established between [${fromId}] <--> [${toId}]`);
+      }
       client.ws.send(JSON.stringify({
         type: 'CONNECT_DECISION',
         fromId,
@@ -642,5 +671,6 @@ module.exports = {
   verifiedPeers,
   pendingChallenges,
   pendingConnectRequests,
-  connectionsByIp
+  connectionsByIp,
+  activePeerPairs
 };

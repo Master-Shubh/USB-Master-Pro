@@ -194,6 +194,126 @@ async fn test_full_loopback_urb_pump_pipeline() {
 }
 
 #[tokio::test]
+async fn test_e2e_network_wire_forwarding_and_descriptor_resolution() {
+    let vhci_client = Arc::new(VhciDriverClient::open().expect("VhciDriverClient open failed"));
+    let test_device_id: u32 = 101;
+
+    let (shutdown_tx, shutdown_rx_vhci) = watch::channel(false);
+    let shutdown_rx_net = shutdown_tx.subscribe();
+    let mut shutdown_rx_fwd = shutdown_tx.subscribe();
+
+    // Data channels simulating the Guest pumps
+    let (vhci_to_net_tx, mut vhci_to_net_rx) = mpsc::channel::<Vec<u8>>(32);
+    let (net_to_vhci_tx, net_to_vhci_rx) = mpsc::channel::<Vec<u8>>(32);
+    let (binary_outbound_tx, mut binary_outbound_rx) = mpsc::channel::<Vec<u8>>(32);
+
+    let vhci_clone_1 = Arc::clone(&vhci_client);
+    let vhci_to_net_task = tokio::spawn(async move {
+        run_vhci_to_network_pump(vhci_clone_1, test_device_id, vhci_to_net_tx, shutdown_rx_vhci).await;
+    });
+
+    let vhci_clone_2 = Arc::clone(&vhci_client);
+    let net_to_vhci_task = tokio::spawn(async move {
+        run_network_to_vhci_pump(vhci_clone_2, net_to_vhci_rx, shutdown_rx_net).await;
+    });
+
+    // Network wire forwarder
+    let binary_tx = binary_outbound_tx.clone();
+    let net_fwd_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                res = shutdown_rx_fwd.changed() => {
+                    if res.is_err() || *shutdown_rx_fwd.borrow() { break; }
+                }
+                frame = vhci_to_net_rx.recv() => {
+                    match frame {
+                        Some(bytes) => {
+                            if binary_tx.send(bytes).await.is_err() { break; }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    });
+
+    // 1. Guest OS issues GET_DESCRIPTOR (18-byte Device Descriptor) into VHCI pending queue
+    let mut submit_msg = AnyUsbUrbMessage::default();
+    submit_msg.device_id = test_device_id;
+    submit_msg.sequence_id = 1234;
+    submit_msg.endpoint_address = 0x00; // Control EP0
+    submit_msg.transfer_type = 0; // Control
+    submit_msg.transfer_buffer_length = 18;
+    // Setup packet for GET_DESCRIPTOR (Device): bmRequestType=0x80, bRequest=0x06, wValue=0x0100, wIndex=0, wLength=18
+    submit_msg.setup_packet[0] = 0x80;
+    submit_msg.setup_packet[1] = 0x06;
+    submit_msg.setup_packet[2] = 0x00;
+    submit_msg.setup_packet[3] = 0x01; // Descriptor type 1 = Device
+    submit_msg.setup_packet[6] = 18;
+    submit_msg.setup_packet[7] = 0;
+
+    vhci_client.queue_simulated_urb(submit_msg);
+
+    // 2. Receive the frame forwarded by net_fwd_task across the network wire
+    let wire_frame = tokio::time::timeout(Duration::from_millis(500), binary_outbound_rx.recv())
+        .await
+        .expect("Timeout waiting for frame on network wire")
+        .expect("Channel closed unexpectedly");
+
+    assert!(wire_frame.len() >= TurboUrbHeader::SIZE);
+    let parsed_hdr = TurboUrbHeader::deserialize_single_urb(&wire_frame[..TurboUrbHeader::SIZE])
+        .expect("Valid TurboUrbHeader");
+    assert_eq!(parsed_hdr.command, CMD_SUBMIT_URB);
+    assert_eq!(parsed_hdr.sequence_id, 1234);
+
+    // 3. Emulate Host USB response: synthesize 18-byte Device Descriptor
+    let dev_desc = vec![
+        18, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
+        0x6D, 0x04, 0x77, 0xC0, 0x00, 0x01, 1, 2, 3, 1
+    ];
+    let mut resp_hdr = TurboUrbHeader::new(
+        CMD_COMPLETE_URB,
+        parsed_hdr.sequence_id,
+        parsed_hdr.device_id,
+        parsed_hdr.endpoint_address,
+        parsed_hdr.transfer_type,
+        18,
+    );
+    resp_hdr.status = 0;
+    resp_hdr.actual_length = 18;
+
+    let mut comp_frame = resp_hdr.serialize();
+    comp_frame.extend_from_slice(&dev_desc);
+
+    // Host sends back over network wire to net_to_vhci_tx
+    net_to_vhci_tx.send(comp_frame).await.expect("Send completion frame");
+
+    // 4. Verify VHCI completed the URB with Device Descriptor
+    let mut completed = Vec::new();
+    for _ in 0..20 {
+        completed = vhci_client.get_completed_urbs();
+        if !completed.is_empty() { break; }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+
+    assert_eq!(completed.len(), 1, "Expected 1 completed URB in VHCI client");
+    let c_seq = { completed[0].sequence_id };
+    let c_len = { completed[0].actual_length };
+    assert_eq!(c_seq, 1234);
+    assert_eq!(c_len, 18);
+    assert_eq!(completed[0].data[0], 18, "bLength must be 18");
+    assert_eq!(completed[0].data[1], 0x01, "bDescriptorType must be Device (1)");
+    assert_eq!(completed[0].data[8], 0x6D, "Vendor ID low byte must match");
+    assert_eq!(completed[0].data[9], 0x04, "Vendor ID high byte must match");
+
+    // Clean teardown
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_millis(200), vhci_to_net_task).await;
+    let _ = tokio::time::timeout(Duration::from_millis(200), net_to_vhci_task).await;
+    let _ = tokio::time::timeout(Duration::from_millis(200), net_fwd_task).await;
+}
+
+#[tokio::test]
 async fn test_urb_64kb_boundary_enforcement() {
     let vhci = Arc::new(VhciDriverClient::open().expect("Open VHCI"));
     let filter = FilterDriverClient::open().expect("Open Filter");

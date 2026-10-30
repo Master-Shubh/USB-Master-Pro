@@ -1,14 +1,14 @@
-# ⚡ USB Master Pro — Enterprise P2P USB Virtualization Suite
+# ⚡ USB Master Pro — Experimental Field-Testing Engine for USB-over-IP
 
-[![Release](https://img.shields.io/badge/Release-v1.0.0_Enterprise-blue.svg?style=flat-square)](https://github.com/bhartx/usb-master-pro)
+[![Release](https://img.shields.io/badge/Release-v1.0.0_Experimental-blue.svg?style=flat-square)](https://github.com/bhartx/usb-master-pro)
 [![Windows CI/CD](https://img.shields.io/badge/Windows_Server_2022-100%25_Green_(Run_41038706487)-brightgreen.svg?style=flat-square)](https://github.com/bhartx/usb-master-pro/actions)
 [![Core Test Suite](https://img.shields.io/badge/Core_Tests-122%2F122_Passing_(12_Suites)-success.svg?style=flat-square)](https://github.com/bhartx/usb-master-pro)
-[![KMDF Drivers](https://img.shields.io/badge/KMDF_Drivers-1.33_Signed_(Authenticode)-blueviolet.svg?style=flat-square)](https://github.com/bhartx/usb-master-pro)
+[![KMDF Drivers](https://img.shields.io/badge/KMDF_Drivers-1.33_Test--Signed_(Authenticode)-blueviolet.svg?style=flat-square)](https://github.com/bhartx/usb-master-pro)
 [![Installer](https://img.shields.io/badge/Inno_Setup-1--Click_Installer-orange.svg?style=flat-square)](https://github.com/bhartx/usb-master-pro)
 [![Architecture](https://img.shields.io/badge/Architecture-x64_AMD64_Native-informational.svg?style=flat-square)](https://github.com/bhartx/usb-master-pro)
 [![Proprietary License](https://img.shields.io/badge/License-BhartX_Enterprise_Proprietary-red.svg?style=flat-square)](https://bhartx.in)
 
-**USB Master Pro** is an enterprise-grade, single-binary, memory-safe USB-over-IP virtualization platform developed and owned by **BhartX Ecosystems Pvt Ltd**. Engineered to supersede legacy commercial tools (SimplyCore USB Redirector, VirtualHere, FabulaTech), USB Master Pro provides an **AnyDesk-style peer-to-peer user experience**, achieving hardware-transparent peripheral redirection across Windows 10, Windows 11, and Windows Server 2022 without requiring manual router port forwarding, static IP allocation, or complex network reconfiguration.
+**USB Master Pro v1.0.0 — Experimental Field-Testing Engine for USB-over-IP** is a single-binary, memory-safe USB-over-IP virtualization platform developed and owned by **BhartX Ecosystems Pvt Ltd**. Engineered to provide an **AnyDesk-style peer-to-peer user experience**, USB Master Pro delivers hardware-transparent peripheral redirection across Windows 10, Windows 11, and Windows Server 2022 without requiring manual router port forwarding, static IP allocation, or complex network reconfiguration.
 
 ---
 
@@ -184,7 +184,7 @@ The VHCI driver operates as a root bus driver (`Class = System`, `ClassGUID = {4
 - **Compilation**: Visual Studio 2022 v170 MSBuild toolset targeting `WindowsKernelModeDriver10.0` with Windows 11 SDK (22621) and WDK 11.
 - **Catalog Generation**: Microsoft `Inf2Cat.exe` generates cryptographically hashed catalogs (`anyusb_vhci.cat`, `anyusb_filter.cat`) verified for `10_X64,Server2022_X64`.
 - **Authenticode Test Signing**: Automated field-test signing via `scripts/setup_field_test_signing.ps1`, stamping drivers with `bhartx_test_ca.cer` containing Kernel Mode Signing extensions (`1.3.6.1.4.1.311.10.3.6`).
-- **WHQL Ready**: Fully compliant with Microsoft Hardware Lab Kit (HLK) tests for certified WHQL Attestation Signing.
+- **KMDF Drivers**: Field Test-Signed (Authenticode) for lab and field validation (WHQL submission requires Extended Validation EV Hardware Token).
 
 ---
 
@@ -232,7 +232,7 @@ All network transmissions serialize URBs into a 36-byte packed binary header fol
 ### 3. Speculative Bulk Read Ring (16 Buffers)
 Legacy USB-over-IP architectures suffer from the "Chatty URB" penalty: UIDAI Aadhaar RD Services exchange >150 roundtrips during fingerprint capture. Across a 50ms WAN connection, this causes a 7.5-second stall, breaching UIDAI's strict <3000ms capture deadline.
 - USB Master Pro Receiver maintains a **Speculative Bulk Read Ring** of 16 pre-allocated URBs.
-- Incoming bulk IN read requests from guest drivers are fulfilled immediately from local buffer memory in **0.049 ms**, eliminating WAN latency penalties.
+- Implements a zero-copy binary Turbo-URB protocol with microsecond pacing (~0.049 ms in synthetic in-memory ring tests; real-world latency is governed by physical USB host controller pacing and network WAN roundtrips), currently validated in automated test suites and undergoing physical hardware test matrix validation.
 
 ### 4. Adaptive Zstandard Streaming Compression
 - Biometric scans (uncompressed 500 KB optical bitmaps) are compressed in real time using Zstandard-1.
@@ -253,6 +253,8 @@ The core includes native heuristic classifiers recognizing enterprise hardware o
 - **POS Printers**: TVS RP3200 (`0x0FE6:0x811E`), Epson TM-T88 (`0x04B8:0x0202`), TSC Barcode (`0x1203:0x0168`).
 - **Serial Bridges**: FTDI FT232R (`0x0403:0x6001`), Silicon Labs CP2102 (`0x10C4:0xEA60`), WCH CH340 (`0x1A86:0x7523`).
 - **Security Tokens**: Feitian ePass2003 (`0x096E:0x0807`), YubiKey 5 (`0x1050:0x0407`).
+
+> **Engineering Status & Hardware Validation**: Device adapter heuristics covering 15 Indian e-Gov and biometric device profiles (Mantra, Morpho, Startek, Cogent, Iris, and GNSS) utilize zero-copy binary Turbo-URB protocol with microsecond pacing, currently validated in automated test suites (`tests/device_adapters_test.rs`) and undergoing physical hardware test matrix validation.
 
 ---
 
@@ -383,6 +385,76 @@ verifier /query
 verifier /reset
 ```
 
+### 🖥️ Physical 2-Machine Testing Guide
+
+This guide walks through validating real-hardware USB-over-IP redirection between two physical Windows workstations:
+
+#### Setup Architecture
+- **Machine B (Host / Sender)**: Physical PC where the actual USB device (e.g. Mantra MFS100 biometric scanner, webcam, or USB flash drive) is plugged into a physical USB port.
+- **Machine A (Guest / Receiver)**: Target PC where the synthetic virtual device will be mounted into Windows Device Manager under `LOGOS_VUSB`.
+- **Signaling Broker**: Coordinates peer discovery and NAT traversal (run locally on the LAN or use a centralized host on port 8443).
+
+```text
+[Machine B: Host / Sender]                        [Machine A: Guest / Receiver]
++--------------------------+                      +---------------------------+
+| Real USB Peripheral      |                      | Virtual Device (UPDO)     |
+|          v               |                      |            ^              |
+| anyusb_filter.sys        |                      | anyusb_vhci.sys           |
+|          v               |                      |            ^              |
+| USBMasterDaemon.exe      | === Encrypted P2P ==>| USBMasterDaemon.exe       |
++--------------------------+     (Turbo-URB)      +---------------------------+
+             ^                                                  ^
+             +-------------- [ Signaling Broker ] --------------+
+```
+
+#### Step 1: Install Software & Drivers on Both Machines
+Run the installer on both Machine A and Machine B:
+```cmd
+:: Run installer as Administrator:
+USBMasterPro-Setup-v1.0.0.exe
+
+:: Or execute manual installation from the release bundle:
+scripts\install_zero_reboot.bat
+```
+*(Note: If using test-signed drivers during field testing, ensure test signing is enabled via `scripts\setup_field_test_signing.ps1` or `bcdedit /set testsigning on` if required by Windows).*
+
+#### Step 2: Start the Signaling Server
+If running your own signaling rendezvous broker on the local network (or on Machine B):
+```bash
+cd signaling
+npm install
+node server.js
+# Broker listening on http://0.0.0.0:8443
+```
+
+#### Step 3: Start Host Daemon on Machine B (Sender)
+1. Plug the physical USB peripheral into Machine B.
+2. Launch the daemon:
+   ```cmd
+   USBMasterDaemon.exe
+   ```
+3. Verify the device is enumerated:
+   ```cmd
+   usb_master_cli.exe list
+   ```
+4. Note Machine B's 9-digit AnyUSB ID (displayed in console and at `http://127.0.0.1:19842`, e.g. `123 456 789`).
+
+#### Step 4: Connect from Machine A (Receiver)
+1. Launch the daemon on Machine A:
+   ```cmd
+   USBMasterDaemon.exe
+   ```
+2. Connect to Machine B using its 9-digit AnyUSB ID:
+   ```cmd
+   usb_master_cli.exe connect 123456789 auto
+   ```
+3. If prompted on Machine B, approve the connection pairing or enter the dynamic PIN.
+
+#### Step 5: Verify Hardware Mounting & Functionality
+1. On Machine A, open **Device Manager** (`devmgmt.msc`).
+2. Verify that the peripheral appears under its expected class (e.g. Biometric Devices, Cameras, Ports) attached to the `LOGOS_VUSB` Virtual Host Controller with native OEM hardware IDs (VID/PID).
+3. Open native vendor client software (e.g., Mantra RD Service test utility, Windows Camera app, or diagnostic tool) on Machine A to confirm end-to-end device operation.
+
 ### Running the CLI & Synthetic Benchmark
 ```cmd
 :: Scan all connected physical USB hardware (<30ms)
@@ -403,7 +475,7 @@ usb_master_cli.exe gui
 
 ### In-Memory Synthetic Benchmark Results
 - **Memory Pipeline Processing Throughput**: `10,298 MB/s` *(Synthetic RAM-to-RAM benchmark measuring serialization, buffer pool cycling, and Zstandard compression; physical throughput is bounded by USB 2.0 / 3.0 bus limits and network conditions)*
-- **Average Frame Processing Latency**: `0.049 ms`
+- **Average Frame Processing Latency**: `0.049 ms` *(Synthetic in-memory loopback pipeline; real-world latency reflects network RTT and physical USB host controller pacing)*
 - **Compression Efficiency**: Shrunk test bitmap patterns by up to `8,594x` via streaming Zstd.
 
 ### Checking License Status via REST API

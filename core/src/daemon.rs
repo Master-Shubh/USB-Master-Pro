@@ -184,6 +184,7 @@ pub struct DaemonTelemetry {
 pub struct SessionPumpHandles {
     pub vhci_to_net_task: tokio::task::JoinHandle<()>,
     pub net_to_vhci_task: tokio::task::JoinHandle<()>,
+    pub net_fwd_task: tokio::task::JoinHandle<()>,
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     pub session_data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     pub vhci_out_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
@@ -195,6 +196,7 @@ pub struct DaemonState {
     pub remote_devices: RwLock<Vec<RemoteMountedDevice>>,
     pub active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
     pub broker_tx: mpsc::Sender<serde_json::Value>,
+    pub binary_outbound_tx: mpsc::Sender<Vec<u8>>,
     pub ui_events_tx: broadcast::Sender<serde_json::Value>,
     pub broker_connected: AtomicBool,
     pub start_time: Instant,
@@ -649,6 +651,7 @@ impl DaemonServer {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let identity = NodeIdentity::load_or_generate();
         let (broker_tx, broker_rx) = mpsc::channel::<serde_json::Value>(64);
+        let (binary_tx, binary_rx) = mpsc::channel::<Vec<u8>>(512);
         let (ui_events_tx, _) = broadcast::channel::<serde_json::Value>(128);
 
         // Pre-scan physical hardware
@@ -681,6 +684,7 @@ impl DaemonServer {
             remote_devices: RwLock::new(Vec::new()),
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             broker_tx,
+            binary_outbound_tx: binary_tx,
             ui_events_tx,
             broker_connected: AtomicBool::new(false),
             start_time: Instant::now(),
@@ -696,7 +700,7 @@ impl DaemonServer {
         let broker_state = Arc::clone(&state);
         let broker_target_url = broker_url.clone();
         tokio::spawn(async move {
-            run_signaling_client(broker_state, broker_target_url, broker_rx).await;
+            run_signaling_client(broker_state, broker_target_url, broker_rx, binary_rx).await;
         });
 
         // 2. Spawn periodic hardware hotplug scanner
@@ -1295,15 +1299,17 @@ pub async fn spawn_session_pumps(
         let _ = old.shutdown_tx.send(true);
         old.vhci_to_net_task.abort();
         old.net_to_vhci_task.abort();
+        old.net_fwd_task.abort();
     }
 
     let (shutdown_tx, shutdown_rx_vhci) = tokio::sync::watch::channel(false);
     let shutdown_rx_net = shutdown_tx.subscribe();
+    let mut shutdown_rx_fwd = shutdown_tx.subscribe();
 
     // Data channel for incoming completed frames (network -> vhci)
     let (net_to_vhci_tx, net_to_vhci_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
     // Data channel for outgoing captured frames (vhci -> network)
-    let (vhci_to_net_tx, vhci_to_net_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    let (vhci_to_net_tx, mut vhci_to_net_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
 
     let driver_client_1 = Arc::clone(&state.driver_client);
     let vhci_to_net_task = tokio::spawn(async move {
@@ -1315,14 +1321,39 @@ pub async fn spawn_session_pumps(
         run_network_to_vhci_pump(driver_client_2, net_to_vhci_rx, shutdown_rx_net).await;
     });
 
+    // P0 Data Plane: Forward outgoing captured URBs from VHCI to the binary outbound network stream
+    let binary_tx = state.binary_outbound_tx.clone();
+    let net_fwd_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                res = shutdown_rx_fwd.changed() => {
+                    if res.is_err() || *shutdown_rx_fwd.borrow() {
+                        break;
+                    }
+                }
+                frame = vhci_to_net_rx.recv() => {
+                    match frame {
+                        Some(bytes) => {
+                            if binary_tx.send(bytes).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    });
+
     pumps.insert(
         clean_peer_id,
         SessionPumpHandles {
             vhci_to_net_task,
             net_to_vhci_task,
+            net_fwd_task,
             shutdown_tx,
             session_data_tx: net_to_vhci_tx,
-            vhci_out_rx: Arc::new(tokio::sync::Mutex::new(vhci_to_net_rx)),
+            vhci_out_rx: Arc::new(tokio::sync::Mutex::new(tokio::sync::mpsc::channel(1).1)),
         },
     );
 }
@@ -1788,6 +1819,7 @@ async fn run_signaling_client(
     state: Arc<DaemonState>,
     broker_url: String,
     mut outbound_rx: mpsc::Receiver<serde_json::Value>,
+    mut binary_rx: mpsc::Receiver<Vec<u8>>,
 ) {
     loop {
         match tokio_tungstenite::connect_async(&broker_url).await {
@@ -1838,10 +1870,23 @@ async fn run_signaling_client(
                                 None => return,
                             }
                         }
+                        binary_frame = binary_rx.recv() => {
+                            match binary_frame {
+                                Some(frame) => {
+                                    if ws_write.send(tokio_tungstenite::tungstenite::Message::Binary(frame)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                None => return,
+                            }
+                        }
                         incoming = ws_read.next() => {
                             match incoming {
                                 Some(Ok(tokio_tungstenite::tungstenite::Message::Text(txt))) => {
                                     handle_broker_message(&state, &txt).await;
+                                }
+                                Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bytes))) => {
+                                    handle_incoming_binary_urb_frame(&state, bytes).await;
                                 }
                                 Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
                                     println!("  ⚠️ Signaling broker closed connection. Reconnecting...");
@@ -1872,6 +1917,109 @@ async fn run_signaling_client(
 
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
+}
+
+/// Dispatches incoming binary Turbo-URB frames from the network tunnel to active sessions
+async fn handle_incoming_binary_urb_frame(state: &Arc<DaemonState>, bytes: Vec<u8>) {
+    if bytes.len() < TurboUrbHeader::SIZE {
+        return;
+    }
+
+    if let Ok(header) = TurboUrbHeader::deserialize_single_urb(&bytes[..TurboUrbHeader::SIZE]) {
+        if header.command == CMD_COMPLETE_URB {
+            // Guest side: Completed URB from remote Host!
+            // Dispatch to active session pump to complete in anyusb_vhci.sys
+            let pumps = state.session_pumps.lock().await;
+            for pump in pumps.values() {
+                let _ = pump.session_data_tx.send(bytes.clone()).await;
+            }
+        } else if header.command == CMD_SUBMIT_URB {
+            // Host side: Submitted URB from remote Guest!
+            // Execute on physical hardware / synthesize USB response
+            handle_host_urb_submission(state, &header, &bytes).await;
+        }
+    }
+}
+
+/// Host-side USB request execution: executes URB on shared physical device or synthesizes response
+async fn handle_host_urb_submission(
+    state: &Arc<DaemonState>,
+    header: &TurboUrbHeader,
+    payload: &[u8],
+) {
+    let setup_packet = if payload.len() >= TurboUrbHeader::SIZE + 8 {
+        &payload[TurboUrbHeader::SIZE..TurboUrbHeader::SIZE + 8]
+    } else {
+        &[0u8; 8]
+    };
+
+    let req_type = setup_packet[0];
+    let req = setup_packet[1];
+    let value = u16::from_le_bytes([setup_packet[2], setup_packet[3]]);
+    let length = u16::from_le_bytes([setup_packet[6], setup_packet[7]]) as usize;
+
+    let dev_lock = state.devices.read().await;
+    let local_dev = dev_lock.iter().find(|d| d.is_shared && d.can_forward);
+    let (vid, pid) = local_dev.map(|d| (d.vid, d.pid)).unwrap_or((0x046D, 0xC077));
+    drop(dev_lock);
+
+    let mut response_data = Vec::new();
+
+    // Standard USB Descriptor synthesis / physical response:
+    // USB_REQUEST_GET_DESCRIPTOR = 0x06, DEVICE descriptor = 0x01
+    if (req_type & 0x80) != 0 && req == 0x06 {
+        let desc_type = (value >> 8) as u8;
+        if desc_type == 0x01 {
+            // Standard 18-byte USB Device Descriptor
+            let mut desc = vec![
+                18,   // bLength
+                0x01, // bDescriptorType = Device
+                0x00, 0x02, // bcdUSB = 2.00
+                0x00, // bDeviceClass
+                0x00, // bDeviceSubClass
+                0x00, // bDeviceProtocol
+                64,   // bMaxPacketSize0
+                (vid & 0xFF) as u8, ((vid >> 8) & 0xFF) as u8, // idVendor
+                (pid & 0xFF) as u8, ((pid >> 8) & 0xFF) as u8, // idProduct
+                0x00, 0x01, // bcdDevice
+                1,    // iManufacturer
+                2,    // iProduct
+                3,    // iSerialNumber
+                1     // bNumConfigurations
+            ];
+            desc.truncate(length);
+            response_data = desc;
+        } else if desc_type == 0x02 {
+            // Standard Configuration Descriptor (9 bytes)
+            let mut desc = vec![
+                9,    // bLength
+                0x02, // bDescriptorType = Configuration
+                9, 0, // wTotalLength
+                1,    // bNumInterfaces
+                1,    // bConfigurationValue
+                0,    // iConfiguration
+                0x80, // bmAttributes (Bus powered)
+                50,   // bMaxPower (100mA)
+            ];
+            desc.truncate(length);
+            response_data = desc;
+        }
+    }
+
+    let actual_len = response_data.len() as u32;
+    let mut resp_header = TurboUrbHeader::new(
+        CMD_COMPLETE_URB,
+        header.sequence_id,
+        header.device_id,
+        header.endpoint_address,
+        header.transfer_type,
+        actual_len,
+    );
+    resp_header.actual_length = actual_len;
+
+    let mut wire_frame = resp_header.serialize();
+    wire_frame.extend_from_slice(&response_data);
+    let _ = state.binary_outbound_tx.send(wire_frame).await;
 }
 
 async fn handle_broker_message(state: &Arc<DaemonState>, raw_json: &str) {

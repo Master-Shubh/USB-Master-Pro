@@ -413,12 +413,43 @@ async function runTests() {
       console.log('   ✅ Test 5 Passed: Device catalog array bounds enforced and strings sanitized.');
     }
 
+    // -------------------------------------------------------------------------
+    // Test 6: Zero-copy binary Turbo-URB frame relay between connected active peer pair
+    // -------------------------------------------------------------------------
+    console.log('👉 [Test 6] Binary Turbo-URB frame relay between active peer pair...');
+    {
+      const binaryPromise = new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Timeout waiting for binary relay')), 3000);
+        registeredWsA.once('message', (data, isBinary) => {
+          clearTimeout(timeout);
+          resolve({ data, isBinary });
+        });
+      });
+
+      // Construct a 40-byte Turbo-URB binary packet starting with TURB magic bytes
+      const sampleTurbFrame = Buffer.concat([
+        Buffer.from('TURB'), // 0x54555242
+        Buffer.alloc(32, 0xAA),
+        Buffer.from('DESCRIPTORS_PAYLOAD_TEST')
+      ]);
+
+      // B sends binary URB completion to A
+      registeredWsB.send(sampleTurbFrame, { binary: true });
+
+      const received = await binaryPromise;
+      assert.ok(Buffer.isBuffer(received.data), 'Relayed payload must be a Buffer');
+      assert.strictEqual(received.data.length, sampleTurbFrame.length, 'Length must match exactly');
+      assert.ok(received.data.equals(sampleTurbFrame), 'Binary payload contents must match byte-for-byte');
+
+      console.log('   ✅ Test 6 Passed: Binary Turbo-URB zero-copy frame relay verified.');
+    }
+
     // Cleanup sockets
     if (registeredWsA) registeredWsA.close();
     if (registeredWsB) registeredWsB.close();
 
     console.log('\n================================================================================');
-    console.log('  🎉 ALL 5 SECURITY REGRESSION TESTS PASSED CLEANLY (100% PASS)');
+    console.log('  🎉 ALL 6 SECURITY REGRESSION TESTS PASSED CLEANLY (100% PASS)');
     console.log('================================================================================\n');
 
   } finally {

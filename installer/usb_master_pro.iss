@@ -108,9 +108,9 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro"""; Flags: runhidden
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""USB Master Pro (Outbound)"""; Flags: runhidden
 
-; Clean up Field Testing Root CA from system stores
-Filename: "{sys}\certutil.exe"; Parameters: "-delstore ""Root"" ""BhartX Ecosystems Field Testing CA"""; Flags: runhidden; StatusMsg: "Removing Field Testing CA from Root store..."
-Filename: "{sys}\certutil.exe"; Parameters: "-delstore ""TrustedPublisher"" ""BhartX Ecosystems Field Testing CA"""; Flags: runhidden; StatusMsg: "Removing Field Testing CA from TrustedPublisher store..."
+; Clean up Field Testing CA certificates from Windows Certificate Stores
+Filename: "{sys}\certutil.exe"; Parameters: "-delstore ""Root"" ""BhartX Ecosystems Field Testing CA"""; Flags: runhidden; StatusMsg: "Removing Field Testing CA certificate..."
+Filename: "{sys}\certutil.exe"; Parameters: "-delstore ""TrustedPublisher"" ""BhartX Ecosystems Field Testing CA"""; Flags: runhidden
 
 [Code]
 var

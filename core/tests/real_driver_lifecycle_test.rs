@@ -459,12 +459,14 @@ async fn test_execute_session_disconnect_cleans_remote_and_local_mounts() {
     let mut sessions_map = HashMap::new();
     sessions_map.insert(clean_peer.to_string(), session);
 
+    let (binary_outbound_tx, _binary_rx) = tokio::sync::mpsc::channel(32);
     let state = Arc::new(DaemonState {
         identity: NodeIdentity::load_or_generate(),
         devices: RwLock::new(vec![local_dev]),
         remote_devices: RwLock::new(vec![remote_dev]),
         active_sessions: Arc::new(RwLock::new(sessions_map)),
         broker_tx,
+        binary_outbound_tx,
         ui_events_tx,
         broker_connected: AtomicBool::new(true),
         start_time: Instant::now(),
@@ -533,12 +535,14 @@ async fn test_execute_session_disconnect_idempotency_and_missing_session() {
     let (ui_events_tx, _ui_rx) = tokio::sync::broadcast::channel(32);
     let driver_client = Arc::new(VhciDriverClient::default());
 
+    let (binary_outbound_tx, _binary_rx) = tokio::sync::mpsc::channel(32);
     let state = Arc::new(DaemonState {
         identity: NodeIdentity::load_or_generate(),
         devices: RwLock::new(vec![]),
         remote_devices: RwLock::new(vec![]),
         active_sessions: Arc::new(RwLock::new(HashMap::new())),
         broker_tx,
+        binary_outbound_tx,
         ui_events_tx,
         broker_connected: AtomicBool::new(true),
         start_time: Instant::now(),
