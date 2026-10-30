@@ -12,7 +12,9 @@ use usb_master_core::daemon::DaemonServer;
 use usb_master_core::hardware_db::{
     DeviceCategory, FLAG_ISOCH_JITTER_BUFFER, FLAG_LOW_LATENCY_SERIAL, FLAG_RD_SERVICE_OPTIMIZED,
 };
-use usb_master_core::licensing::{LicenseClaims, LicenseEngine};
+use usb_master_core::licensing::{
+    LicenseClaims, LicenseEngine, STATIC_PRODUCTION_FIXTURE_HW_HASH, STATIC_PRODUCTION_FIXTURE_TOKEN,
+};
 use usb_master_core::protocol::{
     TransferType, TurboUrbHeader, CMD_SUBMIT_URB, FLAG_ANTICIPATORY, FLAG_COMPRESSED_ZSTD,
     FLAG_ISOCH_PACKET,
@@ -212,6 +214,9 @@ fn test_urb_optimization_pipelines() {
 
 #[tokio::test]
 async fn test_daemon_license_and_driver_endpoints() {
+    // Set test hardware hash to match static production fixture before launching daemon
+    std::env::set_var("BHARTX_TEST_HARDWARE_HASH", STATIC_PRODUCTION_FIXTURE_HW_HASH);
+
     let port = find_free_port();
     let test_token = format!("test_adapter_token_{}", port);
     let token_clone = test_token.clone();
@@ -239,6 +244,7 @@ async fn test_daemon_license_and_driver_endpoints() {
         .expect("Must parse identity JSON");
     let hardware_hash = identity_json["hardware_hash"].as_str().unwrap();
     let formatted_id = identity_json["formatted_id"].as_str().unwrap();
+    assert_eq!(hardware_hash, STATIC_PRODUCTION_FIXTURE_HW_HASH);
 
     // 3. GET /api/license/status before activation
     let status_resp_unlicensed = reqwest_like_get(port, "/api/license/status").await;
@@ -254,27 +260,9 @@ async fn test_daemon_license_and_driver_endpoints() {
     assert!(bad_activate_resp.contains("HTTP/1.1 400 Bad Request"));
     assert!(bad_activate_resp.contains("\"success\":false"));
 
-    // 5. Generate a cryptographically valid license token anchored to local hardware hash
-    let root_kp = LicenseEngine::root_ca_keypair();
-    let valid_claims = LicenseClaims {
-        license_id: "LIC-2026-BHARTX-CERTIFIED".to_string(),
-        hardware_hash: hardware_hash.to_string(),
-        customer_name: "UIDAI Aadhaar Seva Kendra".to_string(),
-        tier: "EnterprisePro".to_string(),
-        max_devices: 64,
-        features: vec![
-            "TURBO_URB_ZSTD".to_string(),
-            "ISOCH_JITTER_BUFFER".to_string(),
-            "EGOV_RD_OPTIMIZED".to_string(),
-        ],
-        issued_at: 1770000000,
-        expires_at: 2050000000, // Year 2035
-    };
-    let token = LicenseEngine::issue_token(&valid_claims, &root_kp).expect("Must issue valid token");
-
-    // 6. POST /api/license/activate with valid token -> returns 200 OK with claims
+    // 5. POST /api/license/activate with valid static production fixture token -> returns 200 OK with claims
     let good_payload = serde_json::json!({
-        "token": token
+        "token": STATIC_PRODUCTION_FIXTURE_TOKEN
     });
     let good_activate_resp = reqwest_like_post_with_token(port, "/api/license/activate", &good_payload, &test_token).await;
     assert!(good_activate_resp.contains("HTTP/1.1 200 OK"));
@@ -282,7 +270,7 @@ async fn test_daemon_license_and_driver_endpoints() {
     assert!(good_activate_resp.contains("UIDAI Aadhaar Seva Kendra"));
     assert!(good_activate_resp.contains("EnterprisePro"));
 
-    // 7. GET /api/license/status after activation -> returns active status with claims
+    // 6. GET /api/license/status after activation -> returns active status with claims
     let status_resp_active = reqwest_like_get(port, "/api/license/status").await;
     assert!(status_resp_active.contains("HTTP/1.1 200 OK"));
     let status_json: serde_json::Value = serde_json::from_str(status_resp_active.split("\r\n\r\n").nth(1).unwrap())
@@ -292,7 +280,10 @@ async fn test_daemon_license_and_driver_endpoints() {
     assert_eq!(status_json["active"], true);
     assert_eq!(status_json["tier"], "EnterprisePro");
     assert_eq!(status_json["customer_name"], "UIDAI Aadhaar Seva Kendra");
-    assert_eq!(status_json["hardware_hash"], hardware_hash);
+    assert_eq!(status_json["hardware_hash"], STATIC_PRODUCTION_FIXTURE_HW_HASH);
     assert_eq!(status_json["formatted_id"], formatted_id);
     assert_eq!(status_json["license_id"], "LIC-2026-BHARTX-CERTIFIED");
+
+    // Clean up env override
+    std::env::remove_var("BHARTX_TEST_HARDWARE_HASH");
 }

@@ -2262,20 +2262,11 @@ mod tests {
 
     #[test]
     fn test_persisted_license_rejects_tampered_token() {
-        let hw_hash = "test_hardware_hash_sec_adv_01";
-        let root_kp = LicenseEngine::root_ca_keypair();
-        let valid_claims = LicenseClaims {
-            license_id: "LIC-2026-BHARTX-VALID".to_string(),
-            hardware_hash: hw_hash.to_string(),
-            customer_name: "Legit Customer".to_string(),
-            tier: "EnterprisePro".to_string(),
-            max_devices: 32,
-            features: vec!["TURBO_URB_ZSTD".to_string()],
-            issued_at: 1000,
-            expires_at: 2000000000,
-        };
-        let token = LicenseEngine::issue_token(&valid_claims, &root_kp).unwrap();
-        let mut tampered_token = token.clone();
+        use crate::licensing::{STATIC_PRODUCTION_FIXTURE_HW_HASH, STATIC_PRODUCTION_FIXTURE_TOKEN};
+        let hw_hash = STATIC_PRODUCTION_FIXTURE_HW_HASH;
+        let token = STATIC_PRODUCTION_FIXTURE_TOKEN;
+        let valid_claims = LicenseEngine::verify_token(token, hw_hash).unwrap();
+        let mut tampered_token = token.to_string();
         tampered_token.replace_range(10..15, "XXXXX");
 
         // Structured JSON with tampered token
@@ -2291,20 +2282,11 @@ mod tests {
 
     #[test]
     fn test_persisted_license_rejects_hardware_mismatch() {
-        let hw_hash_a = "test_hardware_hash_machine_a";
+        use crate::licensing::{STATIC_PRODUCTION_FIXTURE_HW_HASH, STATIC_PRODUCTION_FIXTURE_TOKEN};
+        let hw_hash_a = STATIC_PRODUCTION_FIXTURE_HW_HASH;
         let hw_hash_b = "test_hardware_hash_machine_b";
-        let root_kp = LicenseEngine::root_ca_keypair();
-        let claims = LicenseClaims {
-            license_id: "LIC-2026-BHARTX-HW".to_string(),
-            hardware_hash: hw_hash_a.to_string(),
-            customer_name: "Machine A".to_string(),
-            tier: "EnterprisePro".to_string(),
-            max_devices: 16,
-            features: vec![],
-            issued_at: 1000,
-            expires_at: 2000000000,
-        };
-        let token = LicenseEngine::issue_token(&claims, &root_kp).unwrap();
+        let token = STATIC_PRODUCTION_FIXTURE_TOKEN;
+        let claims = LicenseEngine::verify_token(token, hw_hash_a).unwrap();
 
         let json = serde_json::json!({
             "token": token,
@@ -2319,19 +2301,10 @@ mod tests {
 
     #[test]
     fn test_persisted_license_accepts_valid_signed_token_json_and_raw() {
-        let hw_hash = "test_hardware_hash_machine_c";
-        let root_kp = LicenseEngine::root_ca_keypair();
-        let valid_claims = LicenseClaims {
-            license_id: "LIC-2026-BHARTX-VALID-C".to_string(),
-            hardware_hash: hw_hash.to_string(),
-            customer_name: "Machine C".to_string(),
-            tier: "EnterprisePro".to_string(),
-            max_devices: 64,
-            features: vec!["TURBO_URB_ZSTD".to_string()],
-            issued_at: 1000,
-            expires_at: 2050000000,
-        };
-        let token = LicenseEngine::issue_token(&valid_claims, &root_kp).unwrap();
+        use crate::licensing::{STATIC_PRODUCTION_FIXTURE_HW_HASH, STATIC_PRODUCTION_FIXTURE_TOKEN};
+        let hw_hash = STATIC_PRODUCTION_FIXTURE_HW_HASH;
+        let token = STATIC_PRODUCTION_FIXTURE_TOKEN;
+        let valid_claims = LicenseEngine::verify_token(token, hw_hash).unwrap();
 
         // 1. Structured JSON with "token"
         let json = serde_json::json!({
@@ -2340,7 +2313,7 @@ mod tests {
         }).to_string();
         let loaded = parse_and_verify_persisted_license(&json, hw_hash)
             .expect("Valid structured JSON license must be accepted");
-        assert_eq!(loaded.license_id, "LIC-2026-BHARTX-VALID-C");
+        assert_eq!(loaded.license_id, "LIC-2026-BHARTX-CERTIFIED");
         assert_eq!(loaded.tier, "EnterprisePro");
 
         // 2. Structured JSON where claims block was tampered with, but token is intact
@@ -2361,14 +2334,14 @@ mod tests {
         let loaded_tampered = parse_and_verify_persisted_license(&tampered_claims_json, hw_hash)
             .expect("Valid token in JSON must still verify");
         assert_eq!(
-            loaded_tampered.license_id, "LIC-2026-BHARTX-VALID-C",
+            loaded_tampered.license_id, "LIC-2026-BHARTX-CERTIFIED",
             "Claims must be derived from cryptographically verified token payload, never untrusted JSON fields"
         );
         assert_eq!(loaded_tampered.tier, "EnterprisePro");
 
         // 3. Raw token string
-        let loaded_raw = parse_and_verify_persisted_license(&token, hw_hash)
+        let loaded_raw = parse_and_verify_persisted_license(token, hw_hash)
             .expect("Valid raw token string must be accepted");
-        assert_eq!(loaded_raw.license_id, "LIC-2026-BHARTX-VALID-C");
+        assert_eq!(loaded_raw.license_id, "LIC-2026-BHARTX-CERTIFIED");
     }
 }

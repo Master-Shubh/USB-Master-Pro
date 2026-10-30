@@ -27,6 +27,15 @@ pub const BHARTX_TEST_ROOT_SEED: [u8; 32] = *b"BHARTX_MOCK_TEST_HARNESS_KEY_001"
 #[cfg(any(test, feature = "test-utils"))]
 pub const BHARTX_ROOT_SEED: [u8; 32] = BHARTX_TEST_ROOT_SEED;
 
+/// Static production-signed license fixture for hermetic CI and test harness validation.
+/// Payload is signed by the BhartX Production Root CA and anchored to STATIC_PRODUCTION_FIXTURE_HW_HASH.
+#[cfg(any(test, feature = "test-utils"))]
+pub const STATIC_PRODUCTION_FIXTURE_TOKEN: &str = "eyJsaWNlbnNlX2lkIjoiTElDLTIwMjYtQkhBUlRYLUNFUlRJRklFRCIsImhhcmR3YXJlX2hhc2giOiI4ZmEwM2E3NTk4M2NlZGQ5ZDM2N2E0OWQ0ZmYwZWIwYmVhODk0Njk3ZmMwMmNmYjRmZmE5Nzc0OGMzNWZkZmVhIiwiY3VzdG9tZXJfbmFtZSI6IlVJREFJIEFhZGhhYXIgU2V2YSBLZW5kcmEiLCJ0aWVyIjoiRW50ZXJwcmlzZVBybyIsIm1heF9kZXZpY2VzIjo2NCwiZmVhdHVyZXMiOlsiVFVSQk9fVVJCX1pTVEQiLCJJU09DSF9KSVRURVJfQlVGRkVSIiwiRUdPVl9SRF9PUFRJTUlaRUQiXSwiaXNzdWVkX2F0IjoxNzcwMDAwMDAwLCJleHBpcmVzX2F0IjoyMDUwMDAwMDAwfQ==.4fabad0931c1a4ec872d8604ca43c8ca1f3f564c40e4594c339318725c19089fbf4989513f33b6997fcacbeada3ae64c03d6cc0160cae1f54da7bede5b549f03";
+
+/// Hardware hash corresponding to the static production fixture token.
+#[cfg(any(test, feature = "test-utils"))]
+pub const STATIC_PRODUCTION_FIXTURE_HW_HASH: &str = "8fa03a75983cedd9d367a49d4ff0eb0bea894697fc02cfb4ffa97748c35fdfea";
+
 /// Claims embedded within a cryptographic license payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LicenseClaims {
@@ -246,37 +255,51 @@ mod tests {
 
     #[test]
     fn test_root_pubkey_derivation_consistency() {
-        let root_kp = LicenseEngine::root_ca_keypair();
-        assert_eq!(*root_kp.public_key(), BHARTX_ROOT_LICENSE_PUBKEY);
+        let test_kp = LicenseEngine::test_ca_keypair();
+        let expected_test_pubkey = InstallationKeypair::from_seed(&BHARTX_TEST_ROOT_SEED).public_key;
+        assert_eq!(*test_kp.public_key(), expected_test_pubkey);
+
+        if let Some(prod_kp) = LicenseEngine::load_offline_production_keypair() {
+            assert_eq!(*prod_kp.public_key(), BHARTX_PRODUCTION_ROOT_LICENSE_PUBKEY);
+        }
     }
 
     #[test]
     fn test_valid_license_accepted() {
+        // 1. Verify static production-signed fixture against production verifier
+        let verified_prod = LicenseEngine::verify_token(
+            STATIC_PRODUCTION_FIXTURE_TOKEN,
+            STATIC_PRODUCTION_FIXTURE_HW_HASH,
+        ).expect("Static production fixture must be accepted by production verifier");
+
+        assert_eq!(verified_prod.license_id, "LIC-2026-BHARTX-CERTIFIED");
+        assert_eq!(verified_prod.customer_name, "UIDAI Aadhaar Seva Kendra");
+        assert_eq!(verified_prod.tier, "EnterprisePro");
+        assert!(verified_prod.is_enterprise());
+        assert_eq!(verified_prod.max_devices, 64);
+        assert!(verified_prod.has_feature("TURBO_URB_ZSTD"));
+        assert!(verified_prod.has_feature("ISOCH_JITTER_BUFFER"));
+        assert!(verified_prod.has_feature("EGOV_RD_OPTIMIZED"));
+
+        // 2. Test round-trip dynamic issuance and verification with test CA keypair
         let hw_hash = "a4f89d816c4f74d0932e6a9821804d9d15024b423714bfa4d82260ff8719bc01";
-        // Far future expiration (year 2035)
         let claims = sample_claims(hw_hash, 2050000000);
-        let root_kp = LicenseEngine::root_ca_keypair();
-        let token = LicenseEngine::issue_token(&claims, &root_kp).expect("Failed to issue token");
+        let test_kp = LicenseEngine::test_ca_keypair();
+        let token = LicenseEngine::issue_token(&claims, &test_kp).expect("Failed to issue test token");
 
-        let verified = LicenseEngine::verify_token(&token, hw_hash)
-            .expect("Valid license should be accepted");
-
-        assert_eq!(verified.license_id, "LIC-2026-BHARTX-9941");
-        assert_eq!(verified.customer_name, "Indian Oil Corporation Ltd");
-        assert_eq!(verified.tier, "EnterprisePro");
-        assert!(verified.is_enterprise());
-        assert_eq!(verified.max_devices, 32);
-        assert!(verified.has_feature("TURBO_URB_ZSTD"));
+        let verified_test = LicenseEngine::verify_token_with_pubkey(&token, hw_hash, test_kp.public_key())
+            .expect("Dynamic test token must be accepted by verify_token_with_pubkey");
+        assert_eq!(verified_test.license_id, "LIC-2026-BHARTX-9941");
+        assert_eq!(verified_test.customer_name, "Indian Oil Corporation Ltd");
+        assert_eq!(verified_test.tier, "EnterprisePro");
+        assert!(verified_test.is_enterprise());
+        assert_eq!(verified_test.max_devices, 32);
+        assert!(verified_test.has_feature("TURBO_URB_ZSTD"));
     }
 
     #[test]
     fn test_tampered_payload_rejected_with_cryptographic_signature_failed() {
-        let hw_hash = "a4f89d816c4f74d0932e6a9821804d9d15024b423714bfa4d82260ff8719bc01";
-        let claims = sample_claims(hw_hash, 2050000000);
-        let root_kp = LicenseEngine::root_ca_keypair();
-        let token = LicenseEngine::issue_token(&claims, &root_kp).unwrap();
-
-        let parts: Vec<&str> = token.split('.').collect();
+        let parts: Vec<&str> = STATIC_PRODUCTION_FIXTURE_TOKEN.split('.').collect();
         // Modify a single character in the base64 payload
         let mut tampered_b64 = parts[0].to_string();
         if tampered_b64.starts_with('e') {
@@ -286,33 +309,37 @@ mod tests {
         }
         let tampered_token = format!("{}.{}", tampered_b64, parts[1]);
 
-        let result = LicenseEngine::verify_token(&tampered_token, hw_hash);
+        let result = LicenseEngine::verify_token(&tampered_token, STATIC_PRODUCTION_FIXTURE_HW_HASH);
         assert_eq!(result, Err(LicenseError::CryptographicSignatureFailed));
     }
 
     #[test]
     fn test_wrong_signature_rejected_with_cryptographic_signature_failed() {
-        let hw_hash = "a4f89d816c4f74d0932e6a9821804d9d15024b423714bfa4d82260ff8719bc01";
-        let claims = sample_claims(hw_hash, 2050000000);
+        let claims = sample_claims(STATIC_PRODUCTION_FIXTURE_HW_HASH, 2050000000);
         // Signed with an unauthorized rogue keypair
         let rogue_kp = InstallationKeypair::generate();
         let rogue_token = LicenseEngine::issue_token(&claims, &rogue_kp).unwrap();
 
-        let result = LicenseEngine::verify_token(&rogue_token, hw_hash);
+        let result = LicenseEngine::verify_token(&rogue_token, STATIC_PRODUCTION_FIXTURE_HW_HASH);
         assert_eq!(result, Err(LicenseError::CryptographicSignatureFailed));
     }
 
     #[test]
     fn test_hardware_hash_mismatch_rejected() {
-        let real_hw_hash = "1111111111111111111111111111111111111111111111111111111111111111";
         let other_hw_hash = "9999999999999999999999999999999999999999999999999999999999999999";
-        let claims = sample_claims(real_hw_hash, 2050000000);
-        let root_kp = LicenseEngine::root_ca_keypair();
-        let token = LicenseEngine::issue_token(&claims, &root_kp).unwrap();
 
-        // Valid signature, but local hardware does not match claims
-        let result = LicenseEngine::verify_token(&token, other_hw_hash);
+        // Production verifier rejects hardware hash mismatch on validly signed production fixture
+        let result = LicenseEngine::verify_token(STATIC_PRODUCTION_FIXTURE_TOKEN, other_hw_hash);
         assert_eq!(result, Err(LicenseError::HardwareMismatch));
+
+        // Test keypair dynamic token also rejects hardware hash mismatch
+        let real_hw_hash = "1111111111111111111111111111111111111111111111111111111111111111";
+        let claims = sample_claims(real_hw_hash, 2050000000);
+        let test_kp = LicenseEngine::test_ca_keypair();
+        let token = LicenseEngine::issue_token(&claims, &test_kp).unwrap();
+
+        let test_result = LicenseEngine::verify_token_with_pubkey(&token, other_hw_hash, test_kp.public_key());
+        assert_eq!(test_result, Err(LicenseError::HardwareMismatch));
     }
 
     #[test]
@@ -320,10 +347,10 @@ mod tests {
         let hw_hash = "a4f89d816c4f74d0932e6a9821804d9d15024b423714bfa4d82260ff8719bc01";
         // Expired in 2020 (UNIX timestamp 1577836800)
         let claims = sample_claims(hw_hash, 1577836800);
-        let root_kp = LicenseEngine::root_ca_keypair();
-        let token = LicenseEngine::issue_token(&claims, &root_kp).unwrap();
+        let test_kp = LicenseEngine::test_ca_keypair();
+        let token = LicenseEngine::issue_token(&claims, &test_kp).unwrap();
 
-        let result = LicenseEngine::verify_token(&token, hw_hash);
+        let result = LicenseEngine::verify_token_with_pubkey(&token, hw_hash, test_kp.public_key());
         assert_eq!(result, Err(LicenseError::LicenseExpired));
     }
 
@@ -364,25 +391,32 @@ mod tests {
 
     #[test]
     fn test_production_verifier_accepts_production_key_signed_tokens() {
-        let hw_hash = "a4f89d816c4f74d0932e6a9821804d9d15024b423714bfa4d82260ff8719bc01";
-        let claims = sample_claims(hw_hash, 2050000000);
-        let prod_kp = LicenseEngine::load_offline_production_keypair()
-            .expect("Offline production keypair must exist at /home/shubh/.config/bhartx/licensing/production_root_ca.key");
-        assert_eq!(*prod_kp.public_key(), BHARTX_PRODUCTION_ROOT_LICENSE_PUBKEY);
-
-        let token = LicenseEngine::issue_token(&claims, &prod_kp).expect("Failed to issue production token");
-        let verified = LicenseEngine::verify_token(&token, hw_hash).expect("Production token must be accepted");
-        assert_eq!(verified.license_id, "LIC-2026-BHARTX-9941");
+        // Hermetic CI verification using static production-signed fixture
+        let verified = LicenseEngine::verify_token(
+            STATIC_PRODUCTION_FIXTURE_TOKEN,
+            STATIC_PRODUCTION_FIXTURE_HW_HASH,
+        ).expect("Production token fixture must be accepted");
+        assert_eq!(verified.license_id, "LIC-2026-BHARTX-CERTIFIED");
         assert_eq!(verified.tier, "EnterprisePro");
         assert!(verified.is_enterprise());
+
+        // Dynamic offline issuance check when developer environment has the offline keypair
+        if let Some(prod_kp) = LicenseEngine::load_offline_production_keypair() {
+            assert_eq!(*prod_kp.public_key(), BHARTX_PRODUCTION_ROOT_LICENSE_PUBKEY);
+            let hw_hash = "a4f89d816c4f74d0932e6a9821804d9d15024b423714bfa4d82260ff8719bc01";
+            let claims = sample_claims(hw_hash, 2050000000);
+            let dynamic_token = LicenseEngine::issue_token(&claims, &prod_kp).expect("Failed to issue production token");
+            let dynamic_verified = LicenseEngine::verify_token(&dynamic_token, hw_hash).expect("Dynamic production token must be accepted");
+            assert_eq!(dynamic_verified.license_id, "LIC-2026-BHARTX-9941");
+            assert_eq!(dynamic_verified.tier, "EnterprisePro");
+            assert!(dynamic_verified.is_enterprise());
+        }
     }
 
     #[test]
     fn test_tampered_token_rejected_under_ed25519_dalek() {
-        let hw_hash = "a4f89d816c4f74d0932e6a9821804d9d15024b423714bfa4d82260ff8719bc01";
-        let claims = sample_claims(hw_hash, 2050000000);
-        let prod_kp = LicenseEngine::root_ca_keypair();
-        let token = LicenseEngine::issue_token(&claims, &prod_kp).unwrap();
+        let hw_hash = STATIC_PRODUCTION_FIXTURE_HW_HASH;
+        let token = STATIC_PRODUCTION_FIXTURE_TOKEN;
 
         let parts: Vec<&str> = token.split('.').collect();
         let b64_payload = parts[0];

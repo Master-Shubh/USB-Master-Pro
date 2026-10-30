@@ -120,6 +120,42 @@ pub fn validate_connection_id_format(id_str: &str) -> bool {
 impl NodeIdentity {
     /// Discovers or generates the node's persistent 9-digit identity
     pub fn load_or_generate() -> Self {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Ok(override_hw_hash) = std::env::var("BHARTX_TEST_HARDWARE_HASH") {
+            let trimmed = override_hw_hash.trim();
+            if !trimmed.is_empty() {
+                let hardware_hash = trimmed.to_string();
+                let hash_bytes = hex::decode(&hardware_hash).unwrap_or_else(|_| {
+                    let mut hasher = Sha256::new();
+                    hasher.update(hardware_hash.as_bytes());
+                    hasher.finalize().to_vec()
+                });
+
+                let slice = if hash_bytes.len() >= 4 { &hash_bytes[0..4] } else { &[0u8; 4] };
+                let num = u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]);
+                let raw_id = 100_000_000 + (num % 900_000_000);
+
+                let s = raw_id.to_string();
+                let formatted_id = format!("{} {} {}", &s[0..3], &s[3..6], &s[6..9]);
+
+                let pin_slice = if hash_bytes.len() >= 8 { &hash_bytes[4..8] } else { &[0u8; 4] };
+                let pin_num = u32::from_be_bytes([pin_slice[0], pin_slice[1], pin_slice[2], pin_slice[3]]);
+                let pin_val = 100_000 + (pin_num % 900_000);
+                let pin_s = pin_val.to_string();
+                let default_pin = format!("{} {}", &pin_s[0..3], &pin_s[3..6]);
+
+                let keypair = InstallationKeypair::from_hardware_entropy(&hash_bytes);
+
+                return Self {
+                    raw_id,
+                    formatted_id,
+                    default_pin,
+                    hardware_hash,
+                    installation_public_key: keypair.public_key_hex,
+                };
+            }
+        }
+
         // Collect hardware characteristics
         let hostname = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")).unwrap_or_else(|_| "Host".to_string());
         let username = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "User".to_string());

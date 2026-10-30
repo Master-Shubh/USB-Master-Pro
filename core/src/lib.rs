@@ -48,7 +48,10 @@ pub use licensing::{
     BHARTX_ROOT_LICENSE_PUBKEY,
 };
 #[cfg(any(test, feature = "test-utils"))]
-pub use licensing::{BHARTX_ROOT_SEED, BHARTX_TEST_ROOT_SEED};
+pub use licensing::{
+    BHARTX_ROOT_SEED, BHARTX_TEST_ROOT_SEED, STATIC_PRODUCTION_FIXTURE_HW_HASH,
+    STATIC_PRODUCTION_FIXTURE_TOKEN,
+};
 pub use security::{
     KeyStorageProvider, PortableFileKeyStorage, SecurityError, WindowsDpapiKeyStorage,
 };
