@@ -26,7 +26,8 @@ pub use adapters::{
 pub use buffer_pool::BufferPool;
 pub use compression::TurboCompressor;
 pub use daemon::{
-    derive_numeric_device_id, execute_session_disconnect, run_network_to_vhci_pump,
+    derive_numeric_device_id, execute_session_disconnect, handle_share_device,
+    run_filter_to_network_pump, run_network_to_filter_pump, run_network_to_vhci_pump,
     run_vhci_to_network_pump, spawn_session_pumps, start_daemon, ActiveSession, DaemonServer,
     DaemonState, RemoteMountedDevice, SessionPumpHandles,
 };

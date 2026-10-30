@@ -8,7 +8,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
-use usb_master_core::daemon::{run_network_to_vhci_pump, run_vhci_to_network_pump};
+use usb_master_core::daemon::{
+    run_filter_to_network_pump, run_network_to_filter_pump, run_network_to_vhci_pump,
+    run_vhci_to_network_pump,
+};
 use usb_master_core::driver_client::{
     AnyUsbCompleteRequest, AnyUsbUrbMessage, DriverClientError, FilterDriverClient,
     VhciDriverClient, ANYUSB_MAX_URB_BUFFER_SIZE,
@@ -539,4 +542,101 @@ fn test_filter_client_drop_drains_all_pending_requests() {
 
     // Explicit drop calls stop_capture(0) under Drop trait
     drop(client);
+}
+
+#[tokio::test]
+async fn test_full_sender_filter_urb_pump_pipeline() {
+    let filter_client = Arc::new(FilterDriverClient::open().expect("Open simulated FilterDriverClient"));
+    let test_device_id: u32 = 777;
+
+    // 1. Start capture for test device ID
+    filter_client.start_capture(test_device_id).expect("start_capture failed");
+    assert!(filter_client.is_capturing(test_device_id));
+
+    // 2. Channels and shutdown signals
+    let (shutdown_tx, shutdown_rx_filter) = watch::channel(false);
+    let shutdown_rx_net = shutdown_tx.subscribe();
+
+    let (filter_to_net_tx, mut filter_to_net_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (net_to_filter_tx, net_to_filter_rx) = mpsc::channel::<Vec<u8>>(16);
+
+    // 3. Spawn sender-side pumps
+    let client_sender = Arc::clone(&filter_client);
+    let filter_pump_task = tokio::spawn(async move {
+        run_filter_to_network_pump(client_sender, test_device_id, filter_to_net_tx, shutdown_rx_filter).await;
+    });
+
+    let client_receiver = Arc::clone(&filter_client);
+    let net_pump_task = tokio::spawn(async move {
+        run_network_to_filter_pump(client_receiver, net_to_filter_rx, shutdown_rx_net).await;
+    });
+
+    // 4. Queue simulated physical URB
+    let mut submit_msg = AnyUsbUrbMessage::default();
+    submit_msg.device_id = test_device_id;
+    submit_msg.sequence_id = 9876;
+    submit_msg.endpoint_address = 0x81; // Bulk IN EP 1
+    submit_msg.transfer_type = 2; // Bulk
+    submit_msg.transfer_buffer_length = 8;
+    submit_msg.data[..8].copy_from_slice(b"PHYSICAL");
+
+    filter_client.queue_simulated_urb(submit_msg);
+
+    // 5. Verify run_filter_to_network_pump produces valid TurboUrbHeader wire frame
+    let wire_frame = tokio::time::timeout(Duration::from_millis(500), filter_to_net_rx.recv())
+        .await
+        .expect("Timeout waiting for frame from filter pump")
+        .expect("Channel closed unexpectedly");
+
+    assert!(wire_frame.len() >= TurboUrbHeader::SIZE);
+    let parsed_hdr = TurboUrbHeader::deserialize_single_urb(&wire_frame[..TurboUrbHeader::SIZE])
+        .expect("Valid TurboUrbHeader");
+    assert_eq!(parsed_hdr.command, CMD_SUBMIT_URB);
+    assert_eq!(parsed_hdr.sequence_id, 9876);
+    assert_eq!(parsed_hdr.device_id, test_device_id);
+    assert_eq!(parsed_hdr.endpoint_address, 0x81);
+    assert_eq!(parsed_hdr.buffer_length, 8);
+    assert_eq!(&wire_frame[TurboUrbHeader::SIZE..TurboUrbHeader::SIZE + 8], b"PHYSICAL");
+
+    // 6. Send simulated network completion frame back into run_network_to_filter_pump
+    let completion_payload = b"RESPDATA";
+    let mut resp_hdr = TurboUrbHeader::new(
+        CMD_COMPLETE_URB,
+        parsed_hdr.sequence_id,
+        parsed_hdr.device_id,
+        parsed_hdr.endpoint_address,
+        parsed_hdr.transfer_type,
+        completion_payload.len() as u32,
+    );
+    resp_hdr.status = 0;
+    resp_hdr.actual_length = completion_payload.len() as u32;
+
+    let mut comp_frame = resp_hdr.serialize();
+    comp_frame.extend_from_slice(completion_payload);
+
+    net_to_filter_tx.send(comp_frame).await.expect("Send completion frame to filter net pump");
+
+    // 7. Verify filter_client.get_completed_urbs() contains the completed URB
+    let mut completed = Vec::new();
+    for _ in 0..20 {
+        completed = filter_client.get_completed_urbs();
+        if !completed.is_empty() { break; }
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+
+    assert_eq!(completed.len(), 1, "Expected 1 completed URB in FilterDriverClient");
+    assert_eq!({ completed[0].sequence_id }, 9876);
+    assert_eq!({ completed[0].device_id }, test_device_id);
+    assert_eq!({ completed[0].status }, 0);
+    assert_eq!({ completed[0].actual_length }, 8);
+    assert_eq!(&completed[0].data[..8], completion_payload);
+
+    // 8. Clean teardown
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_millis(100), filter_pump_task).await;
+    let _ = tokio::time::timeout(Duration::from_millis(100), net_pump_task).await;
+
+    // 9. Stop capture
+    filter_client.stop_capture(test_device_id).expect("stop_capture failed");
+    assert!(!filter_client.is_capturing(test_device_id));
 }
