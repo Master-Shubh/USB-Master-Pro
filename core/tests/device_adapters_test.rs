@@ -13,7 +13,7 @@ use usb_master_core::hardware_db::{
     DeviceCategory, FLAG_ISOCH_JITTER_BUFFER, FLAG_LOW_LATENCY_SERIAL, FLAG_RD_SERVICE_OPTIMIZED,
 };
 use usb_master_core::licensing::{
-    LicenseClaims, LicenseEngine, STATIC_PRODUCTION_FIXTURE_HW_HASH, STATIC_PRODUCTION_FIXTURE_TOKEN,
+    STATIC_PRODUCTION_FIXTURE_HW_HASH, STATIC_PRODUCTION_FIXTURE_TOKEN,
 };
 use usb_master_core::protocol::{
     TransferType, TurboUrbHeader, CMD_SUBMIT_URB, FLAG_ANTICIPATORY, FLAG_COMPRESSED_ZSTD,
