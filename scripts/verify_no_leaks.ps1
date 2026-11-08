@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     USB Master Pro — Windows Release Artifact Secret Leak Verifier (PowerShell)
     BhartX Ecosystems Pvt Ltd — Autonomous Security Gate
