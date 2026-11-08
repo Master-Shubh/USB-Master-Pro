@@ -1049,8 +1049,14 @@ pub async fn handle_share_device(
             let numeric_dev_id = derive_numeric_device_id(&d.id);
             if payload.share {
                 let _ = state.filter_client.start_capture(numeric_dev_id);
+                // Check if device is a WinUSB peripheral and claim it
+                let winusb_devs = crate::winusb::WinUsbClient::enumerate_devices(None);
+                if let Some(w_dev) = winusb_devs.iter().find(|w| w.vid == d.vid && w.pid == d.pid) {
+                    let _ = state.winusb_client.claim_device(numeric_dev_id, &w_dev.path);
+                }
             } else {
                 let _ = state.filter_client.stop_capture(numeric_dev_id);
+                state.winusb_client.release_device(numeric_dev_id);
             }
 
             let mut closed_peer_id = None;
@@ -2315,12 +2321,21 @@ async fn handle_host_urb_submission(
         }
     };
 
-    // Dispatch to local physical WinUSB device
-    let (status, response_data) = state.winusb_client.dispatch_urb(
-        &header,
-        setup_packet.as_ref(),
-        payload,
-    );
+    // Dispatch to local physical WinUSB device on blocking thread pool
+    let winusb_client = Arc::clone(&state.winusb_client);
+    let payload_vec = payload.to_vec();
+    let dispatch_res = tokio::task::spawn_blocking(move || {
+        winusb_client.dispatch_urb(
+            &header,
+            setup_packet.as_ref(),
+            &payload_vec,
+        )
+    }).await;
+
+    let (status, response_data) = match dispatch_res {
+        Ok(res) => res,
+        Err(_) => (crate::winusb::client::STATUS_NOT_SUPPORTED, Vec::new()),
+    };
 
     let actual_len = response_data.len() as u32;
     let mut resp_header = TurboUrbHeader::new(

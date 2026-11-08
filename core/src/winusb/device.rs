@@ -224,6 +224,8 @@ impl WinUsbDevice {
                         }
                     } else if wait == WAIT_TIMEOUT {
                         CancelIoEx(self.file_handle, &mut ov);
+                        let mut transferred_dummy = 0u32;
+                        let _ = GetOverlappedResult(self.file_handle, &mut ov, &mut transferred_dummy, 1);
                         Err(WinUsbError::Timeout { endpoint: 0, timeout_ms })
                     } else {
                         Err(WinUsbError::IoFailed {
@@ -296,6 +298,8 @@ impl WinUsbDevice {
                     } else if wait == WAIT_TIMEOUT {
                         CancelIoEx(self.file_handle, &mut ov);
                         let _ = WinUsb_AbortPipe(self.winusb_handle, pipe_id);
+                        let mut transferred_dummy = 0u32;
+                        let _ = GetOverlappedResult(self.file_handle, &mut ov, &mut transferred_dummy, 1);
                         Err(WinUsbError::Timeout { endpoint: pipe_id, timeout_ms })
                     } else {
                         Err(WinUsbError::IoFailed {
@@ -368,6 +372,8 @@ impl WinUsbDevice {
                     } else if wait == WAIT_TIMEOUT {
                         CancelIoEx(self.file_handle, &mut ov);
                         let _ = WinUsb_AbortPipe(self.winusb_handle, pipe_id);
+                        let mut transferred_dummy = 0u32;
+                        let _ = GetOverlappedResult(self.file_handle, &mut ov, &mut transferred_dummy, 1);
                         Err(WinUsbError::Timeout { endpoint: pipe_id, timeout_ms })
                     } else {
                         Err(WinUsbError::IoFailed {
@@ -458,3 +464,4 @@ impl Drop for WinUsbDevice {
         }
     }
 }
+

@@ -237,19 +237,8 @@ impl WinUsbClient {
         let dev = match self.get_device(header.device_id) {
             Some(d) => d,
             None => {
-                // If device is not opened, check if any WinUSB device can be auto-claimed
-                let discovered = Self::enumerate_devices(None);
-                if let Some(first) = discovered.first() {
-                    match self.claim_device(header.device_id, &first.path) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            eprintln!("⚠️ Failed to auto-claim WinUSB device: {}", e);
-                            return (STATUS_DEVICE_NOT_CONNECTED, Vec::new());
-                        }
-                    }
-                } else {
-                    return (STATUS_DEVICE_NOT_CONNECTED, Vec::new());
-                }
+                // Device must be explicitly claimed via claim_device before URB dispatch
+                return (STATUS_DEVICE_NOT_CONNECTED, Vec::new());
             }
         };
 
@@ -264,10 +253,10 @@ impl WinUsbClient {
                 };
 
                 let is_in = (sp[0] & 0x80) != 0;
-                let expected_len = (header.actual_length as usize).min(65536);
+                let sp_length = u16::from_le_bytes([sp[6], sp[7]]) as usize;
 
                 if is_in {
-                    let mut buffer = vec![0u8; expected_len.max(u16::from_le_bytes([sp[6], sp[7]]) as usize)];
+                    let mut buffer = vec![0u8; sp_length.min(65536)];
                     match dev.control_transfer(sp, &mut buffer, 3000) {
                         Ok(transferred) => {
                             buffer.truncate(transferred as usize);
@@ -288,8 +277,9 @@ impl WinUsbClient {
                         }
                     }
                 } else {
-                    // Control OUT: copy payload into mutable buffer
+                    // Control OUT: buffer must be sized to SetupPacket.Length
                     let mut buffer = payload.to_vec();
+                    buffer.resize(sp_length, 0);
                     match dev.control_transfer(sp, &mut buffer, 3000) {
                         Ok(_) => (USBD_STATUS_SUCCESS as i32, Vec::new()),
                         Err(WinUsbError::Timeout { .. }) => (STATUS_TIMEOUT, Vec::new()),
@@ -360,3 +350,4 @@ impl WinUsbClient {
         }
     }
 }
+

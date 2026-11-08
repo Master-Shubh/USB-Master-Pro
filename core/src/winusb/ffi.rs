@@ -87,8 +87,8 @@ impl GUID {
     }
 }
 
-/// Standard WinUSB 8-byte setup packet
-#[repr(C, packed)]
+/// Standard WinUSB 8-byte setup packet (naturally 8 bytes, 2-byte aligned)
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WINUSB_SETUP_PACKET {
     pub request_type: u8,
@@ -294,3 +294,4 @@ pub unsafe fn WinUsb_ResetPipe(_: WINUSB_INTERFACE_HANDLE, _: u8) -> BOOL { 1 }
 pub unsafe fn WinUsb_AbortPipe(_: WINUSB_INTERFACE_HANDLE, _: u8) -> BOOL { 1 }
 #[cfg(not(target_os = "windows"))]
 pub unsafe fn WinUsb_SetPipePolicy(_: WINUSB_INTERFACE_HANDLE, _: u8, _: u32, _: u32, _: *const c_void) -> BOOL { 1 }
+
