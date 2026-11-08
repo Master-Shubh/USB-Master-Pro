@@ -5,6 +5,7 @@
 use std::ffi::c_void;
 
 pub type HANDLE = *mut c_void;
+#[allow(non_camel_case_types)]
 pub type WINUSB_INTERFACE_HANDLE = *mut c_void;
 pub type BOOL = i32;
 

@@ -4,6 +4,7 @@
 
 use crate::hardware_db::{DeviceCategory, HardwareClassifier, FLAG_SYSTEM_DEVICE};
 use serde::{Deserialize, Serialize};
+#[allow(unused_imports)]
 use std::fs;
 use std::path::Path;
 

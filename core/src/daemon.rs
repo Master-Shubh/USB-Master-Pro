@@ -2324,9 +2324,10 @@ async fn handle_host_urb_submission(
     // Dispatch to local physical WinUSB device on blocking thread pool
     let winusb_client = Arc::clone(&state.winusb_client);
     let payload_vec = payload.to_vec();
+    let hdr_clone = header.clone();
     let dispatch_res = tokio::task::spawn_blocking(move || {
         winusb_client.dispatch_urb(
-            &header,
+            &hdr_clone,
             setup_packet.as_ref(),
             &payload_vec,
         )
