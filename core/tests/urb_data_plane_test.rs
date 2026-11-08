@@ -575,7 +575,7 @@ async fn test_full_sender_filter_urb_pump_pipeline() {
     let mut submit_msg = AnyUsbUrbMessage::default();
     submit_msg.device_id = test_device_id;
     submit_msg.sequence_id = 9876;
-    submit_msg.endpoint_address = 0x81; // Bulk IN EP 1
+    submit_msg.endpoint_address = 0x01; // Bulk OUT EP 1
     submit_msg.transfer_type = 2; // Bulk
     submit_msg.transfer_buffer_length = 8;
     submit_msg.data[..8].copy_from_slice(b"PHYSICAL");
@@ -594,7 +594,7 @@ async fn test_full_sender_filter_urb_pump_pipeline() {
     assert_eq!(parsed_hdr.command, CMD_SUBMIT_URB);
     assert_eq!(parsed_hdr.sequence_id, 9876);
     assert_eq!(parsed_hdr.device_id, test_device_id);
-    assert_eq!(parsed_hdr.endpoint_address, 0x81);
+    assert_eq!(parsed_hdr.endpoint_address, 0x01);
     assert_eq!(parsed_hdr.buffer_length, 8);
     assert_eq!(&wire_frame[TurboUrbHeader::SIZE..TurboUrbHeader::SIZE + 8], b"PHYSICAL");
 
