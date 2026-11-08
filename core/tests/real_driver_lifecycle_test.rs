@@ -28,6 +28,7 @@ use usb_master_core::driver_client::{
 use usb_master_core::hardware_db::DeviceCategory;
 use usb_master_core::identity::NodeIdentity;
 use usb_master_core::state::SessionState;
+use usb_master_core::winusb::WinUsbClient;
 use usb_master_core::UsbDeviceInfo;
 
 static TEST_DRIVER_STATUS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -475,6 +476,7 @@ async fn test_execute_session_disconnect_cleans_remote_and_local_mounts() {
         local_api_token: std::sync::RwLock::new("test-token".to_string()),
         driver_client,
         filter_client: Arc::new(FilterDriverClient::default()),
+        winusb_client: Arc::new(WinUsbClient::new()),
         session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         dynamic_pin: Arc::new(tokio::sync::RwLock::new("123 456".to_string())),
         failed_pin_attempts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -579,6 +581,7 @@ async fn test_execute_session_disconnect_idempotency_and_missing_session() {
         local_api_token: std::sync::RwLock::new("test-token".to_string()),
         driver_client,
         filter_client: Arc::new(FilterDriverClient::default()),
+        winusb_client: Arc::new(WinUsbClient::new()),
         session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         dynamic_pin: Arc::new(tokio::sync::RwLock::new("123 456".to_string())),
         failed_pin_attempts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

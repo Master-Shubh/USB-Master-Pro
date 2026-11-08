@@ -248,7 +248,20 @@ jobs:
           Write-Host "=================================================================="
           Write-Host "Executing automated tests for x86_64-pc-windows-msvc..."
           Write-Host "=================================================================="
-          cargo test --workspace --target x86_64-pc-windows-msvc
+          $testOutput = cargo test --workspace --target x86_64-pc-windows-msvc 2>&1
+          $testOutput | Set-Content -Path "cargo_test.log"
+          $testOutput | Out-Host
+          if ($LASTEXITCODE -ne 0) {
+              throw "FATAL: cargo test --workspace failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Upload Test Failure Log Artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-test-failure-log
+          path: cargo_test.log
+          if-no-files-found: ignore
 
       - name: Execute Signaling Security Regression Test Suite (npm test)
         run: |
