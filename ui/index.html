@@ -359,6 +359,24 @@
               <span id="diagVhciBadge" class="px-2 py-1 rounded bg-slate-500/20 text-slate-300 font-mono font-bold text-[11px]">UNVERIFIED</span>
             </div>
 
+            <!-- VHCI Driver User-Approved Installation Banner (Visible only when missing) -->
+            <div id="vhciInstallPrompt" class="hidden p-3.5 rounded-xl bg-amber-950/40 border border-amber-500/40 space-y-2">
+              <div class="flex items-center space-x-2 text-amber-300 font-bold text-xs">
+                <i data-lucide="alert-triangle" class="w-4 h-4 text-amber-400"></i>
+                <span>VHCI Virtual USB Bus Driver Required for Receiver Role</span>
+              </div>
+              <p class="text-[11px] text-slate-300 leading-relaxed">
+                To mount remote USB devices, Windows requires the kernel bus driver (<code>anyusb_vhci.sys</code>).
+                Silent driver installation is strictly prohibited. To install with your explicit Administrator approval:
+              </p>
+              <div class="bg-black/60 p-2.5 rounded-lg border border-amber-500/30 text-amber-200 font-mono text-[11px] select-all flex items-center justify-between">
+                <span>powershell -Command "Start-Process cmd -ArgumentList '/c scripts\install_zero_reboot.bat' -Verb RunAs"</span>
+              </div>
+              <div class="text-[10px] text-slate-400">
+                Note: A standard Windows UAC dialog will prompt you to authorize driver registration. No system reboot required.
+              </div>
+            </div>
+
             <div class="bg-darkBg p-3 rounded-xl border border-darkBorder flex items-center justify-between">
               <div>
                 <div class="font-bold text-white font-mono">USBMasterDaemon.exe</div>
@@ -2216,7 +2234,28 @@
         } else {
           const errText = await res.text();
           updateConnectionStatus('Degraded', currentTransport);
-          alert("Connect Error: " + errText);
+          let isDriverMissing = false;
+          try {
+            const errJson = JSON.parse(errText);
+            if (errJson.error_code === 'VHCI_DRIVER_NOT_INSTALLED' || (errJson.error && errJson.error.toLowerCase().includes('kernel driver not installed'))) {
+              isDriverMissing = true;
+            }
+          } catch(e) {
+            if (errText.toLowerCase().includes('kernel driver not installed')) isDriverMissing = true;
+          }
+
+          if (isDriverMissing) {
+            alert(
+              "⚠️ RECEIVER BUS DRIVER NOT DETECTED\n\n" +
+              "Windows requires the AnyUSB Virtual Host Controller driver (anyusb_vhci.sys) to mount remote USB devices.\n\n" +
+              "Silent installation is disabled for system security.\n" +
+              "To install the driver with Administrator approval, open an elevated PowerShell and run:\n\n" +
+              "scripts\\install_zero_reboot.bat\n\n" +
+              "(Requires UAC authorization — no system reboot needed)"
+            );
+          } else {
+            alert("Connect Error: " + errText);
+          }
         }
       } catch (err) {
         updateConnectionStatus('Interrupted', currentTransport);
@@ -2740,6 +2779,15 @@
           renderDriverBadge(vhciBadge, vhciText, vhciStatus);
           renderDiagBadge(diagFilterBadge, filterStatus);
           renderDiagBadge(diagVhciBadge, vhciStatus);
+
+          const vhciPromptEl = document.getElementById('vhciInstallPrompt');
+          if (vhciPromptEl) {
+            if (vhciStatus === 'unavailable') {
+              vhciPromptEl.classList.remove('hidden');
+            } else {
+              vhciPromptEl.classList.add('hidden');
+            }
+          }
 
           if (daemonBadge) {
             daemonBadge.className = "flex items-center space-x-1.5 px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-xs";

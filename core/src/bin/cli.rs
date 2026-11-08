@@ -219,8 +219,67 @@ async fn main() {
             }
         }
 
+        "doctor" | "--doctor" | "preflight" | "--preflight" => {
+            println!("🩺 Running USB Master Pro System Preflight & Doctor Check...\n");
+            println!("  Operating System:     {}", std::env::consts::OS);
+            println!("  Architecture:         {}", std::env::consts::ARCH);
+
+            // 1. Check WinUSB direct bridge support
+            #[cfg(target_os = "windows")]
+            {
+                println!("  WinUSB Direct Bridge: \x1b[1;32mSupported (Native Win32/SetupAPI user-mode)\x1b[0m");
+                let winusb_devs = usb_master_core::winusb::WinUsbClient::enumerate_devices(None);
+                println!("  Active WinUSB Devices: Found {} device(s) ready for redirection", winusb_devs.len());
+                for dev in &winusb_devs {
+                    println!("    ├─ [{:04X}:{:04X}] {} ({})", dev.vid, dev.pid, dev.friendly_name, dev.path);
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                println!("  WinUSB Direct Bridge: \x1b[1;33mSimulated / Development Stub\x1b[0m");
+            }
+
+            // 2. Check VHCI Virtual Host Controller driver
+            let vhci_status = usb_master_core::driver_client::check_driver_status(usb_master_core::driver_client::VhciDriverClient::DEVICE_PATH);
+            match vhci_status {
+                usb_master_core::driver_client::DriverOperationalStatus::Accessible => {
+                    println!("  VHCI Virtual Bus:     \x1b[1;32mACCESSIBLE (\\\\.\\AnyUsbVhci operational)\x1b[0m");
+                    println!("                        Receiver role is ready to mount virtual devices.");
+                }
+                usb_master_core::driver_client::DriverOperationalStatus::AccessDenied => {
+                    println!("  VHCI Virtual Bus:     \x1b[1;31mACCESS DENIED\x1b[0m");
+                    println!("                        Driver exists but permissions are restricted. Run as Administrator.");
+                }
+                usb_master_core::driver_client::DriverOperationalStatus::Unavailable => {
+                    println!("  VHCI Virtual Bus:     \x1b[1;31mNOT INSTALLED / UNAVAILABLE\x1b[0m");
+                    println!("  [!] ACTION REQUIRED for Receiver role:");
+                    println!("      The Virtual USB Host Controller interface (\\\\.\\AnyUsbVhci) is not loaded.");
+                    println!("      Silent background installation is strictly prohibited for security.");
+                    println!("      To install the driver with your explicit Administrator approval, execute:");
+                    println!("        powershell -Command \"Start-Process cmd -ArgumentList '/c scripts\\install_zero_reboot.bat' -Verb RunAs\"\n");
+                }
+                usb_master_core::driver_client::DriverOperationalStatus::TestStub => {
+                    println!("  VHCI Virtual Bus:     \x1b[1;36mTEST STUB (Emulated environment)\x1b[0m");
+                }
+                _ => {
+                    println!("  VHCI Virtual Bus:     \x1b[1;33mUNSUPPORTED_PLATFORM ({})\x1b[0m", std::env::consts::OS);
+                }
+            }
+
+            // 3. Check Local Daemon Status on 127.0.0.1:19842
+            let port = std::env::var("DAEMON_PORT")
+                .ok()
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(19842);
+            match tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await {
+                Ok(_) => println!("  Local Daemon (19842): \x1b[1;32mONLINE (Active listener)\x1b[0m"),
+                Err(_) => println!("  Local Daemon (19842): \x1b[1;33mSTOPPED (Start with 'usb_master_cli daemon' or 'gui')\x1b[0m"),
+            }
+            println!("\n  Doctor check completed.");
+        }
+
         _ => {
-            println!("Usage: usb_master_cli [gui | list | benchmark | daemon | connect <target_id> <dev_id>]");
+            println!("Usage: usb_master_cli [gui | list | benchmark | daemon | connect <target_id> <dev_id> | doctor]");
         }
     }
 }

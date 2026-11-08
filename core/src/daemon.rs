@@ -1137,6 +1137,7 @@ async fn handle_post_connect(
             StatusCode::SERVICE_UNAVAILABLE,
             serde_json::json!({
                 "success": false,
+                "error_code": "VHCI_DRIVER_NOT_INSTALLED",
                 "error": "KMDF kernel driver not installed. Please install anyusb_vhci driver and restart daemon."
             }).to_string(),
         ));
