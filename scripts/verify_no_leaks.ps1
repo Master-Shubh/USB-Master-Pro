@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     USB Master Pro — Windows Release Artifact Secret Leak Verifier (PowerShell)
     BhartX Ecosystems Pvt Ltd — Autonomous Security Gate
@@ -45,8 +45,8 @@ if ([string]::IsNullOrWhiteSpace($DriversDir)) {
 $ErrorActionPreference = "Stop"
 
 Write-Host "================================================================================" -ForegroundColor Cyan
-Write-Host "  🛡️ USB Master Pro — Windows Release Artifact Secret Leak Gate" -ForegroundColor Cyan
-Write-Host "  🏢 BhartX Ecosystems Pvt Ltd" -ForegroundColor Cyan
+Write-Host "  [GATE] USB Master Pro - Windows Release Artifact Secret Leak Gate" -ForegroundColor Cyan
+Write-Host "  [INFO] BhartX Ecosystems Pvt Ltd" -ForegroundColor Cyan
 Write-Host "================================================================================" -ForegroundColor Cyan
 
 $forbiddenPatterns = @(
@@ -82,7 +82,7 @@ if ($targetFiles.Count -eq 0) {
 $leaksFound = 0
 
 foreach ($file in $targetFiles) {
-    Write-Host "  👉 Scanning: $($file.Name) ($([math]::Round($file.Length / 1KB, 2)) KB)..." -ForegroundColor White
+    Write-Host "  [*] Scanning: $($file.Name) ($([math]::Round($file.Length / 1KB, 2)) KB)..." -ForegroundColor White
     $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
     $latin1String = [System.Text.Encoding]::GetEncoding("iso-8859-1").GetString($bytes)
     $utf8String = [System.Text.Encoding]::UTF8.GetString($bytes)
@@ -94,7 +94,7 @@ foreach ($file in $targetFiles) {
         }
 
         if ($found) {
-            Write-Host "  ❌ [CRITICAL LEAK] Forbidden pattern '$pattern' detected in $($file.FullName)!" -ForegroundColor Red
+            Write-Host "  [FAIL] [CRITICAL LEAK] Forbidden pattern '$pattern' detected in $($file.FullName)!" -ForegroundColor Red
             $leaksFound++
         }
     }
@@ -103,11 +103,11 @@ foreach ($file in $targetFiles) {
 Write-Host "--------------------------------------------------------------------------------" -ForegroundColor Cyan
 
 if ($leaksFound -gt 0) {
-    Write-Host "  🚨 SECURITY GATE FAILED: $leaksFound forbidden signature(s) detected in release artifacts!" -ForegroundColor Red
-    Write-Host "  ⛔ Release builds MUST NOT proceed. Fix feature gates and rebuild." -ForegroundColor Red
+    Write-Host "  [!] SECURITY GATE FAILED: $leaksFound forbidden signature(s) detected in release artifacts!" -ForegroundColor Red
+    Write-Host "  [!] Release builds MUST NOT proceed. Fix feature gates and rebuild." -ForegroundColor Red
     exit 1
 } else {
-    Write-Host "  ✅ LEAK CHECK PASSED: 0 forbidden signatures found across all $($targetFiles.Count) scanned artifact(s)." -ForegroundColor Green
-    Write-Host "  🛡️ Binary integrity verified: BHARTX root seed and private keys are strictly absent." -ForegroundColor Green
+    Write-Host "  [+] LEAK CHECK PASSED: 0 forbidden signatures found across all $($targetFiles.Count) scanned artifact(s)." -ForegroundColor Green
+    Write-Host "  [+] Binary integrity verified: BHARTX root seed and private keys are strictly absent." -ForegroundColor Green
     exit 0
 }

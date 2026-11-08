@@ -413,6 +413,11 @@ AnyUsbVhci_EvtIoDeviceControl(
                 break;
             }
 
+            // Force null-termination on user-supplied strings to prevent kernel pool over-read
+            attachReq->ProductDescription[ARRAYSIZE(attachReq->ProductDescription) - 1] = L'\0';
+            attachReq->Manufacturer[ARRAYSIZE(attachReq->Manufacturer) - 1] = L'\0';
+            attachReq->SerialNumber[ARRAYSIZE(attachReq->SerialNumber) - 1] = L'\0';
+
             KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
                 "USB Master Pro: Synthesizing Child PDO for Remote Device [VID:0x%04X PID:0x%04X DeviceId:%lu]...\n",
                 attachReq->VendorId, attachReq->ProductId, attachReq->DeviceId));
@@ -596,7 +601,11 @@ AnyUsbVhci_EvtIoDeviceControl(
             WdfSpinLockRelease(fdoData->DeviceListLock);
 
             if (targetChildDevice != NULL) {
-                // Cancel any in-flight pending requests belonging to this child device
+                // Collect and cancel any in-flight pending requests belonging to this child device
+                // Requests are unlinked inside spinlock and completed OUTSIDE to avoid deadlock
+                WDFREQUEST requestsToCancel[ANYUSB_MAX_PENDING_URBS];
+                ULONG cancelCount = 0;
+
                 WdfSpinLockAcquire(fdoData->PendingUrbLock);
                 for (ULONG i = 0; i < ANYUSB_MAX_PENDING_URBS; i++) {
                     WDFREQUEST pendingReq = fdoData->PendingRequests[i].Request;
@@ -607,12 +616,16 @@ AnyUsbVhci_EvtIoDeviceControl(
                             fdoData->PendingRequests[i].SequenceId = 0;
                             fdoData->PendingRequests[i].DeviceId = 0;
                             if (NT_SUCCESS(WdfRequestUnmarkCancelable(pendingReq))) {
-                                WdfRequestComplete(pendingReq, STATUS_CANCELLED);
+                                requestsToCancel[cancelCount++] = pendingReq;
                             }
                         }
                     }
                 }
                 WdfSpinLockRelease(fdoData->PendingUrbLock);
+
+                for (ULONG i = 0; i < cancelCount; i++) {
+                    WdfRequestComplete(requestsToCancel[i], STATUS_CANCELLED);
+                }
 
                 // Mark child PDO missing (WdfPdoMarkMissing automatically invalidates bus relations)
                 status = WdfPdoMarkMissing(targetChildDevice);
@@ -894,6 +907,7 @@ AnyUsbVhci_EvtIoDeviceControl(
                     break;
                 }
 
+                ULONG completedLength = compReq->ActualLength;
                 // Retrieve guest WDM IRP and URB from targetRequest
                 PIRP irp = WdfRequestWdmGetIrp(targetRequest);
                 if (irp != NULL) {
@@ -903,75 +917,128 @@ AnyUsbVhci_EvtIoDeviceControl(
                         urb->UrbHeader.Status = compReq->Status;
 
                         if (urb->UrbHeader.Function == URB_FUNCTION_CONTROL_TRANSFER) {
-                            urb->UrbControlTransfer.TransferBufferLength = compReq->ActualLength;
-                            // If IN transfer and compReq->ActualLength > 0: copy compReq->Data into guest buffer
-                            if ((urb->UrbControlTransfer.SetupPacket[0] & 0x80) && compReq->ActualLength > 0) {
-                                ULONG copyLen = compReq->ActualLength;
-                                if (copyLen > sizeof(compReq->Data)) {
-                                    copyLen = sizeof(compReq->Data);
-                                }
+                            ULONG origMaxLen = urb->UrbControlTransfer.TransferBufferLength;
+                            ULONG copyLen = compReq->ActualLength;
+                            if (copyLen > sizeof(compReq->Data)) {
+                                copyLen = sizeof(compReq->Data);
+                            }
+                            if (copyLen > origMaxLen) {
+                                copyLen = origMaxLen;
+                                urb->UrbHeader.Status = USBD_STATUS_DATA_OVERRUN;
+                            }
+                            // If IN transfer and copyLen > 0: copy compReq->Data into guest buffer
+                            if ((urb->UrbControlTransfer.SetupPacket[0] & 0x80) && copyLen > 0) {
                                 PVOID dst = AnyUsb_GetTransferBuffer(urb->UrbControlTransfer.TransferBuffer,
                                                                      urb->UrbControlTransfer.TransferBufferMDL);
                                 if (dst != NULL) {
                                     RtlCopyMemory(dst, compReq->Data, copyLen);
                                 }
                             }
+                            urb->UrbControlTransfer.TransferBufferLength = copyLen;
+                            completedLength = copyLen;
                         } else if (urb->UrbHeader.Function == URB_FUNCTION_CONTROL_TRANSFER_EX) {
-                            urb->UrbControlTransferEx.TransferBufferLength = compReq->ActualLength;
-                            if ((urb->UrbControlTransferEx.SetupPacket[0] & 0x80) && compReq->ActualLength > 0) {
-                                ULONG copyLen = compReq->ActualLength;
-                                if (copyLen > sizeof(compReq->Data)) {
-                                    copyLen = sizeof(compReq->Data);
-                                }
+                            ULONG origMaxLen = urb->UrbControlTransferEx.TransferBufferLength;
+                            ULONG copyLen = compReq->ActualLength;
+                            if (copyLen > sizeof(compReq->Data)) {
+                                copyLen = sizeof(compReq->Data);
+                            }
+                            if (copyLen > origMaxLen) {
+                                copyLen = origMaxLen;
+                                urb->UrbHeader.Status = USBD_STATUS_DATA_OVERRUN;
+                            }
+                            if ((urb->UrbControlTransferEx.SetupPacket[0] & 0x80) && copyLen > 0) {
                                 PVOID dst = AnyUsb_GetTransferBuffer(urb->UrbControlTransferEx.TransferBuffer,
                                                                      urb->UrbControlTransferEx.TransferBufferMDL);
                                 if (dst != NULL) {
                                     RtlCopyMemory(dst, compReq->Data, copyLen);
                                 }
                             }
+                            urb->UrbControlTransferEx.TransferBufferLength = copyLen;
+                            completedLength = copyLen;
                         } else if (urb->UrbHeader.Function == URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER) {
-                            urb->UrbBulkOrInterruptTransfer.TransferBufferLength = compReq->ActualLength;
-                            // If IN transfer and compReq->ActualLength > 0: copy compReq->Data into guest buffer
-                            if ((urb->UrbBulkOrInterruptTransfer.TransferFlags & USBD_TRANSFER_DIRECTION_IN) && compReq->ActualLength > 0) {
-                                ULONG copyLen = compReq->ActualLength;
-                                if (copyLen > sizeof(compReq->Data)) {
-                                    copyLen = sizeof(compReq->Data);
-                                }
+                            ULONG origMaxLen = urb->UrbBulkOrInterruptTransfer.TransferBufferLength;
+                            ULONG copyLen = compReq->ActualLength;
+                            if (copyLen > sizeof(compReq->Data)) {
+                                copyLen = sizeof(compReq->Data);
+                            }
+                            if (copyLen > origMaxLen) {
+                                copyLen = origMaxLen;
+                                urb->UrbHeader.Status = USBD_STATUS_DATA_OVERRUN;
+                            }
+                            // If IN transfer and copyLen > 0: copy compReq->Data into guest buffer
+                            if ((urb->UrbBulkOrInterruptTransfer.TransferFlags & USBD_TRANSFER_DIRECTION_IN) && copyLen > 0) {
                                 PVOID dst = AnyUsb_GetTransferBuffer(urb->UrbBulkOrInterruptTransfer.TransferBuffer,
                                                                      urb->UrbBulkOrInterruptTransfer.TransferBufferMDL);
                                 if (dst != NULL) {
                                     RtlCopyMemory(dst, compReq->Data, copyLen);
                                 }
                             }
+                            urb->UrbBulkOrInterruptTransfer.TransferBufferLength = copyLen;
+                            completedLength = copyLen;
                         } else if (urb->UrbHeader.Function == URB_FUNCTION_ISOCH_TRANSFER) {
-                            urb->UrbIsochronousTransfer.TransferBufferLength = compReq->ActualLength;
-                            if ((urb->UrbIsochronousTransfer.TransferFlags & USBD_TRANSFER_DIRECTION_IN) && compReq->ActualLength > 0) {
-                                ULONG copyLen = compReq->ActualLength;
-                                if (copyLen > sizeof(compReq->Data)) {
-                                    copyLen = sizeof(compReq->Data);
-                                }
+                            ULONG origMaxLen = urb->UrbIsochronousTransfer.TransferBufferLength;
+                            ULONG copyLen = compReq->ActualLength;
+                            if (copyLen > sizeof(compReq->Data)) {
+                                copyLen = sizeof(compReq->Data);
+                            }
+                            if (copyLen > origMaxLen) {
+                                copyLen = origMaxLen;
+                                urb->UrbHeader.Status = USBD_STATUS_DATA_OVERRUN;
+                            }
+                            if ((urb->UrbIsochronousTransfer.TransferFlags & USBD_TRANSFER_DIRECTION_IN) && copyLen > 0) {
                                 PVOID dst = AnyUsb_GetTransferBuffer(urb->UrbIsochronousTransfer.TransferBuffer,
                                                                      urb->UrbIsochronousTransfer.TransferBufferMDL);
                                 if (dst != NULL) {
                                     RtlCopyMemory(dst, compReq->Data, copyLen);
                                 }
                             }
+                            urb->UrbIsochronousTransfer.TransferBufferLength = copyLen;
+                            completedLength = copyLen;
                         } else if (urb->UrbHeader.Function == URB_FUNCTION_SELECT_CONFIGURATION) {
+                            PUCHAR urbEnd = ((PUCHAR)urb) + urb->UrbHeader.Length;
                             PUSBD_INTERFACE_INFORMATION iface = &urb->UrbSelectConfiguration.Interface;
-                            for (ULONG i = 0; i < iface->NumberOfPipes; i++) {
-                                iface->Pipes[i].PipeHandle = (USBD_PIPE_HANDLE)(ULONG_PTR)iface->Pipes[i].EndpointAddress;
+                            while (((PUCHAR)iface) + sizeof(USBD_INTERFACE_INFORMATION) <= urbEnd) {
+                                if (iface->Length == 0 || ((PUCHAR)iface) + iface->Length > urbEnd) {
+                                    break;
+                                }
+                                ULONG maxPipesAllowed = 0;
+                                if (iface->Length >= sizeof(USBD_INTERFACE_INFORMATION)) {
+                                    maxPipesAllowed = 1 + (iface->Length - sizeof(USBD_INTERFACE_INFORMATION)) / sizeof(USBD_PIPE_INFORMATION);
+                                }
+                                ULONG numPipes = iface->NumberOfPipes;
+                                if (numPipes > maxPipesAllowed) {
+                                    numPipes = maxPipesAllowed;
+                                    iface->NumberOfPipes = numPipes;
+                                }
+                                iface->InterfaceHandle = (USBD_INTERFACE_HANDLE)(ULONG_PTR)(iface->InterfaceNumber + 1);
+                                for (ULONG i = 0; i < numPipes; i++) {
+                                    iface->Pipes[i].PipeHandle = (USBD_PIPE_HANDLE)(ULONG_PTR)iface->Pipes[i].EndpointAddress;
+                                }
+                                iface = (PUSBD_INTERFACE_INFORMATION)(((PUCHAR)iface) + iface->Length);
                             }
                         } else if (urb->UrbHeader.Function == URB_FUNCTION_SELECT_INTERFACE) {
+                            PUCHAR urbEnd = ((PUCHAR)urb) + urb->UrbHeader.Length;
                             PUSBD_INTERFACE_INFORMATION iface = &urb->UrbSelectInterface.Interface;
-                            for (ULONG i = 0; i < iface->NumberOfPipes; i++) {
-                                iface->Pipes[i].PipeHandle = (USBD_PIPE_HANDLE)(ULONG_PTR)iface->Pipes[i].EndpointAddress;
+                            if (((PUCHAR)iface) + sizeof(USBD_INTERFACE_INFORMATION) <= urbEnd &&
+                                iface->Length >= sizeof(USBD_INTERFACE_INFORMATION) &&
+                                ((PUCHAR)iface) + iface->Length <= urbEnd) {
+                                ULONG maxPipesAllowed = 1 + (iface->Length - sizeof(USBD_INTERFACE_INFORMATION)) / sizeof(USBD_PIPE_INFORMATION);
+                                ULONG numPipes = iface->NumberOfPipes;
+                                if (numPipes > maxPipesAllowed) {
+                                    numPipes = maxPipesAllowed;
+                                    iface->NumberOfPipes = numPipes;
+                                }
+                                iface->InterfaceHandle = (USBD_INTERFACE_HANDLE)(ULONG_PTR)(iface->InterfaceNumber + 1);
+                                for (ULONG i = 0; i < numPipes; i++) {
+                                    iface->Pipes[i].PipeHandle = (USBD_PIPE_HANDLE)(ULONG_PTR)iface->Pipes[i].EndpointAddress;
+                                }
                             }
                         }
                     }
                 }
 
-                // Complete targetRequest with compReq->Status and compReq->ActualLength
-                WdfRequestCompleteWithInformation(targetRequest, compReq->Status, compReq->ActualLength);
+                // Complete targetRequest with compReq->Status and completedLength
+                WdfRequestCompleteWithInformation(targetRequest, compReq->Status, completedLength);
                 bytesReturned = 0;
                 status = STATUS_SUCCESS;
             }

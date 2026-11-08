@@ -78,13 +78,48 @@ impl Drop for PortableFileKeyStorage {
     }
 }
 
+/// Fills the slice with cryptographically secure random bytes from the OS CSPRNG.
+pub fn fill_secure_entropy(buf: &mut [u8]) -> bool {
+    #[cfg(unix)]
+    {
+        if let Ok(mut f) = fs::File::open("/dev/urandom") {
+            use std::io::Read;
+            if f.read_exact(buf).is_ok() {
+                return true;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        #[link(name = "advapi32")]
+        extern "system" {
+            #[link_name = "SystemFunction036"]
+            fn rtl_gen_random(buffer: *mut u8, length: u32) -> u8;
+        }
+        unsafe {
+            if rtl_gen_random(buf.as_mut_ptr(), buf.len() as u32) != 0 {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 impl PortableFileKeyStorage {
     /// Creates storage using default machine-anchored master key in the given directory.
     pub fn new(storage_dir: PathBuf) -> Self {
         let mut seed = [0u8; 32];
-        if let Ok(mut f) = fs::File::open("/dev/urandom") {
-            use std::io::Read;
-            let _ = f.read_exact(&mut seed);
+        if !fill_secure_entropy(&mut seed) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let mut h = Sha256::new();
+            h.update(b"PORTABLE_KEY_STORAGE_FALLBACK");
+            h.update(now.to_le_bytes());
+            seed.copy_from_slice(&h.finalize());
         }
         let mut hasher = Sha256::new();
         hasher.update(b"PORTABLE_FILE_KEY_STORAGE_DEFAULT_V1");
@@ -156,14 +191,7 @@ impl KeyStorageProvider for PortableFileKeyStorage {
 
         // Generate 16-byte random salt
         let mut salt = [0u8; SALT_SIZE];
-        let mut filled = false;
-        if let Ok(mut f) = fs::File::open("/dev/urandom") {
-            use std::io::Read;
-            if f.read_exact(&mut salt).is_ok() {
-                filled = true;
-            }
-        }
-        if !filled {
+        if !fill_secure_entropy(&mut salt) {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -476,6 +504,18 @@ impl KeyStorageProvider for WindowsDpapiKeyStorage {
         if !file_path.exists() {
             return Err(SecurityError::NotFound(key.to_string()));
         }
+
+        // Secure wipe: overwrite with zeros before unlinking
+        if let Ok(metadata) = fs::metadata(&file_path) {
+            let len = metadata.len() as usize;
+            if let Ok(mut f) = fs::OpenOptions::new().write(true).open(&file_path) {
+                let zeros = vec![0u8; len];
+                let _ = f.write_all(&zeros);
+                let _ = f.flush();
+                let _ = f.sync_all();
+            }
+        }
+
         fs::remove_file(&file_path)?;
         Ok(())
     }

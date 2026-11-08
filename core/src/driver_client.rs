@@ -530,9 +530,13 @@ impl VhciDriverClient {
             )));
         }
 
+        #[cfg(any(test, feature = "test-utils"))]
         {
             let mut completed = self.completed_urbs.lock().unwrap();
             completed.push(*req);
+            if completed.len() > 1000 {
+                completed.remove(0);
+            }
         }
 
         if self.is_real() {
@@ -749,18 +753,25 @@ impl FilterDriverClient {
         let mut queue = self.pending_urb_queue.lock().unwrap();
         let mut drained = 0;
         let mut remaining = std::collections::VecDeque::new();
+        #[cfg(any(test, feature = "test-utils"))]
         let mut completed = self.completed_urbs.lock().unwrap();
 
         while let Some(msg) = queue.pop_front() {
             if target_device_id == 0 || msg.device_id == target_device_id {
                 drained += 1;
-                completed.push(AnyUsbCompleteRequest {
-                    device_id: msg.device_id,
-                    sequence_id: msg.sequence_id,
-                    status: completion_status,
-                    actual_length: 0,
-                    data: [0u8; ANYUSB_MAX_URB_BUFFER_SIZE],
-                });
+                #[cfg(any(test, feature = "test-utils"))]
+                {
+                    completed.push(AnyUsbCompleteRequest {
+                        device_id: msg.device_id,
+                        sequence_id: msg.sequence_id,
+                        status: completion_status,
+                        actual_length: 0,
+                        data: [0u8; ANYUSB_MAX_URB_BUFFER_SIZE],
+                    });
+                    if completed.len() > 1000 {
+                        completed.remove(0);
+                    }
+                }
             } else {
                 remaining.push_back(msg);
             }
@@ -833,9 +844,13 @@ impl FilterDriverClient {
             )));
         }
 
+        #[cfg(any(test, feature = "test-utils"))]
         {
             let mut completed = self.completed_urbs.lock().unwrap();
             completed.push(*req);
+            if completed.len() > 1000 {
+                completed.remove(0);
+            }
         }
 
         if self.is_real() {
@@ -990,8 +1005,14 @@ impl VhciDriverClient {
                 actual_len, ANYUSB_MAX_URB_BUFFER_SIZE
             )));
         }
-        let mut completed = self.completed_urbs.lock().unwrap();
-        completed.push(*req);
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            let mut completed = self.completed_urbs.lock().unwrap();
+            completed.push(*req);
+            if completed.len() > 1000 {
+                completed.remove(0);
+            }
+        }
         Ok(())
     }
 
@@ -1073,18 +1094,25 @@ impl FilterDriverClient {
         let mut queue = self.pending_urb_queue.lock().unwrap();
         let mut drained = 0;
         let mut remaining = std::collections::VecDeque::new();
+        #[cfg(any(test, feature = "test-utils"))]
         let mut completed = self.completed_urbs.lock().unwrap();
 
         while let Some(msg) = queue.pop_front() {
             if target_device_id == 0 || msg.device_id == target_device_id {
                 drained += 1;
-                completed.push(AnyUsbCompleteRequest {
-                    device_id: msg.device_id,
-                    sequence_id: msg.sequence_id,
-                    status: completion_status,
-                    actual_length: 0,
-                    data: [0u8; ANYUSB_MAX_URB_BUFFER_SIZE],
-                });
+                #[cfg(any(test, feature = "test-utils"))]
+                {
+                    completed.push(AnyUsbCompleteRequest {
+                        device_id: msg.device_id,
+                        sequence_id: msg.sequence_id,
+                        status: completion_status,
+                        actual_length: 0,
+                        data: [0u8; ANYUSB_MAX_URB_BUFFER_SIZE],
+                    });
+                    if completed.len() > 1000 {
+                        completed.remove(0);
+                    }
+                }
             } else {
                 remaining.push_back(msg);
             }
@@ -1121,8 +1149,14 @@ impl FilterDriverClient {
                 actual_len, ANYUSB_MAX_URB_BUFFER_SIZE
             )));
         }
-        let mut completed = self.completed_urbs.lock().unwrap();
-        completed.push(*req);
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            let mut completed = self.completed_urbs.lock().unwrap();
+            completed.push(*req);
+            if completed.len() > 1000 {
+                completed.remove(0);
+            }
+        }
         Ok(())
     }
 

@@ -116,7 +116,18 @@ const lockoutCleanupTimer = setInterval(cleanupExpiredLockouts, 5 * 60 * 1000);
 if (lockoutCleanupTimer.unref) lockoutCleanupTimer.unref();
 
 const server = http.createServer((req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  const allowedOriginEnv = process.env.ALLOWED_ORIGINS;
+  const origin = req.headers['origin'];
+  if (allowedOriginEnv) {
+    const list = allowedOriginEnv.split(',').map(s => s.trim());
+    if (origin && list.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    }
+  } else {
+    if (origin && (origin.includes('localhost') || origin.includes('127.0.0.1') || origin.startsWith('tauri://') || origin.startsWith('app://'))) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    }
+  }
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Content-Type', 'application/json');

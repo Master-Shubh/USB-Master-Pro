@@ -32,14 +32,7 @@ impl InstallationKeypair {
     /// Generates a new random installation keypair using system entropy
     pub fn generate() -> Self {
         let mut seed = [0u8; 32];
-        let mut filled = false;
-        if let Ok(mut f) = fs::File::open("/dev/urandom") {
-            use std::io::Read;
-            if f.read_exact(&mut seed).is_ok() {
-                filled = true;
-            }
-        }
-        if !filled {
+        if !crate::security::fill_secure_entropy(&mut seed) {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

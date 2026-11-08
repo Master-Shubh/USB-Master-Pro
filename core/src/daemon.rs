@@ -460,14 +460,8 @@ pub fn is_authorized_origin(origin_str: &str) -> bool {
         return true;
     }
 
-    // Native app container schemes
-    if origin_clean == "tauri://localhost" || origin_clean.starts_with("tauri://") {
-        return true;
-    }
-    if origin_clean == "app://localhost" || origin_clean.starts_with("app://") {
-        return true;
-    }
-    if origin_clean.starts_with("vscode-webview://") {
+    // Native app container schemes (strictly bound to localhost)
+    if origin_clean == "tauri://localhost" || origin_clean == "app://localhost" {
         return true;
     }
 
