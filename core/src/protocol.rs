@@ -250,6 +250,102 @@ pub struct TurboIsoPacketDescriptor {
     pub status: i32,
 }
 
+/// Encodes a complete SUBMIT_URB wire frame with strict transfer-type contracts:
+/// - For Control transfers: prepends the mandatory 8-byte USB Setup Packet, followed by optional OUT data.
+/// - For Bulk/Interrupt/Isochronous: appends OUT payload data directly after the 36-byte header.
+pub fn encode_submit_urb_frame(
+    header: &TurboUrbHeader,
+    setup_packet: Option<&[u8; 8]>,
+    out_data: &[u8],
+) -> Result<Vec<u8>, String> {
+    if header.command != CMD_SUBMIT_URB {
+        return Err(format!("Expected CMD_SUBMIT_URB (0x0001), got 0x{:04X}", header.command));
+    }
+    header.validate_urb_buffer_boundary()?;
+
+    let mut frame = header.serialize();
+    if header.transfer_type == TransferType::Control {
+        let sp = setup_packet.ok_or_else(|| {
+            "Control transfer SUBMIT requires an 8-byte USB Setup Packet".to_string()
+        })?;
+        frame.extend_from_slice(sp);
+        // Only append OUT data if bmRequestType direction is OUT (MSB == 0)
+        let is_out = (sp[0] & 0x80) == 0;
+        if is_out && !out_data.is_empty() {
+            let copy_len = out_data.len().min(ANYUSB_MAX_URB_BUFFER_SIZE);
+            frame.extend_from_slice(&out_data[..copy_len]);
+        }
+    } else {
+        // Bulk / Interrupt / Isochronous OUT
+        let is_out = (header.endpoint_address & 0x80) == 0;
+        if is_out && !out_data.is_empty() {
+            let copy_len = out_data.len().min(ANYUSB_MAX_URB_BUFFER_SIZE);
+            frame.extend_from_slice(&out_data[..copy_len]);
+        }
+    }
+    Ok(frame)
+}
+
+/// Decodes a SUBMIT_URB wire frame enforcing bounds, extracting setup packet and data payload.
+pub fn decode_submit_urb_frame(
+    bytes: &[u8],
+) -> Result<(TurboUrbHeader, Option<[u8; 8]>, &[u8]), String> {
+    let header = TurboUrbHeader::deserialize_single_urb(bytes)?;
+    if header.command != CMD_SUBMIT_URB {
+        return Err(format!("Expected CMD_SUBMIT_URB (0x0001), got 0x{:04X}", header.command));
+    }
+
+    let mut offset = TurboUrbHeader::SIZE;
+    if header.transfer_type == TransferType::Control {
+        if bytes.len() < offset + 8 {
+            return Err(format!(
+                "Malformed Control frame: expected at least {} bytes (36B header + 8B setup packet), got {}",
+                offset + 8,
+                bytes.len()
+            ));
+        }
+        let mut sp = [0u8; 8];
+        sp.copy_from_slice(&bytes[offset..offset + 8]);
+        offset += 8;
+        let payload = &bytes[offset..];
+        Ok((header, Some(sp), payload))
+    } else {
+        let payload = &bytes[offset..];
+        Ok((header, None, payload))
+    }
+}
+
+/// Encodes a complete COMPLETE_URB wire frame:
+/// 36-byte header followed by the received IN payload data (if any).
+pub fn encode_complete_urb_frame(
+    header: &TurboUrbHeader,
+    in_data: &[u8],
+) -> Result<Vec<u8>, String> {
+    if header.command != CMD_COMPLETE_URB {
+        return Err(format!("Expected CMD_COMPLETE_URB (0x0002), got 0x{:04X}", header.command));
+    }
+    header.validate_urb_buffer_boundary()?;
+
+    let mut frame = header.serialize();
+    let copy_len = in_data.len().min(ANYUSB_MAX_URB_BUFFER_SIZE);
+    if copy_len > 0 {
+        frame.extend_from_slice(&in_data[..copy_len]);
+    }
+    Ok(frame)
+}
+
+/// Decodes a COMPLETE_URB wire frame extracting header and payload.
+pub fn decode_complete_urb_frame(
+    bytes: &[u8],
+) -> Result<(TurboUrbHeader, &[u8]), String> {
+    let header = TurboUrbHeader::deserialize_single_urb(bytes)?;
+    if header.command != CMD_COMPLETE_URB {
+        return Err(format!("Expected CMD_COMPLETE_URB (0x0002), got 0x{:04X}", header.command));
+    }
+    let payload = &bytes[TurboUrbHeader::SIZE..];
+    Ok((header, payload))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +428,90 @@ mod tests {
         let mut invalid_act = TurboUrbHeader::new(CMD_SUBMIT_URB, 3, 1, 0x81, TransferType::Bulk, 512);
         invalid_act.actual_length = 65537;
         assert!(validate_urb_buffer_boundary(&invalid_act).is_err());
+    }
+
+    #[test]
+    fn test_control_submit_roundtrip() {
+        let hdr = TurboUrbHeader::new(CMD_SUBMIT_URB, 42, 1, 0x80, TransferType::Control, 18);
+        let setup_packet: [u8; 8] = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // GET_DESCRIPTOR (Device)
+        let frame = encode_submit_urb_frame(&hdr, Some(&setup_packet), &[]).expect("Control encode failed");
+        assert_eq!(frame.len(), TurboUrbHeader::SIZE + 8);
+
+        let (decoded_hdr, decoded_sp, payload) = decode_submit_urb_frame(&frame).expect("Control decode failed");
+        assert_eq!(decoded_hdr, hdr);
+        assert_eq!(decoded_sp, Some(setup_packet));
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_control_out_submit_roundtrip() {
+        let hdr = TurboUrbHeader::new(CMD_SUBMIT_URB, 43, 1, 0x00, TransferType::Control, 4);
+        let setup_packet: [u8; 8] = [0x40, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00]; // Vendor OUT
+        let out_data = [0xAA, 0xBB, 0xCC, 0xDD];
+        let frame = encode_submit_urb_frame(&hdr, Some(&setup_packet), &out_data).expect("Control OUT encode failed");
+        assert_eq!(frame.len(), TurboUrbHeader::SIZE + 8 + 4);
+
+        let (decoded_hdr, decoded_sp, payload) = decode_submit_urb_frame(&frame).expect("Control OUT decode failed");
+        assert_eq!(decoded_hdr, hdr);
+        assert_eq!(decoded_sp, Some(setup_packet));
+        assert_eq!(payload, &out_data);
+    }
+
+    #[test]
+    fn test_control_missing_setup_packet_rejected() {
+        let hdr = TurboUrbHeader::new(CMD_SUBMIT_URB, 44, 1, 0x80, TransferType::Control, 64);
+        let res = encode_submit_urb_frame(&hdr, None, &[]);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("requires an 8-byte USB Setup Packet"));
+    }
+
+    #[test]
+    fn test_bulk_in_out_submit_roundtrip() {
+        // Bulk OUT
+        let hdr_out = TurboUrbHeader::new(CMD_SUBMIT_URB, 50, 1, 0x02, TransferType::Bulk, 16);
+        let out_data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let frame_out = encode_submit_urb_frame(&hdr_out, None, &out_data).expect("Bulk OUT encode failed");
+        assert_eq!(frame_out.len(), TurboUrbHeader::SIZE + 16);
+
+        let (dec_hdr_out, sp_out, payload_out) = decode_submit_urb_frame(&frame_out).expect("Bulk OUT decode failed");
+        assert_eq!(dec_hdr_out, hdr_out);
+        assert_eq!(sp_out, None);
+        assert_eq!(payload_out, &out_data);
+
+        // Bulk IN (Read buffer length = 512, no payload on submit)
+        let hdr_in = TurboUrbHeader::new(CMD_SUBMIT_URB, 51, 1, 0x81, TransferType::Bulk, 512);
+        let frame_in = encode_submit_urb_frame(&hdr_in, None, &[]).expect("Bulk IN encode failed");
+        assert_eq!(frame_in.len(), TurboUrbHeader::SIZE);
+
+        let (dec_hdr_in, sp_in, payload_in) = decode_submit_urb_frame(&frame_in).expect("Bulk IN decode failed");
+        assert_eq!(dec_hdr_in, hdr_in);
+        assert_eq!(sp_in, None);
+        assert!(payload_in.is_empty());
+    }
+
+    #[test]
+    fn test_complete_urb_roundtrip() {
+        let mut hdr = TurboUrbHeader::new(CMD_COMPLETE_URB, 100, 1, 0x81, TransferType::Bulk, 64);
+        hdr.actual_length = 64;
+        hdr.status = 0;
+        let in_data = vec![0x55u8; 64];
+
+        let frame = encode_complete_urb_frame(&hdr, &in_data).expect("Complete encode failed");
+        assert_eq!(frame.len(), TurboUrbHeader::SIZE + 64);
+
+        let (dec_hdr, payload) = decode_complete_urb_frame(&frame).expect("Complete decode failed");
+        assert_eq!(dec_hdr, hdr);
+        assert_eq!(payload, &in_data[..]);
+    }
+
+    #[test]
+    fn test_malformed_control_frame_rejected() {
+        let hdr = TurboUrbHeader::new(CMD_SUBMIT_URB, 60, 1, 0x80, TransferType::Control, 18);
+        let mut truncated = hdr.serialize();
+        truncated.extend_from_slice(&[0x80, 0x06, 0x00]); // Only 3 bytes instead of 8
+        let res = decode_submit_urb_frame(&truncated);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Malformed Control frame"));
     }
 }
 

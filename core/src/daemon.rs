@@ -9,7 +9,11 @@ use crate::driver_client::{
 use crate::enumerator::{HardwareEnumerator, UsbDeviceInfo};
 use crate::identity::NodeIdentity;
 use crate::licensing::{LicenseClaims, LicenseEngine};
-use crate::protocol::{TurboUrbHeader, CMD_COMPLETE_URB, CMD_SUBMIT_URB, TransferType};
+use crate::protocol::{
+    decode_complete_urb_frame, decode_submit_urb_frame, encode_complete_urb_frame,
+    encode_submit_urb_frame, TransferType, TurboUrbHeader, CMD_COMPLETE_URB, CMD_SUBMIT_URB,
+};
+use crate::winusb::WinUsbClient;
 use crate::state::{SessionState, SessionStateMachine, StateTransitionError};
 use axum::{
     extract::{
@@ -212,6 +216,7 @@ pub struct DaemonState {
     pub local_api_token: std::sync::RwLock<String>,
     pub driver_client: Arc<VhciDriverClient>,
     pub filter_client: Arc<FilterDriverClient>,
+    pub winusb_client: Arc<WinUsbClient>,
     pub session_pumps: Arc<tokio::sync::Mutex<HashMap<String, SessionPumpHandles>>>,
     pub dynamic_pin: Arc<RwLock<String>>,
     pub failed_pin_attempts: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
@@ -807,6 +812,7 @@ impl DaemonServer {
             local_api_token: std::sync::RwLock::new(local_api_token),
             driver_client,
             filter_client,
+            winusb_client: Arc::new(WinUsbClient::new()),
             session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             dynamic_pin: Arc::new(RwLock::new(get_initial_session_pin())),
             failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -1347,11 +1353,18 @@ pub async fn run_vhci_to_network_pump(
                 );
                 header.actual_length = buffer_len;
 
-                let mut frame = header.serialize();
                 let payload_len = (buffer_len as usize).min(ANYUSB_MAX_URB_BUFFER_SIZE);
-                if payload_len > 0 {
-                    frame.extend_from_slice(&urb_msg.data[..payload_len]);
-                }
+                let frame = match encode_submit_urb_frame(
+                    &header,
+                    if xfer_type == TransferType::Control { Some(&urb_msg.setup_packet) } else { None },
+                    &urb_msg.data[..payload_len],
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("⚠️ Failed to encode submit URB frame: {}", e);
+                        continue;
+                    }
+                };
 
                 if session_data_tx.send(frame).await.is_err() {
                     // Session data channel closed / disconnected
@@ -1413,22 +1426,13 @@ pub async fn run_network_to_vhci_pump(
             }
         };
 
-        if frame.len() < TurboUrbHeader::SIZE {
-            eprintln!("⚠️ Truncated wire frame received (< {} bytes)", TurboUrbHeader::SIZE);
-            continue;
-        }
-
-        let header = match TurboUrbHeader::deserialize_single_urb(&frame[..TurboUrbHeader::SIZE]) {
-            Ok(h) => h,
+        let (header, payload) = match decode_complete_urb_frame(&frame) {
+            Ok(res) => res,
             Err(e) => {
-                eprintln!("⚠️ Wire header parsing error: {}", e);
+                eprintln!("⚠️ Wire complete URB parsing error: {}", e);
                 continue;
             }
         };
-
-        if header.command != CMD_COMPLETE_URB {
-            continue;
-        }
 
         let mut comp_req = AnyUsbCompleteRequest {
             device_id: header.device_id,
@@ -1438,15 +1442,6 @@ pub async fn run_network_to_vhci_pump(
             data: [0u8; ANYUSB_MAX_URB_BUFFER_SIZE],
         };
 
-        if header.actual_length as usize > ANYUSB_MAX_URB_BUFFER_SIZE {
-            eprintln!(
-                "⚠️ Completion URB Seq {} length {} exceeds 64 KB limit. Dropping.",
-                header.sequence_id, header.actual_length
-            );
-            continue;
-        }
-
-        let payload = &frame[TurboUrbHeader::SIZE..];
         let copy_len = (header.actual_length as usize)
             .min(payload.len())
             .min(ANYUSB_MAX_URB_BUFFER_SIZE);
@@ -1512,11 +1507,18 @@ pub async fn run_filter_to_network_pump(
                 );
                 header.actual_length = buffer_len;
 
-                let mut frame = header.serialize();
                 let payload_len = (buffer_len as usize).min(ANYUSB_MAX_URB_BUFFER_SIZE);
-                if payload_len > 0 {
-                    frame.extend_from_slice(&urb_msg.data[..payload_len]);
-                }
+                let frame = match encode_submit_urb_frame(
+                    &header,
+                    if xfer_type == TransferType::Control { Some(&urb_msg.setup_packet) } else { None },
+                    &urb_msg.data[..payload_len],
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("⚠️ Failed to encode submit URB frame: {}", e);
+                        continue;
+                    }
+                };
 
                 if session_data_tx.send(frame).await.is_err() {
                     // Session data channel closed / disconnected
@@ -1578,22 +1580,13 @@ pub async fn run_network_to_filter_pump(
             }
         };
 
-        if frame.len() < TurboUrbHeader::SIZE {
-            eprintln!("⚠️ Truncated wire frame received (< {} bytes)", TurboUrbHeader::SIZE);
-            continue;
-        }
-
-        let header = match TurboUrbHeader::deserialize_single_urb(&frame[..TurboUrbHeader::SIZE]) {
-            Ok(h) => h,
+        let (header, payload) = match decode_complete_urb_frame(&frame) {
+            Ok(res) => res,
             Err(e) => {
-                eprintln!("⚠️ Wire header parsing error: {}", e);
+                eprintln!("⚠️ Wire complete URB parsing error: {}", e);
                 continue;
             }
         };
-
-        if header.command != CMD_COMPLETE_URB {
-            continue;
-        }
 
         let mut comp_req = AnyUsbCompleteRequest {
             device_id: header.device_id,
@@ -1603,15 +1596,6 @@ pub async fn run_network_to_filter_pump(
             data: [0u8; ANYUSB_MAX_URB_BUFFER_SIZE],
         };
 
-        if header.actual_length as usize > ANYUSB_MAX_URB_BUFFER_SIZE {
-            eprintln!(
-                "⚠️ Completion URB Seq {} length {} exceeds 64 KB limit. Dropping.",
-                header.sequence_id, header.actual_length
-            );
-            continue;
-        }
-
-        let payload = &frame[TurboUrbHeader::SIZE..];
         let copy_len = (header.actual_length as usize)
             .min(payload.len())
             .min(ANYUSB_MAX_URB_BUFFER_SIZE);
@@ -2317,70 +2301,26 @@ async fn handle_incoming_binary_urb_frame(state: &Arc<DaemonState>, bytes: Vec<u
     }
 }
 
-/// Host-side USB request execution: executes URB on shared physical device or synthesizes response
+/// Host-side USB request execution: bridges URB directly to local physical WinUSB device
 async fn handle_host_urb_submission(
     state: &Arc<DaemonState>,
-    header: &TurboUrbHeader,
-    payload: &[u8],
+    _header: &TurboUrbHeader,
+    raw_frame: &[u8],
 ) {
-    let setup_packet = if payload.len() >= TurboUrbHeader::SIZE + 8 {
-        &payload[TurboUrbHeader::SIZE..TurboUrbHeader::SIZE + 8]
-    } else {
-        &[0u8; 8]
+    let (header, setup_packet, payload) = match decode_submit_urb_frame(raw_frame) {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("⚠️ Failed to decode incoming SUBMIT_URB frame: {}", e);
+            return;
+        }
     };
 
-    let req_type = setup_packet[0];
-    let req = setup_packet[1];
-    let value = u16::from_le_bytes([setup_packet[2], setup_packet[3]]);
-    let length = u16::from_le_bytes([setup_packet[6], setup_packet[7]]) as usize;
-
-    let dev_lock = state.devices.read().await;
-    let local_dev = dev_lock.iter().find(|d| d.is_shared && d.can_forward);
-    let (vid, pid) = local_dev.map(|d| (d.vid, d.pid)).unwrap_or((0x046D, 0xC077));
-    drop(dev_lock);
-
-    let mut response_data = Vec::new();
-
-    // Standard USB Descriptor synthesis / physical response:
-    // USB_REQUEST_GET_DESCRIPTOR = 0x06, DEVICE descriptor = 0x01
-    if (req_type & 0x80) != 0 && req == 0x06 {
-        let desc_type = (value >> 8) as u8;
-        if desc_type == 0x01 {
-            // Standard 18-byte USB Device Descriptor
-            let mut desc = vec![
-                18,   // bLength
-                0x01, // bDescriptorType = Device
-                0x00, 0x02, // bcdUSB = 2.00
-                0x00, // bDeviceClass
-                0x00, // bDeviceSubClass
-                0x00, // bDeviceProtocol
-                64,   // bMaxPacketSize0
-                (vid & 0xFF) as u8, ((vid >> 8) & 0xFF) as u8, // idVendor
-                (pid & 0xFF) as u8, ((pid >> 8) & 0xFF) as u8, // idProduct
-                0x00, 0x01, // bcdDevice
-                1,    // iManufacturer
-                2,    // iProduct
-                3,    // iSerialNumber
-                1     // bNumConfigurations
-            ];
-            desc.truncate(length);
-            response_data = desc;
-        } else if desc_type == 0x02 {
-            // Standard Configuration Descriptor (9 bytes)
-            let mut desc = vec![
-                9,    // bLength
-                0x02, // bDescriptorType = Configuration
-                9, 0, // wTotalLength
-                1,    // bNumInterfaces
-                1,    // bConfigurationValue
-                0,    // iConfiguration
-                0x80, // bmAttributes (Bus powered)
-                50,   // bMaxPower (100mA)
-            ];
-            desc.truncate(length);
-            response_data = desc;
-        }
-    }
+    // Dispatch to local physical WinUSB device
+    let (status, response_data) = state.winusb_client.dispatch_urb(
+        &header,
+        setup_packet.as_ref(),
+        payload,
+    );
 
     let actual_len = response_data.len() as u32;
     let mut resp_header = TurboUrbHeader::new(
@@ -2392,13 +2332,11 @@ async fn handle_host_urb_submission(
         actual_len,
     );
     resp_header.actual_length = actual_len;
-    if response_data.is_empty() {
-        resp_header.status = 0xC00000BB_u32 as i32; // STATUS_NOT_SUPPORTED
-    }
+    resp_header.status = status;
 
-    let mut wire_frame = resp_header.serialize();
-    wire_frame.extend_from_slice(&response_data);
-    let _ = state.binary_outbound_tx.send(wire_frame).await;
+    if let Ok(wire_frame) = encode_complete_urb_frame(&resp_header, &response_data) {
+        let _ = state.binary_outbound_tx.send(wire_frame).await;
+    }
 }
 
 async fn handle_broker_message(state: &Arc<DaemonState>, raw_json: &str) {
@@ -2957,6 +2895,7 @@ mod tests {
             local_api_token: std::sync::RwLock::new("test-token".to_string()),
             driver_client,
             filter_client,
+            winusb_client: Arc::new(WinUsbClient::new()),
             session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             dynamic_pin: Arc::new(RwLock::new(get_initial_session_pin())),
             failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -3031,6 +2970,7 @@ mod tests {
             local_api_token: std::sync::RwLock::new("test-token".to_string()),
             driver_client,
             filter_client,
+            winusb_client: Arc::new(WinUsbClient::new()),
             session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             dynamic_pin: Arc::new(RwLock::new(get_initial_session_pin())),
             failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -3038,20 +2978,17 @@ mod tests {
 
         // Setup an unsupported vendor URB submit frame (non-GET_DESCRIPTOR)
         let submit_hdr = TurboUrbHeader::new(CMD_SUBMIT_URB, 42, 101, 0x00, TransferType::Control, 8);
-        let mut frame = submit_hdr.serialize();
-        // Setup packet: Vendor Request 0xFF (not GET_DESCRIPTOR)
         let setup_packet = [0x40, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        frame.extend_from_slice(&setup_packet);
+        let frame = encode_submit_urb_frame(&submit_hdr, Some(&setup_packet), &[]).expect("Valid submit frame");
 
         handle_host_urb_submission(&state, &submit_hdr, &frame).await;
 
         let resp_frame = binary_outbound_rx.recv().await.expect("Must produce response");
-        let resp_hdr = TurboUrbHeader::deserialize_single_urb(&resp_frame[..TurboUrbHeader::SIZE])
-            .expect("Valid header");
+        let (resp_hdr, _) = decode_complete_urb_frame(&resp_frame).expect("Valid header");
 
         assert_eq!(resp_hdr.command, CMD_COMPLETE_URB);
         assert_eq!(resp_hdr.sequence_id, 42);
-        assert_eq!(resp_hdr.status, 0xC00000BB_u32 as i32, "Unsupported URB must return STATUS_NOT_SUPPORTED");
+        assert_eq!(resp_hdr.status, crate::winusb::client::STATUS_DEVICE_NOT_CONNECTED, "Unconnected device must return STATUS_DEVICE_NOT_CONNECTED");
         assert_eq!(resp_hdr.actual_length, 0);
     }
 
@@ -3095,6 +3032,7 @@ mod tests {
             local_api_token: std::sync::RwLock::new("test-token".to_string()),
             driver_client: Arc::new(VhciDriverClient::default()),
             filter_client: Arc::new(FilterDriverClient::default()),
+            winusb_client: Arc::new(WinUsbClient::new()),
             session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             dynamic_pin: Arc::new(RwLock::new("111 222".to_string())),
             failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -3131,6 +3069,7 @@ mod tests {
             local_api_token: std::sync::RwLock::new("test-token".to_string()),
             driver_client: Arc::new(VhciDriverClient::default()),
             filter_client: Arc::new(FilterDriverClient::default()),
+            winusb_client: Arc::new(WinUsbClient::new()),
             session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             dynamic_pin: Arc::new(RwLock::new("999 888".to_string())),
             failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -3190,6 +3129,7 @@ mod tests {
             local_api_token: std::sync::RwLock::new("test-token".to_string()),
             driver_client: Arc::new(VhciDriverClient::default()),
             filter_client: Arc::new(FilterDriverClient::default()),
+            winusb_client: Arc::new(WinUsbClient::new()),
             session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             dynamic_pin: Arc::new(RwLock::new("555 444".to_string())),
             failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -3242,6 +3182,7 @@ mod tests {
             local_api_token: std::sync::RwLock::new("test-token".to_string()),
             driver_client: Arc::new(VhciDriverClient::default()),
             filter_client: Arc::new(FilterDriverClient::default()),
+            winusb_client: Arc::new(WinUsbClient::new()),
             session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             dynamic_pin: Arc::new(RwLock::new("777 888".to_string())),
             failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
@@ -3259,5 +3200,72 @@ mod tests {
         // Calling verify with correct PIN after expiration should prune expired entry and succeed
         let res = state.verify_incoming_pin(peer, "777 888").await;
         assert_eq!(res, PinVerificationResult::Success, "Expired lockout must be pruned and valid PIN accepted");
+    }
+
+    #[tokio::test]
+    async fn test_winusb_physical_bridge_control_and_bulk_dispatch() {
+        let (broker_tx, _) = mpsc::channel(16);
+        let (binary_outbound_tx, mut binary_outbound_rx) = mpsc::channel(16);
+        let (ui_events_tx, _) = broadcast::channel(16);
+        let winusb_client = Arc::new(WinUsbClient::new());
+
+        // 1. Register simulated RP2040 Pico TinyUSB Device Descriptor (VID 0xCafe, PID 0x4001)
+        let pico_device_desc = vec![
+            18, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
+            0xFE, 0xCA, // VID = 0xCAFE
+            0x01, 0x40, // PID = 0x4001
+            0x00, 0x01, 1, 2, 3, 1,
+        ];
+        winusb_client.register_simulation_response(1001, 0, pico_device_desc.clone());
+
+        // 2. Register simulated RP2040 Pico Bulk IN loopback data
+        let loopback_data = vec![0x42u8; 64];
+        winusb_client.register_simulation_response(1002, 0, loopback_data.clone());
+
+        let state = Arc::new(DaemonState {
+            identity: NodeIdentity::load_or_generate(),
+            devices: RwLock::new(vec![]),
+            remote_devices: RwLock::new(vec![]),
+            active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            broker_tx,
+            binary_outbound_tx,
+            ui_events_tx,
+            broker_connected: AtomicBool::new(true),
+            start_time: Instant::now(),
+            broker_url: "ws://127.0.0.1:8080".to_string(),
+            active_license: RwLock::new(None),
+            local_api_token: std::sync::RwLock::new("test-token".to_string()),
+            driver_client: Arc::new(VhciDriverClient::default()),
+            filter_client: Arc::new(FilterDriverClient::default()),
+            winusb_client: Arc::clone(&winusb_client),
+            session_pumps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            dynamic_pin: Arc::new(RwLock::new(get_initial_session_pin())),
+            failed_pin_attempts: Arc::new(Mutex::new(HashMap::new())),
+        });
+
+        // Submit Control Transfer (GET_DESCRIPTOR Device)
+        let ctrl_hdr = TurboUrbHeader::new(CMD_SUBMIT_URB, 1001, 1, 0x80, TransferType::Control, 18);
+        let setup_packet = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00];
+        let ctrl_frame = encode_submit_urb_frame(&ctrl_hdr, Some(&setup_packet), &[]).unwrap();
+
+        handle_host_urb_submission(&state, &ctrl_hdr, &ctrl_frame).await;
+
+        let resp1 = binary_outbound_rx.recv().await.expect("Control completion expected");
+        let (hdr1, payload1) = decode_complete_urb_frame(&resp1).expect("Decode completion");
+        assert_eq!(hdr1.sequence_id, 1001);
+        assert_eq!(hdr1.status, 0);
+        assert_eq!(payload1, &pico_device_desc[..]);
+
+        // Submit Bulk IN Transfer (EP 0x82)
+        let bulk_hdr = TurboUrbHeader::new(CMD_SUBMIT_URB, 1002, 1, 0x82, TransferType::Bulk, 64);
+        let bulk_frame = encode_submit_urb_frame(&bulk_hdr, None, &[]).unwrap();
+
+        handle_host_urb_submission(&state, &bulk_hdr, &bulk_frame).await;
+
+        let resp2 = binary_outbound_rx.recv().await.expect("Bulk completion expected");
+        let (hdr2, payload2) = decode_complete_urb_frame(&resp2).expect("Decode completion");
+        assert_eq!(hdr2.sequence_id, 1002);
+        assert_eq!(hdr2.status, 0);
+        assert_eq!(payload2, &loopback_data[..]);
     }
 }

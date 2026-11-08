@@ -17,6 +17,7 @@ pub mod security;
 pub mod state;
 pub mod urb_engine;
 pub mod usb_descriptors;
+pub mod winusb;
 
 pub use adapters::{
     AdapterError, AdapterRegistry, GpsGnssAdapter, IDeviceAdapter, IrisScannersAdapter,
@@ -74,3 +75,4 @@ pub use usb_descriptors::{
     UsbHidDescriptor, UsbInterfaceAssociationDescriptor, UsbInterfaceDescriptor,
     UsbParsedConfiguration, UsbParsedEndpoint, UsbParsedInterface,
 };
+pub use winusb::{WinUsbClient, WinUsbDevice, WinUsbDeviceInfo, WinUsbError};
