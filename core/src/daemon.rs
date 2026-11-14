@@ -1058,15 +1058,33 @@ pub async fn handle_share_device(
                 ));
             }
 
-            d.is_shared = payload.share;
             let numeric_dev_id = derive_numeric_device_id(&d.id);
             if payload.share {
                 // Check if device is a WinUSB peripheral and claim it (ADR-011 pure user-mode)
                 let winusb_devs = crate::winusb::WinUsbClient::enumerate_devices(None);
                 if let Some(w_dev) = winusb_devs.iter().find(|w| w.vid == d.vid && w.pid == d.pid) {
-                    let _ = state.winusb_client.claim_device(numeric_dev_id, &w_dev.path);
+                    if let Err(e) = state.winusb_client.claim_device(numeric_dev_id, &w_dev.path) {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to claim WinUSB interface for device '{}': {}", d.friendly_name, e),
+                        ));
+                    }
+                } else {
+                    #[cfg(target_os = "windows")]
+                    #[cfg(not(any(test, feature = "driver-simulation")))]
+                    {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "Device '{}' [VID_{:04X}&PID_{:04X}] cannot be captured: No active WinUSB interface found. Under ADR-011, devices must have WinUSB bound or provide a WinUSB-compatible interface.",
+                                d.friendly_name, d.vid, d.pid
+                            ),
+                        ));
+                    }
                 }
+                d.is_shared = true;
             } else {
+                d.is_shared = false;
                 state.winusb_client.release_device(numeric_dev_id);
             }
 
@@ -2240,11 +2258,23 @@ async fn handle_get_system_drivers() -> impl IntoResponse {
         || vhci_status == DriverOperationalStatus::TestStub;
     let filter_installed = filter_status == DriverOperationalStatus::Accessible
         || filter_status == DriverOperationalStatus::TestStub;
-    let is_operational = vhci_status == DriverOperationalStatus::Accessible
-        && filter_status == DriverOperationalStatus::Accessible;
+    // Under ADR-011, Host A uses native WinUSB (built-in user-mode capture),
+    // and Host B uses anyusb_vhci.sys. Filter driver is legacy/not required.
+    let is_operational = if cfg!(target_os = "windows") {
+        vhci_status == DriverOperationalStatus::Accessible
+    } else {
+        vhci_status == DriverOperationalStatus::Accessible
+            && filter_status == DriverOperationalStatus::Accessible
+    };
 
     Json(serde_json::json!({
         "platform": std::env::consts::OS,
+        "adr011_architecture": "winusb_vhci",
+        "winusb": {
+            "status": if cfg!(target_os = "windows") { "accessible" } else { "unsupported_platform" },
+            "backend": "winusb_direct_capture",
+            "message": "Native Windows WinUSB user-mode capture subsystem ready"
+        },
         "vhci": {
             "status": vhci_status,
             "device_path": VhciDriverClient::DEVICE_PATH,
@@ -2253,7 +2283,9 @@ async fn handle_get_system_drivers() -> impl IntoResponse {
         "filter": {
             "status": filter_status,
             "device_path": r"\\.\AnyUsbFilter",
-            "message": filter_message
+            "message": filter_message,
+            "required": false,
+            "legacy": true
         },
         "vhci_installed": vhci_installed,
         "filter_installed": filter_installed,

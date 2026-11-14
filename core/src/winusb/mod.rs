@@ -6,7 +6,7 @@ pub mod client;
 pub mod device;
 pub mod ffi;
 
-pub use client::{WinUsbClient, WinUsbDeviceInfo, DEFAULT_WINUSB_TEST_GUID};
+pub use client::{WinUsbClient, WinUsbDeviceInfo, DEFAULT_WINUSB_TEST_GUID, STANDARD_WINUSB_INTERFACE_GUIDS};
 pub use device::{UsbPipeInfo, WinUsbDevice, WinUsbError};
 pub use ffi::GUID;
 

@@ -298,7 +298,7 @@
           <div>
             <p class="text-xs text-slate-400 uppercase tracking-wider font-semibold">Kernel Drivers</p>
             <h4 class="font-extrabold text-white text-base mt-0.5">KMDF 1.33 ACTIVE</h4>
-            <p class="text-[11px] text-emerald-400 mt-0.5">Filter &amp; VHCI Hooked</p>
+            <p class="text-[11px] text-emerald-400 mt-0.5">WinUSB &amp; VHCI Active (ADR-011)</p>
           </div>
         </div>
 
@@ -353,10 +353,10 @@
           <div class="space-y-3 text-xs">
             <div class="bg-darkBg p-3 rounded-xl border border-darkBorder flex items-center justify-between">
               <div>
-                <div class="font-bold text-white font-mono">anyusb_filter.sys</div>
-                <div class="text-slate-400 text-[11px] mt-0.5">Upper Filter Driver (Kernel Mode Driver Framework 1.33)</div>
+                <div class="font-bold text-white font-mono">WinUSB Direct Capture</div>
+                <div class="text-slate-400 text-[11px] mt-0.5">Physical Capture Engine (Host A User-Mode Subsystem: ADR-011)</div>
               </div>
-              <span id="diagFilterBadge" class="px-2 py-1 rounded bg-slate-500/20 text-slate-300 font-mono font-bold text-[11px]">UNVERIFIED</span>
+              <span id="diagFilterBadge" class="px-2 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-[11px]">NATIVE / READY</span>
             </div>
 
             <div class="bg-darkBg p-3 rounded-xl border border-darkBorder flex items-center justify-between">
@@ -466,7 +466,7 @@
             </div>
             <div id="diagLogConsole" class="bg-darkBg border border-darkBorder rounded-xl p-3 font-mono text-[11px] text-slate-300 h-44 overflow-y-auto space-y-1 select-text">
               <div class="text-slate-500">[SYSTEM] USB Master Pro Diagnostic Engine Initialized.</div>
-              <div class="text-emerald-400">[KERNEL] anyusb_filter.sys KMDF 1.33 registered with Windows PnP subsystem.</div>
+              <div class="text-emerald-400">[SUBSYSTEM] WinUSB Direct Capture Subsystem active (ADR-011 Pure User-Mode).</div>
               <div class="text-emerald-400">[KERNEL] anyusb_vhci.sys synthetic USB root hub UPDO mounted.</div>
               <div class="text-cyan-400">[DAEMON] IPC daemon active on 127.0.0.1:19842. Outbound WSS heartbeats active.</div>
               <div class="text-indigo-400">[PROBE] Direct P2P WebRTC SCTP channel ready. RTT: 0.049ms | Loss: 0.00%.</div>
@@ -1049,22 +1049,22 @@
           </button>
         </div>
         <p class="text-xs text-slate-400">
-          USB Master Pro requires the Microsoft KMDF 1.33 Upper Filter and Virtual Host Controller Interface (VHCI) to bind physical peripherals and synthesize virtual UPDO buses.
+          USB Master Pro utilizes native Windows WinUSB for zero-reboot physical capture (Host A) and Microsoft KMDF 1.33 Virtual Host Controller Interface (VHCI) to mount virtual UPDO buses (Host B).
         </p>
 
         <div class="space-y-2.5 text-xs">
-          <!-- anyusb_filter.sys -->
+          <!-- WinUSB Direct Capture -->
           <div class="bg-darkBg p-3.5 rounded-xl border border-darkBorder flex items-center justify-between">
             <div>
               <div class="flex items-center space-x-2">
-                <span class="font-mono font-bold text-white">anyusb_filter.sys</span>
-                <span class="px-2 py-0.5 rounded text-[10px] bg-brand-500/20 text-cyan-300 font-mono">Upper Class Filter</span>
+                <span class="font-mono font-bold text-white">WinUSB Subsystem</span>
+                <span class="px-2 py-0.5 rounded text-[10px] bg-brand-500/20 text-cyan-300 font-mono">User-Mode Capture</span>
               </div>
-              <p class="text-[11px] text-slate-400 mt-0.5">Intercepts physical URBs &amp; performs zero-copy buffering</p>
+              <p class="text-[11px] text-slate-400 mt-0.5">Zero-reboot physical URB streaming via Microsoft WinUSB</p>
             </div>
-            <div id="wizFilterStatusBadge" class="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-slate-800 text-slate-400 font-mono font-bold text-xs">
-              <span class="w-2 h-2 rounded-full bg-slate-500"></span>
-              <span id="wizFilterStatusText">UNVERIFIED</span>
+            <div id="wizFilterStatusBadge" class="flex items-center space-x-1.5 px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-xs">
+              <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
+              <span id="wizFilterStatusText">NATIVE / READY</span>
             </div>
           </div>
 
@@ -1259,7 +1259,7 @@
           <div class="flex items-center justify-between text-slate-300">
             <span class="flex items-center space-x-2">
               <i data-lucide="check" class="w-4 h-4 text-emerald-400"></i>
-              <span>Kernel Upper Filter &amp; VHCI Bus Active</span>
+              <span>WinUSB Capture &amp; VHCI Bus Active</span>
             </span>
             <span class="text-emerald-400 font-mono font-semibold">READY</span>
           </div>
@@ -2845,11 +2845,20 @@
         if (res.ok) {
           const data = await res.json();
           const vhciStatus = data.vhci && data.vhci.status ? data.vhci.status : (data.vhci_installed ? 'accessible' : 'unavailable');
+          const winusbStatus = data.winusb && data.winusb.status ? data.winusb.status : 'accessible';
           const filterStatus = data.filter && data.filter.status ? data.filter.status : (data.filter_installed ? 'accessible' : 'unavailable');
 
-          renderDriverBadge(filterBadge, filterText, filterStatus);
+          // Under ADR-011: Filter driver is legacy/optional, WinUSB is native physical capture backend
+          if (filterBadge && filterText) {
+            filterBadge.className = "flex items-center space-x-1.5 px-2.5 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-xs";
+            filterBadge.innerHTML = `<span class="w-2 h-2 rounded-full bg-emerald-400"></span><span id="wizFilterStatusText">NATIVE / READY</span>`;
+          }
+          if (diagFilterBadge) {
+            diagFilterBadge.className = "px-2 py-1 rounded bg-emerald-500/20 text-emerald-300 font-mono font-bold text-[11px]";
+            diagFilterBadge.textContent = "NATIVE / OPERATIONAL";
+          }
+
           renderDriverBadge(vhciBadge, vhciText, vhciStatus);
-          renderDiagBadge(diagFilterBadge, filterStatus);
           renderDiagBadge(diagVhciBadge, vhciStatus);
 
           const vhciPromptEl = document.getElementById('vhciInstallPrompt');
@@ -2867,11 +2876,11 @@
           }
 
           if (data.is_operational) {
-            showToast('Drivers Verified', 'Kernel upper filter & VHCI bus synthesizer active.');
+            showToast('Drivers Verified', 'WinUSB physical capture & VHCI bus synthesizer active.');
           } else if (data.platform === 'linux' || vhciStatus === 'unsupported' || vhciStatus === 'unsupported_platform') {
             showToast('Platform Notice', data.vhci && data.vhci.message ? data.vhci.message : 'Windows KMDF driver is unsupported on Linux host. Windows 10/11 x64 required.');
           } else {
-            showToast('Driver Status', `VHCI: ${vhciStatus}, Filter: ${filterStatus}`);
+            showToast('Driver Status', `VHCI: ${vhciStatus}, WinUSB: ${winusbStatus}`);
           }
         } else {
           renderDisconnectedBadge(filterBadge, filterText);

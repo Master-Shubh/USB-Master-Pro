@@ -15,6 +15,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_WINUSB_TEST_GUID: &str = "{dee824ef-729b-4a0e-9c14-b7117d33a817}";
+pub const STANDARD_WINUSB_INTERFACE_GUIDS: &[&str] = &[
+    "{dee824ef-729b-4a0e-9c14-b7117d33a817}", // TinyUSB / RP2040 sample interface GUID
+    "{88bae032-5a81-49f0-bc3d-a4ff138216d6}", // Generic WinUSB Device Interface GUID
+    "{a5dcbf10-6530-11d2-901f-00c04fb951ed}", // GUID_DEVINTERFACE_USB_DEVICE
+];
 pub const STATUS_NOT_SUPPORTED: i32 = 0xC00000BB_u32 as i32;
 pub const STATUS_DEVICE_NOT_CONNECTED: i32 = 0xC000000E_u32 as i32;
 pub const STATUS_TIMEOUT: i32 = 0x00000102_u32 as i32;
@@ -52,9 +57,27 @@ impl WinUsbClient {
         }
     }
 
-    /// Enumerates all present devices exposing the specified WinUSB device interface GUID.
+    /// Enumerates all present devices exposing the specified WinUSB device interface GUID,
+    /// or across all standard WinUSB device interface GUIDs if guid_str is None.
     pub fn enumerate_devices(guid_str: Option<&str>) -> Vec<WinUsbDeviceInfo> {
-        let target_guid_str = guid_str.unwrap_or(DEFAULT_WINUSB_TEST_GUID);
+        if let Some(target) = guid_str {
+            Self::enumerate_by_guid(target)
+        } else {
+            let mut all_devs = Vec::new();
+            let mut seen_paths = std::collections::HashSet::new();
+            for target_guid in STANDARD_WINUSB_INTERFACE_GUIDS {
+                for dev in Self::enumerate_by_guid(target_guid) {
+                    if seen_paths.insert(dev.path.clone()) {
+                        all_devs.push(dev);
+                    }
+                }
+            }
+            all_devs
+        }
+    }
+
+    /// Enumerates devices for a single specified device interface GUID.
+    pub fn enumerate_by_guid(target_guid_str: &str) -> Vec<WinUsbDeviceInfo> {
         let guid = match GUID::from_str_guid(target_guid_str) {
             Ok(g) => g,
             Err(_) => return Vec::new(),

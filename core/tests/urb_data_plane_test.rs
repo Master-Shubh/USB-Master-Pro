@@ -715,3 +715,61 @@ fn test_fail_closed_entropy_and_pin_protection() {
     assert!(json_str.contains("raw_id"));
     assert!(json_str.contains("formatted_id"));
 }
+
+#[tokio::test]
+async fn test_winusb_data_plane_network_pump_lifecycle() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, watch};
+    use usb_master_core::daemon::run_network_to_winusb_pump;
+    use usb_master_core::protocol::{
+        decode_complete_urb_frame, encode_submit_urb_frame, TransferType, TurboUrbHeader,
+        CMD_SUBMIT_URB,
+    };
+    use usb_master_core::winusb::client::{WinUsbClient, STANDARD_WINUSB_INTERFACE_GUIDS};
+
+    // 1. Verify standard GUIDs defined for multi-class enumeration
+    assert!(STANDARD_WINUSB_INTERFACE_GUIDS.len() >= 3);
+
+    let winusb_client = Arc::new(WinUsbClient::new());
+    let (net_to_pump_tx, net_to_pump_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (pump_to_net_tx, mut pump_to_net_rx) = mpsc::channel::<Vec<u8>>(16);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let client_clone = Arc::clone(&winusb_client);
+    let pump_task = tokio::spawn(async move {
+        run_network_to_winusb_pump(client_clone, net_to_pump_rx, pump_to_net_tx, shutdown_rx).await;
+    });
+
+    // 2. Register simulation response for Bulk IN transfer (Seq 7001)
+    let expected_payload = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+    winusb_client.register_simulation_response(7001, 0, expected_payload.clone());
+
+    // 3. Encode and send CMD_SUBMIT_URB frame
+    let header = TurboUrbHeader::new(
+        CMD_SUBMIT_URB,
+        7001,
+        42,
+        0x81,
+        TransferType::Bulk,
+        64,
+    );
+    let frame = encode_submit_urb_frame(&header, None, &[]).expect("Must encode submit frame");
+    net_to_pump_tx.send(frame).await.expect("Must send frame to pump");
+
+    // 4. Receive completion frame from pump_to_net_rx
+    let comp_frame = tokio::time::timeout(Duration::from_millis(500), pump_to_net_rx.recv())
+        .await
+        .expect("Timeout waiting for pump completion")
+        .expect("Completion frame must be present");
+
+    let (comp_hdr, comp_data) = decode_complete_urb_frame(&comp_frame).expect("Must decode complete frame");
+    assert_eq!(comp_hdr.sequence_id, 7001);
+    assert_eq!(comp_hdr.status, 0);
+    assert_eq!(comp_hdr.actual_length, 6);
+    assert_eq!(comp_data, expected_payload);
+
+    // 5. Teardown pump cleanly
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_millis(200), pump_task).await;
+}
