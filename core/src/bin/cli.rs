@@ -1,15 +1,71 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::time::Instant;
 use usb_master_core::{
     BufferPool, DaemonServer, HardwareEnumerator, NodeIdentity, TurboCompressor, TurboUrbHeader, TransferType,
     CMD_SUBMIT_URB,
 };
 
-fn open_browser(url: &str) {
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn AttachConsole(dwProcessId: u32) -> i32;
+        }
+        const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+fn open_native_window(url: &str) {
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", url])
-            .spawn();
+        // Try launching Microsoft Edge in standalone App Mode (--app=URL)
+        // Edge is an integral component of Windows 10 & 11, requiring no extra browser or software.
+        let edge_candidates = [
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ];
+
+        let mut launched = false;
+        for path in &edge_candidates {
+            if std::path::Path::new(path).exists() {
+                if let Ok(_) = std::process::Command::new(path)
+                    .args([
+                        &format!("--app={}", url),
+                        "--window-size=1280,820",
+                        "--window-position=center",
+                        "--disable-extensions",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                    ])
+                    .spawn()
+                {
+                    launched = true;
+                    break;
+                }
+            }
+        }
+
+        if !launched {
+            // Try msedge from PATH or fall back to rundll32 FileProtocolHandler (zero-console pop)
+            if let Ok(_) = std::process::Command::new("msedge")
+                .args([
+                    &format!("--app={}", url),
+                    "--window-size=1280,820",
+                ])
+                .spawn()
+            {
+                launched = true;
+            }
+        }
+
+        if !launched {
+            let _ = std::process::Command::new("rundll32")
+                .args(["url.dll,FileProtocolHandler", url])
+                .spawn();
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -27,20 +83,26 @@ fn open_browser(url: &str) {
 
 #[tokio::main]
 async fn main() {
-    let identity = NodeIdentity::load_or_generate();
-
-    println!("================================================================================");
-    println!("  ⚡ USB Master Pro — Developed & Owned by BhartX Ecosystems Pvt Ltd");
-    println!("  🌐 Website: https://bhartx.in | ✉️ Support: admin@bhartx.in");
-    println!("================================================================================");
-    println!("  Your AnyUSB ID:      \x1b[1;32m{}\x1b[0m", identity.formatted_id);
-    println!("  Default Security PIN: \x1b[1;33m{}\x1b[0m", identity.default_pin);
-    println!("  Hardware Fingerprint: {}", &identity.hardware_hash[0..16]);
-    println!("  P2P Rendezvous Mesh:  Active (Outbound WebSocket / TLS Signaling)");
-    println!("================================================================================\n");
+    #[cfg(target_os = "windows")]
+    attach_parent_console();
 
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).map(|s| s.as_str()).unwrap_or("");
+
+    let identity = NodeIdentity::load_or_generate();
+
+    // Only print the banner if running in a command/CLI mode or attached to a console
+    if !matches!(command, "" | "gui" | "--gui" | "start" | "--start" | "run" | "--run") {
+        println!("================================================================================");
+        println!("  ⚡ USB Master Pro — Developed & Owned by BhartX Ecosystems Pvt Ltd");
+        println!("  🌐 Website: https://bhartx.in | ✉️ Support: admin@bhartx.in");
+        println!("================================================================================");
+        println!("  Your AnyUSB ID:       \x1b[1;32m{}\x1b[0m", identity.formatted_id);
+        println!("  Default Security PIN: \x1b[1;33m{}\x1b[0m", identity.default_pin);
+        println!("  Hardware Fingerprint: {}", &identity.hardware_hash[0..16]);
+        println!("  P2P Rendezvous Mesh:  Active (Outbound WebSocket / TLS Signaling)");
+        println!("================================================================================\n");
+    }
 
     match command {
         "" | "gui" | "--gui" | "start" | "--start" | "run" | "--run" => {
@@ -62,14 +124,9 @@ async fn main() {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
             let url = format!("http://127.0.0.1:{}/", port);
-            open_browser(&url);
-
-            println!("  ⚡ USB Master Pro is running!");
-            println!("  🌐 Dashboard URL: {}", url);
-            println!("  ⌨️  Press Ctrl+C to stop.\n");
+            open_native_window(&url);
 
             let _ = tokio::signal::ctrl_c().await;
-            println!("\n  Shutting down USB Master Pro...");
         }
 
         "daemon" | "--daemon" => {
@@ -169,8 +226,9 @@ async fn main() {
         "connect" => {
             let target_id = args.get(2).cloned().unwrap_or_default();
             let dev_id = args.get(3).cloned().unwrap_or_else(|| "auto".to_string());
+            let pin = args.get(4).cloned();
             if target_id.trim().is_empty() {
-                println!("Usage: usb_master_cli connect <target_9_digit_id> [device_id]");
+                println!("Usage: usb_master_cli connect <target_9_digit_id> [device_id] [pin]");
                 return;
             }
             let clean_target_id = target_id.replace(' ', "");
@@ -185,10 +243,16 @@ async fn main() {
                 .or_else(usb_master_core::daemon::read_secure_token_from_disk)
                 .unwrap_or_default();
 
-            let payload = serde_json::json!({
+            let mut payload_map = serde_json::json!({
                 "target_id": clean_target_id,
                 "device_id": dev_id
-            }).to_string();
+            });
+            if let Some(pin_val) = pin {
+                if !pin_val.trim().is_empty() {
+                    payload_map["pin"] = serde_json::Value::String(pin_val.trim().to_string());
+                }
+            }
+            let payload = payload_map.to_string();
 
             let req = format!(
                 "POST /api/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",

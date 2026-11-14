@@ -1079,13 +1079,70 @@ AnyUsbVhci_EvtIoInternalDeviceControl(
     }
 
     if (IoControlCode == IOCTL_INTERNAL_USB_SUBMIT_URB) {
-        // Enqueue guest driver URB into FDO PendingUrbQueue for daemon processing
+        PIRP irp = WdfRequestWdmGetIrp(Request);
+        PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
+        PURB urb = (PURB)irpSp->Parameters.Others.Argument1;
+
+        // Local synthesis of configuration and interface selection requests
+        // Prevents Code 10 failure during PnP pipe setup
+        if (urb != NULL) {
+            USHORT func = urb->UrbHeader.Function;
+            if (func == URB_FUNCTION_SELECT_CONFIGURATION) {
+                PUCHAR urbEnd = ((PUCHAR)urb) + urb->UrbHeader.Length;
+                PUSBD_INTERFACE_INFORMATION iface = &urb->UrbSelectConfiguration.Interface;
+                while (((PUCHAR)iface) + sizeof(USBD_INTERFACE_INFORMATION) <= urbEnd) {
+                    if (iface->Length == 0 || ((PUCHAR)iface) + iface->Length > urbEnd) {
+                        break;
+                    }
+                    ULONG maxPipesAllowed = 0;
+                    if (iface->Length >= sizeof(USBD_INTERFACE_INFORMATION)) {
+                        maxPipesAllowed = 1 + (iface->Length - sizeof(USBD_INTERFACE_INFORMATION)) / sizeof(USBD_PIPE_INFORMATION);
+                    }
+                    ULONG numPipes = iface->NumberOfPipes;
+                    if (numPipes > maxPipesAllowed) {
+                        numPipes = maxPipesAllowed;
+                        iface->NumberOfPipes = numPipes;
+                    }
+                    iface->InterfaceHandle = (USBD_INTERFACE_HANDLE)(ULONG_PTR)(iface->InterfaceNumber + 1);
+                    for (ULONG i = 0; i < numPipes; i++) {
+                        iface->Pipes[i].PipeHandle = (USBD_PIPE_HANDLE)(ULONG_PTR)iface->Pipes[i].EndpointAddress;
+                    }
+                    iface = (PUSBD_INTERFACE_INFORMATION)(((PUCHAR)iface) + iface->Length);
+                }
+                urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+                WdfRequestComplete(Request, STATUS_SUCCESS);
+                return;
+            } else if (func == URB_FUNCTION_SELECT_INTERFACE) {
+                PUCHAR urbEnd = ((PUCHAR)urb) + urb->UrbHeader.Length;
+                PUSBD_INTERFACE_INFORMATION iface = &urb->UrbSelectInterface.Interface;
+                if (((PUCHAR)iface) + sizeof(USBD_INTERFACE_INFORMATION) <= urbEnd &&
+                    iface->Length >= sizeof(USBD_INTERFACE_INFORMATION) &&
+                    ((PUCHAR)iface) + iface->Length <= urbEnd) {
+                    ULONG maxPipesAllowed = 1 + (iface->Length - sizeof(USBD_INTERFACE_INFORMATION)) / sizeof(USBD_PIPE_INFORMATION);
+                    ULONG numPipes = iface->NumberOfPipes;
+                    if (numPipes > maxPipesAllowed) {
+                        numPipes = maxPipesAllowed;
+                        iface->NumberOfPipes = numPipes;
+                    }
+                    iface->InterfaceHandle = (USBD_INTERFACE_HANDLE)(ULONG_PTR)(iface->InterfaceNumber + 1);
+                    for (ULONG i = 0; i < numPipes; i++) {
+                        iface->Pipes[i].PipeHandle = (USBD_PIPE_HANDLE)(ULONG_PTR)iface->Pipes[i].EndpointAddress;
+                    }
+                }
+                urb->UrbHeader.Status = USBD_STATUS_SUCCESS;
+                WdfRequestComplete(Request, STATUS_SUCCESS);
+                return;
+            }
+        }
+
+        // Enqueue guest driver data URB into FDO PendingUrbQueue for daemon processing
         NTSTATUS status = WdfRequestForwardToIoQueue(Request, fdoData->PendingUrbQueue);
         if (!NT_SUCCESS(status)) {
             KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                 "USB Master Pro: WdfRequestForwardToIoQueue failed: 0x%08X\n", status));
             WdfRequestComplete(Request, status);
         }
+        return;
     } else {
         KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL,
             "USB Master Pro: Unhandled internal IOCTL 0x%08X on child PDO\n", IoControlCode));

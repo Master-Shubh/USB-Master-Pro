@@ -852,8 +852,11 @@ impl DaemonServer {
 
 // --- STATIC ASSET HANDLERS ---
 
-async fn handle_serve_index() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], EMBEDDED_INDEX_HTML)
+async fn handle_serve_index(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let token = state.local_api_token.read().unwrap().clone();
+    let injection = format!("<script>window.__DAEMON_TOKEN__ = \"{}\";</script>", token);
+    let html = EMBEDDED_INDEX_HTML.replacen("<head>", &format!("<head>\n  {}", injection), 1);
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
 }
 
 async fn handle_serve_logo() -> impl IntoResponse {
@@ -899,7 +902,7 @@ async fn handle_get_pin(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    validate_request_token_or_origin(&headers, &state)?;
+    validate_request_origin_and_auth(&headers, &state)?;
     let pin = state.get_pin().await;
     Ok(Json(serde_json::json!({
         "pin": pin,
@@ -1339,9 +1342,18 @@ pub async fn run_vhci_to_network_pump(
                 let buffer_len = urb_msg.transfer_buffer_length;
                 if buffer_len as usize > ANYUSB_MAX_URB_BUFFER_SIZE {
                     eprintln!(
-                        "⚠️ URB buffer length {} exceeds 64 KB limit. Dropping transfer.",
+                        "⚠️ URB buffer length {} exceeds 64 KB limit. Rejecting transfer.",
                         buffer_len
                     );
+                    let comp_req = AnyUsbCompleteRequest {
+                        device_id: urb_msg.device_id,
+                        sequence_id: urb_msg.sequence_id,
+                        status: -1073741789, // STATUS_BUFFER_OVERFLOW (0xC0000023)
+                        actual_length: 0,
+                        data: [0u8; ANYUSB_MAX_URB_BUFFER_SIZE],
+                    };
+                    let client = Arc::clone(&driver_client);
+                    let _ = tokio::task::spawn_blocking(move || client.complete_urb(&comp_req)).await;
                     continue;
                 }
 
@@ -1493,9 +1505,18 @@ pub async fn run_filter_to_network_pump(
                 let buffer_len = urb_msg.transfer_buffer_length;
                 if buffer_len as usize > ANYUSB_MAX_URB_BUFFER_SIZE {
                     eprintln!(
-                        "⚠️ Filter URB buffer length {} exceeds 64 KB limit. Dropping transfer.",
+                        "⚠️ Filter URB buffer length {} exceeds 64 KB limit. Rejecting transfer.",
                         buffer_len
                     );
+                    let comp_req = AnyUsbCompleteRequest {
+                        device_id: urb_msg.device_id,
+                        sequence_id: urb_msg.sequence_id,
+                        status: -1073741789, // STATUS_BUFFER_OVERFLOW (0xC0000023)
+                        actual_length: 0,
+                        data: [0u8; ANYUSB_MAX_URB_BUFFER_SIZE],
+                    };
+                    let client = Arc::clone(&filter_client);
+                    let _ = tokio::task::spawn_blocking(move || client.complete_urb(&comp_req)).await;
                     continue;
                 }
 
@@ -2102,13 +2123,69 @@ async fn handle_get_system_drivers() -> impl IntoResponse {
     }))
 }
 
-// --- WEBSOCKET EVENT STREAM FOR UI ---
+// --- WEBSOCKET EVENT STREAM FOR UI (Protected against CSWSH) ---
 
 async fn handle_ws_events(
     ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     State(state): State<Arc<DaemonState>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ui_socket(socket, state))
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // 1. Host validation against DNS rebinding
+    if let Some(host_val) = headers.get(axum::http::header::HOST) {
+        if let Ok(host_str) = host_val.to_str() {
+            if !is_authorized_host(host_str) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("Access forbidden: unauthorized Host '{}'", host_str),
+                ));
+            }
+        }
+    }
+
+    // 2. Origin validation against Cross-Site WebSocket Hijacking (CSWSH)
+    if let Some(origin_val) = headers.get(axum::http::header::ORIGIN) {
+        if let Ok(origin_str) = origin_val.to_str() {
+            if !is_authorized_origin(origin_str) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("Access forbidden: unauthorized Origin '{}'", origin_str),
+                ));
+            }
+        }
+    }
+
+    // 3. Token validation (via query param ?token=, x-daemon-token, or Authorization: Bearer <token>)
+    let token_query = params.get("token").map(|s| s.as_str());
+    let token_header = headers.get("x-daemon-token").and_then(|v| v.to_str().ok());
+    let token_auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer ").or(Some(s)));
+
+    let provided_token = token_query.or(token_header).or(token_auth);
+    let expected_token = state.local_api_token.read().unwrap();
+
+    let is_authorized = match provided_token {
+        Some(tok) => constant_time_eq_str(tok, &expected_token),
+        None => {
+            // Allow same-origin local context or test execution
+            if let Some(site) = headers.get("sec-fetch-site") {
+                site == "same-origin" || site == "none"
+            } else {
+                cfg!(any(test, feature = "driver-simulation"))
+            }
+        }
+    };
+
+    if is_authorized || cfg!(any(test, feature = "driver-simulation")) {
+        Ok(ws.on_upgrade(move |socket| handle_ui_socket(socket, state)))
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            "Access unauthorized: valid daemon token required for WebSocket event stream".to_string(),
+        ))
+    }
 }
 
 async fn handle_ui_socket(mut socket: WebSocket, state: Arc<DaemonState>) {

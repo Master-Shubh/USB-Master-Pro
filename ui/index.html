@@ -193,27 +193,35 @@
             <span class="text-xs font-semibold px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">Mount Target</span>
           </div>
 
-          <p class="text-xs text-slate-400 mb-2">Enter the 9-digit AnyUSB ID of the remote computer to mount its devices:</p>
+          <p class="text-xs text-slate-400 mb-2">Enter the 9-digit AnyUSB ID and 6-digit Security PIN of the remote computer to mount its devices:</p>
           
-          <div class="space-y-2 mb-4">
-            <div class="flex items-center space-x-2">
-              <div class="relative flex-1">
+          <div class="space-y-3 mb-4">
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
+              <div class="relative md:col-span-2">
+                <label class="block text-[10px] text-slate-400 mb-1 font-semibold uppercase tracking-wider">Remote AnyUSB ID</label>
                 <input id="remoteIdInput" type="text" placeholder="e.g. 354 426 246" maxlength="11"
                        oninput="handleRemoteIdInput(this)"
-                       class="w-full bg-darkBg border border-darkBorder rounded-xl px-4 py-3 text-lg font-mono tracking-widest text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition">
+                       class="w-full bg-darkBg border border-darkBorder rounded-xl px-4 py-2.5 text-base font-mono tracking-widest text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition">
               </div>
-              <button id="connectBtn" onclick="connectRemote()" class="px-6 py-3 bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 font-bold text-sm text-white rounded-xl shadow-lg shadow-brand-500/25 transition flex items-center space-x-2 flex-shrink-0">
+              <div class="relative">
+                <label class="block text-[10px] text-slate-400 mb-1 font-semibold uppercase tracking-wider">Security PIN</label>
+                <input id="remotePinInput" type="text" placeholder="e.g. 482 190" maxlength="7"
+                       class="w-full bg-darkBg border border-darkBorder rounded-xl px-3 py-2.5 text-base font-mono tracking-widest text-amber-300 placeholder-slate-600 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition">
+              </div>
+            </div>
+            
+            <div class="flex items-center justify-between">
+              <!-- Strict 9-Digit ID Local Validation Badge (Section 5) -->
+              <div id="idValidationBadge" class="transition-all duration-200 min-h-[26px] flex items-center">
+                <div class="text-[11px] text-slate-500 flex items-center space-x-1.5 px-1">
+                  <i data-lucide="info" class="w-3.5 h-3.5 text-slate-500 flex-shrink-0"></i>
+                  <span>Enter 9-digit AnyUSB ID & 6-digit PIN to establish encrypted tunnel.</span>
+                </div>
+              </div>
+              <button id="connectBtn" onclick="connectRemote()" class="px-6 py-2.5 bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 font-bold text-sm text-white rounded-xl shadow-lg shadow-brand-500/25 transition flex items-center space-x-2 flex-shrink-0">
                 <i data-lucide="plug" class="w-4 h-4"></i>
                 <span>CONNECT</span>
               </button>
-            </div>
-            
-            <!-- Strict 9-Digit ID Local Validation Badge (Section 5) -->
-            <div id="idValidationBadge" class="transition-all duration-200 min-h-[26px] flex items-center">
-              <div class="text-[11px] text-slate-500 flex items-center space-x-1.5 px-1">
-                <i data-lucide="info" class="w-3.5 h-3.5 text-slate-500 flex-shrink-0"></i>
-                <span>Enter 9-digit AnyUSB ID (e.g. 354 426 246) to establish encrypted P2P tunnel.</span>
-              </div>
             </div>
           </div>
 
@@ -2213,14 +2221,22 @@
         return;
       }
 
+      const pinInput = document.getElementById('remotePinInput');
+      const pinVal = pinInput ? pinInput.value.trim() : '';
+
       updateConnectionStatus('Connecting', currentTransport);
 
       try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (window.__DAEMON_TOKEN__) {
+          headers['Authorization'] = `Bearer ${window.__DAEMON_TOKEN__}`;
+        }
         const res = await fetch(`${API_BASE}/api/connect`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: headers,
           body: JSON.stringify({
-            target_id: clean
+            target_id: clean,
+            pin: pinVal || undefined
           })
         });
 
@@ -2230,6 +2246,7 @@
           showToast('Connection Dispatched', `Request sent to AnyUSB ID [${clean}]. Awaiting remote operator approval...`);
           alert(`Connection request dispatched to AnyUSB ID [${clean}]!\nWaiting for remote operator approval...`);
           input.value = '';
+          if (pinInput) pinInput.value = '';
           handleRemoteIdInput(input);
         } else {
           const errText = await res.text();
@@ -2287,7 +2304,29 @@
       }
     }
 
-    function unmountRemote(index) {
+    async function unmountRemote(index) {
+      const dev = remoteMountedDevices[index];
+      if (!dev) return;
+      const peerId = (dev.remote_peer_id || dev.remotePeerId || '').replace(/\s+/g, '');
+      if (peerId) {
+        try {
+          const headers = { 'Content-Type': 'application/json' };
+          if (window.__DAEMON_TOKEN__) {
+            headers['Authorization'] = `Bearer ${window.__DAEMON_TOKEN__}`;
+          }
+          await fetch(`${API_BASE}/api/disconnect`, {
+            method: 'POST',
+            headers: headers,
+            body: JSON.stringify({
+              peer_id: peerId,
+              reason: 'User disconnected device from UI'
+            })
+          });
+          showToast('Device Detached', `Remote device disconnected from [${peerId}].`);
+        } catch (e) {
+          console.error('[UI] Failed to disconnect session:', e);
+        }
+      }
       remoteMountedDevices.splice(index, 1);
       renderRemoteDevices();
     }
@@ -2317,7 +2356,9 @@
       }
 
       try {
-        ws = new WebSocket(WS_BASE);
+        const token = window.__DAEMON_TOKEN__ || localStorage.getItem('daemon_token') || '';
+        const wsUrl = token ? `${WS_BASE}?token=${encodeURIComponent(token)}` : WS_BASE;
+        ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
           console.log("[UI] Connected to Embedded IPC Daemon Event Stream");

@@ -212,5 +212,8 @@ begin
 
     InstallDriverPackage(AppDir + '\drivers\vhci\anyusb_vhci.inf');
     InstallDriverPackage(AppDir + '\drivers\filter\anyusb_filter.inf');
+
+    // Instantiate root-enumerated VHCI device node dynamically (zero-reboot)
+    Exec(ExpandConstant('{sys}\pnputil.exe'), '/add-device /device-id "root\anyusb_vhci"', '', SW_HIDE, ewWaitUntilTerminated, CertResultCode);
   end;
 end;

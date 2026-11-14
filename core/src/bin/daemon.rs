@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! USB Master Pro — Production IPC Daemon Binary
 //! Runs embedded HTTP/WS server on 127.0.0.1:19842 and connects to Signaling Broker.
 

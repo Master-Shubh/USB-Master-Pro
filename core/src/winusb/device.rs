@@ -12,6 +12,10 @@ pub const ERROR_IO_PENDING: u32 = 997;
 pub const ERROR_DEVICE_NOT_CONNECTED: u32 = 1167;
 pub const ERROR_GEN_FAILURE: u32 = 31;
 pub const ERROR_OPERATION_ABORTED: u32 = 995;
+pub const ERROR_NO_SUCH_DEVICE: u32 = 433;
+pub const ERROR_NOT_FOUND: u32 = 1168;
+pub const ERROR_BAD_COMMAND: u32 = 22;
+pub const ERROR_INVALID_HANDLE: u32 = 6;
 
 #[derive(Debug, Error)]
 pub enum WinUsbError {
@@ -56,7 +60,6 @@ pub struct WinUsbDevice {
     file_handle: HANDLE,
     winusb_handle: WINUSB_INTERFACE_HANDLE,
     pub pipes: Vec<UsbPipeInfo>,
-    io_lock: Mutex<()>,
 }
 
 unsafe impl Send for WinUsbDevice {}
@@ -72,7 +75,6 @@ impl WinUsbDevice {
                 file_handle: INVALID_HANDLE_VALUE,
                 winusb_handle: std::ptr::null_mut(),
                 pipes: Vec::new(),
-                io_lock: Mutex::new(()),
             })
         }
 
@@ -148,7 +150,6 @@ impl WinUsbDevice {
                 file_handle,
                 winusb_handle,
                 pipes,
-                io_lock: Mutex::new(()),
             })
         }
     }
@@ -170,7 +171,6 @@ impl WinUsbDevice {
 
         #[cfg(target_os = "windows")]
         unsafe {
-            let _lock = self.io_lock.lock().unwrap();
             let sp = WINUSB_SETUP_PACKET {
                 request_type: setup_packet_bytes[0],
                 request: setup_packet_bytes[1],
@@ -222,17 +222,20 @@ impl WinUsbDevice {
                         } else {
                             Err(self.map_win32_error("ControlTransfer", 0, GetLastError()))
                         }
-                    } else if wait == WAIT_TIMEOUT {
+                    } else {
+                        // On any non-WAIT_OBJECT_0 result (timeout or wait failed), cancel and wait synchronously
                         CancelIoEx(self.file_handle, &mut ov);
                         let mut transferred_dummy = 0u32;
                         let _ = GetOverlappedResult(self.file_handle, &mut ov, &mut transferred_dummy, 1);
-                        Err(WinUsbError::Timeout { endpoint: 0, timeout_ms })
-                    } else {
-                        Err(WinUsbError::IoFailed {
-                            op: "WaitForSingleObject".to_string(),
-                            endpoint: 0,
-                            error_code: GetLastError(),
-                        })
+                        if wait == WAIT_TIMEOUT {
+                            Err(WinUsbError::Timeout { endpoint: 0, timeout_ms })
+                        } else {
+                            Err(WinUsbError::IoFailed {
+                                op: "WaitForSingleObject".to_string(),
+                                endpoint: 0,
+                                error_code: GetLastError(),
+                            })
+                        }
                     }
                 } else {
                     Err(self.map_win32_error("ControlTransfer", 0, err))
@@ -258,7 +261,6 @@ impl WinUsbDevice {
 
         #[cfg(target_os = "windows")]
         unsafe {
-            let _lock = self.io_lock.lock().unwrap();
             let h_event = CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null());
             if h_event.is_null() {
                 return Err(WinUsbError::IoFailed {
@@ -295,18 +297,21 @@ impl WinUsbDevice {
                         } else {
                             Err(self.map_win32_error("ReadPipe", pipe_id, GetLastError()))
                         }
-                    } else if wait == WAIT_TIMEOUT {
+                    } else {
+                        // Always cancel, abort pipe, and wait synchronously for kernel to detach ov
                         CancelIoEx(self.file_handle, &mut ov);
                         let _ = WinUsb_AbortPipe(self.winusb_handle, pipe_id);
                         let mut transferred_dummy = 0u32;
                         let _ = GetOverlappedResult(self.file_handle, &mut ov, &mut transferred_dummy, 1);
-                        Err(WinUsbError::Timeout { endpoint: pipe_id, timeout_ms })
-                    } else {
-                        Err(WinUsbError::IoFailed {
-                            op: "WaitForSingleObject".to_string(),
-                            endpoint: pipe_id,
-                            error_code: GetLastError(),
-                        })
+                        if wait == WAIT_TIMEOUT {
+                            Err(WinUsbError::Timeout { endpoint: pipe_id, timeout_ms })
+                        } else {
+                            Err(WinUsbError::IoFailed {
+                                op: "WaitForSingleObject".to_string(),
+                                endpoint: pipe_id,
+                                error_code: GetLastError(),
+                            })
+                        }
                     }
                 } else {
                     Err(self.map_win32_error("ReadPipe", pipe_id, err))
@@ -332,7 +337,6 @@ impl WinUsbDevice {
 
         #[cfg(target_os = "windows")]
         unsafe {
-            let _lock = self.io_lock.lock().unwrap();
             let h_event = CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null());
             if h_event.is_null() {
                 return Err(WinUsbError::IoFailed {
@@ -369,18 +373,21 @@ impl WinUsbDevice {
                         } else {
                             Err(self.map_win32_error("WritePipe", pipe_id, GetLastError()))
                         }
-                    } else if wait == WAIT_TIMEOUT {
+                    } else {
+                        // Always cancel, abort pipe, and wait synchronously for kernel to detach ov
                         CancelIoEx(self.file_handle, &mut ov);
                         let _ = WinUsb_AbortPipe(self.winusb_handle, pipe_id);
                         let mut transferred_dummy = 0u32;
                         let _ = GetOverlappedResult(self.file_handle, &mut ov, &mut transferred_dummy, 1);
-                        Err(WinUsbError::Timeout { endpoint: pipe_id, timeout_ms })
-                    } else {
-                        Err(WinUsbError::IoFailed {
-                            op: "WaitForSingleObject".to_string(),
-                            endpoint: pipe_id,
-                            error_code: GetLastError(),
-                        })
+                        if wait == WAIT_TIMEOUT {
+                            Err(WinUsbError::Timeout { endpoint: pipe_id, timeout_ms })
+                        } else {
+                            Err(WinUsbError::IoFailed {
+                                op: "WaitForSingleObject".to_string(),
+                                endpoint: pipe_id,
+                                error_code: GetLastError(),
+                            })
+                        }
                     }
                 } else {
                     Err(self.map_win32_error("WritePipe", pipe_id, err))
@@ -437,9 +444,10 @@ impl WinUsbDevice {
     #[cfg(target_os = "windows")]
     fn map_win32_error(&self, op: &str, endpoint: u8, code: u32) -> WinUsbError {
         match code {
-            ERROR_DEVICE_NOT_CONNECTED => WinUsbError::DeviceDisconnected,
+            ERROR_DEVICE_NOT_CONNECTED | ERROR_NO_SUCH_DEVICE | ERROR_NOT_FOUND | ERROR_GEN_FAILURE => {
+                WinUsbError::DeviceDisconnected
+            }
             ERROR_OPERATION_ABORTED => WinUsbError::Aborted,
-            ERROR_GEN_FAILURE => WinUsbError::Stalled(endpoint),
             _ => WinUsbError::IoFailed {
                 op: op.to_string(),
                 endpoint,

@@ -44,6 +44,7 @@ if exist "%DRIVER_DIR%\bhartx_test_ca.cer" (
 
 echo [USB Master Pro] Dynamically staging Virtual USB Host Controller (anyusb_vhci)...
 pnputil.exe /add-driver "%DRIVER_DIR%\vhci\anyusb_vhci.inf" /install
+pnputil.exe /add-device /device-id "root\anyusb_vhci" >nul 2>&1
 if %errorLevel% equ 3010 (
     echo [NOTICE] Reboot is required by Windows to complete driver registration.
 ) else if %errorLevel% neq 0 (

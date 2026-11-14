@@ -192,16 +192,10 @@ impl WinUsbClient {
         map.remove(&device_id);
     }
 
-    /// Gets an open device by device ID (or returns the default device if only one is active).
+    /// Gets an open device by exact device ID.
     pub fn get_device(&self, device_id: u32) -> Option<Arc<WinUsbDevice>> {
         let map = self.devices.lock().unwrap();
-        if let Some(d) = map.get(&device_id) {
-            Some(Arc::clone(d))
-        } else if map.len() == 1 {
-            map.values().next().cloned()
-        } else {
-            None
-        }
+        map.get(&device_id).cloned()
     }
 
     #[cfg(any(test, feature = "driver-simulation"))]
@@ -301,7 +295,13 @@ impl WinUsbClient {
             TransferType::Bulk | TransferType::Interrupt => {
                 let is_in = (header.endpoint_address & 0x80) != 0;
                 if is_in {
-                    let req_len = (header.actual_length as usize).min(65536);
+                    let req_len = if header.buffer_length > 0 {
+                        (header.buffer_length as usize).min(65536)
+                    } else if header.actual_length > 0 {
+                        (header.actual_length as usize).min(65536)
+                    } else {
+                        65536
+                    };
                     let mut buffer = vec![0u8; req_len];
                     match dev.read_pipe(header.endpoint_address, &mut buffer, 3000) {
                         Ok(transferred) => {
