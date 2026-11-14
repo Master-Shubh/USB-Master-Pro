@@ -293,6 +293,18 @@ impl WinUsbClient {
                 }
             }
             TransferType::Bulk | TransferType::Interrupt => {
+                // 1. Endpoint existence validation against interface descriptor
+                if !dev.pipes.is_empty() && !dev.pipes.iter().any(|p| p.pipe_id == header.endpoint_address) {
+                    eprintln!("⚠️ Pipe 0x{:02X} does not exist on claimed WinUSB interface for Seq {}", header.endpoint_address, header.sequence_id);
+                    return (STATUS_NOT_SUPPORTED, Vec::new());
+                }
+
+                // 2. 64 KB bounds protection
+                if header.buffer_length as usize > 65536 || header.actual_length as usize > 65536 {
+                    eprintln!("⚠️ Buffer length exceeds 64 KB limit for Seq {}", header.sequence_id);
+                    return (-1073741789, Vec::new()); // STATUS_BUFFER_OVERFLOW (0xC0000023)
+                }
+
                 let is_in = (header.endpoint_address & 0x80) != 0;
                 if is_in {
                     let req_len = if header.buffer_length > 0 {

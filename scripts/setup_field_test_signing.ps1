@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     BhartX Ecosystems Pvt Ltd — Automated Field-Testing Driver Setup & Signing Script
     Windows 10 / Windows 11 (x64 and ARM64)
@@ -407,6 +407,5 @@ Write-Host "  2. If running on VM (Hyper-V / VMware / Proxmox / VirtualBox):"
 Write-Host "     -> Disable Secure Boot in VM configuration settings."
 Write-Host "  3. To manually stage drivers anytime, run:"
 Write-Host "     pnputil.exe /add-driver `"$PSScriptRoot\..\drivers\vhci\anyusb_vhci.inf`" /install"
-Write-Host "     pnputil.exe /add-driver `"$PSScriptRoot\..\drivers\filter\anyusb_filter.inf`" /install"
 Write-Host "  4. Check Device Manager -> System Devices -> 'USB Master Pro Virtual Host Controller & Bus Root'"
 Write-Host "================================================================================`n" -ForegroundColor Cyan

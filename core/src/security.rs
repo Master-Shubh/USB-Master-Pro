@@ -109,17 +109,11 @@ pub fn fill_secure_entropy(buf: &mut [u8]) -> bool {
 
 impl PortableFileKeyStorage {
     /// Creates storage using default machine-anchored master key in the given directory.
+    /// Strictly fails closed if cryptographically secure OS entropy is unavailable.
     pub fn new(storage_dir: PathBuf) -> Self {
         let mut seed = [0u8; 32];
         if !fill_secure_entropy(&mut seed) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let mut h = Sha256::new();
-            h.update(b"PORTABLE_KEY_STORAGE_FALLBACK");
-            h.update(now.to_le_bytes());
-            seed.copy_from_slice(&h.finalize());
+            panic!("FATAL: Cryptographically secure OS entropy unavailable. System must fail-closed.");
         }
         let mut hasher = Sha256::new();
         hasher.update(b"PORTABLE_FILE_KEY_STORAGE_DEFAULT_V1");
@@ -189,17 +183,10 @@ impl KeyStorageProvider for PortableFileKeyStorage {
             fs::create_dir_all(parent)?;
         }
 
-        // Generate 16-byte random salt
+        // Generate 16-byte random salt (fails closed if OS entropy fails)
         let mut salt = [0u8; SALT_SIZE];
         if !fill_secure_entropy(&mut salt) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let mut h = Sha256::new();
-            h.update(now.to_le_bytes());
-            let d = h.finalize();
-            salt.copy_from_slice(&d[0..16]);
+            panic!("FATAL: Cryptographically secure OS entropy unavailable. System must fail-closed.");
         }
 
         // Derive K = SHA256("USB_MASTER_KEY_PROTECT" || master_key || salt)

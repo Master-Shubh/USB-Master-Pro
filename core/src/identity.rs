@@ -11,7 +11,8 @@ use std::fs;
 pub struct NodeIdentity {
     pub raw_id: u32,       // e.g. 482190334
     pub formatted_id: String, // e.g. "482 190 334"
-    pub default_pin: String,  // e.g. "821 490"
+    #[serde(skip_serializing)]
+    pub default_pin: String,  // e.g. "821 490" (Guarded against serialization / network leakage)
     pub hardware_hash: String,
     #[serde(default)]
     pub installation_public_key: String,
@@ -30,21 +31,21 @@ pub struct InstallationKeypair {
 pub type Ed25519Keypair = InstallationKeypair;
 
 impl InstallationKeypair {
-    /// Generates a new random installation keypair using system entropy
+    /// Generates a new random installation keypair using system entropy.
+    /// Strictly fails closed if cryptographically secure OS entropy is unavailable.
     pub fn generate() -> Self {
+        Self::try_generate().expect("FATAL: Cryptographically secure OS entropy unavailable. System must fail-closed.")
+    }
+
+    /// Fallible generator that returns an error when OS CSPRNG fails.
+    pub fn try_generate() -> Result<Self, crate::security::SecurityError> {
         let mut seed = [0u8; 32];
         if !crate::security::fill_secure_entropy(&mut seed) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let mut hasher = Sha256::new();
-            hasher.update(b"INSTALLATION_KEYPAIR_FALLBACK_ENTROPY");
-            hasher.update(now.to_le_bytes());
-            let hash = hasher.finalize();
-            seed.copy_from_slice(&hash[0..32]);
+            return Err(crate::security::SecurityError::CryptoError(
+                "Cryptographically secure OS entropy unavailable. System must fail-closed.".to_string(),
+            ));
         }
-        Self::from_seed(&seed)
+        Ok(Self::from_seed(&seed))
     }
 
     /// Derives an asymmetric keypair deterministically from a 32-byte seed using RFC 8032 Ed25519

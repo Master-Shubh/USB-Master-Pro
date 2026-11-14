@@ -240,8 +240,12 @@ pub enum PinVerificationResult {
 /// Generates a cryptographically secure 6-digit one-time session PIN using CSPRNG.
 /// Formatted as "XXX XXX" (e.g., "482 190").
 pub fn generate_csprng_pin() -> String {
-    use rand::Rng;
-    let pin_num: u32 = rand::thread_rng().gen_range(100_000..=999_999);
+    let mut bytes = [0u8; 4];
+    if !crate::security::fill_secure_entropy(&mut bytes) {
+        panic!("FATAL: Cryptographically secure OS entropy unavailable for session PIN generation. System must fail-closed.");
+    }
+    let val = u32::from_le_bytes(bytes);
+    let pin_num: u32 = 100_000 + (val % 900_000);
     let s = pin_num.to_string();
     format!("{} {}", &s[0..3], &s[3..6])
 }

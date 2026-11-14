@@ -640,3 +640,78 @@ async fn test_full_sender_filter_urb_pump_pipeline() {
     filter_client.stop_capture(test_device_id).expect("stop_capture failed");
     assert!(!filter_client.is_capturing(test_device_id));
 }
+
+#[tokio::test]
+async fn test_winusb_dispatch_validation_and_cancellation() {
+    use usb_master_core::protocol::{TurboUrbHeader, CMD_SUBMIT_URB, CMD_UNLINK_URB, TransferType};
+    use usb_master_core::winusb::client::{WinUsbClient, STATUS_NOT_SUPPORTED, STATUS_DEVICE_NOT_CONNECTED};
+
+    let client = WinUsbClient::new();
+
+    // 1. Unclaimed device dispatch must return STATUS_DEVICE_NOT_CONNECTED
+    let hdr = TurboUrbHeader::new(
+        CMD_SUBMIT_URB,
+        1001,
+        999, // Unclaimed device
+        0x81,
+        TransferType::Bulk,
+        512,
+    );
+    let (status, resp) = client.dispatch_urb(&hdr, None, &[]);
+    assert_eq!(status, STATUS_DEVICE_NOT_CONNECTED);
+    assert!(resp.is_empty());
+
+    // 2. Cancellation / UNLINK command must return USBD_STATUS_CANCELED (0xC0010000)
+    let unlink_hdr = TurboUrbHeader::new(
+        CMD_UNLINK_URB,
+        1002,
+        999,
+        0x81,
+        TransferType::Bulk,
+        0,
+    );
+    let (unlink_status, _) = client.dispatch_urb(&unlink_hdr, None, &[]);
+    assert_eq!(unlink_status, 0xC0010000_u32 as i32);
+
+    // 3. Simulation response registration and retrieval
+    client.register_simulation_response(2001, 0, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    let sim_hdr = TurboUrbHeader::new(
+        CMD_SUBMIT_URB,
+        2001,
+        101,
+        0x81,
+        TransferType::Bulk,
+        4,
+    );
+    let (sim_status, sim_data) = client.dispatch_urb(&sim_hdr, None, &[]);
+    assert_eq!(sim_status, 0);
+    assert_eq!(sim_data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+}
+
+#[test]
+fn test_fail_closed_entropy_and_pin_protection() {
+    use usb_master_core::identity::{InstallationKeypair, NodeIdentity};
+    use usb_master_core::daemon::generate_csprng_pin;
+
+    // 1. Verify InstallationKeypair generates valid Ed25519 keypair
+    let keypair = InstallationKeypair::generate();
+    assert_eq!(keypair.public_key.len(), 32);
+    assert_eq!(keypair.public_key_hex.len(), 64);
+
+    let try_res = InstallationKeypair::try_generate();
+    assert!(try_res.is_ok(), "OS CSPRNG must succeed on host");
+
+    // 2. Verify CSPRNG session PIN format (3 digits, space, 3 digits)
+    let pin = generate_csprng_pin();
+    assert_eq!(pin.len(), 7, "PIN must be 'XXX XXX'");
+    assert_eq!(&pin[3..4], " ");
+    let numeric_part: String = pin.chars().filter(|c| c.is_ascii_digit()).collect();
+    assert_eq!(numeric_part.len(), 6);
+
+    // 3. Verify NodeIdentity JSON serialization NEVER leaks default_pin
+    let node_id = NodeIdentity::load_or_generate();
+    let json_str = serde_json::to_string(&node_id).unwrap();
+    assert!(!json_str.contains("default_pin"), "default_pin MUST NOT be exposed in serialized NodeIdentity JSON");
+    assert!(json_str.contains("raw_id"));
+    assert!(json_str.contains("formatted_id"));
+}
