@@ -1313,10 +1313,11 @@ async fn handle_post_respond(
         if let Some(first_shareable) = dev_lock.iter_mut().find(|d| d.can_forward) {
             if first_shareable.is_mounted && first_shareable.remote_peer_id.as_deref() != Some(&clean_from_id) {
                 let current_owner = first_shareable.remote_peer_id.clone().unwrap_or_default();
+                let device_name = first_shareable.friendly_name.clone();
                 drop(dev_lock);
                 return Err((
                     StatusCode::CONFLICT,
-                    format!("Device '{}' is already locked by remote peer [{}]. Cannot accept concurrent session.", first_shareable.friendly_name, current_owner)
+                    format!("Device '{}' is already locked by remote peer [{}]. Cannot accept concurrent session.", device_name, current_owner)
                 ));
             }
             first_shareable.is_shared = true;
