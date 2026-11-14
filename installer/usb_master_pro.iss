@@ -53,9 +53,6 @@ Source: "{#BinDir}\USBMasterDaemon.exe"; DestDir: "{app}\bin"; Flags: ignorevers
 Source: "..\drivers\vhci\anyusb_vhci.sys"; DestDir: "{app}\drivers\vhci"; Flags: ignoreversion
 Source: "..\drivers\vhci\anyusb_vhci.inf"; DestDir: "{app}\drivers\vhci"; Flags: ignoreversion
 Source: "..\drivers\vhci\anyusb_vhci.cat"; DestDir: "{app}\drivers\vhci"; Flags: ignoreversion
-Source: "..\drivers\filter\anyusb_filter.sys"; DestDir: "{app}\drivers\filter"; Flags: ignoreversion
-Source: "..\drivers\filter\anyusb_filter.inf"; DestDir: "{app}\drivers\filter"; Flags: ignoreversion
-Source: "..\drivers\filter\anyusb_filter.cat"; DestDir: "{app}\drivers\filter"; Flags: ignoreversion
 Source: "..\drivers\bhartx_test_ca.cer"; DestDir: "{app}\drivers"; Flags: ignoreversion skipifsourcedoesntexist
 
 ; Deployment & Operational Scripts
@@ -131,12 +128,6 @@ begin
     MissingList := MissingList + '  - ' + AppDir + '\drivers\vhci\anyusb_vhci.sys' + #13#10;
   if not FileExists(AppDir + '\drivers\vhci\anyusb_vhci.cat') then
     MissingList := MissingList + '  - ' + AppDir + '\drivers\vhci\anyusb_vhci.cat' + #13#10;
-  if not FileExists(AppDir + '\drivers\filter\anyusb_filter.inf') then
-    MissingList := MissingList + '  - ' + AppDir + '\drivers\filter\anyusb_filter.inf' + #13#10;
-  if not FileExists(AppDir + '\drivers\filter\anyusb_filter.sys') then
-    MissingList := MissingList + '  - ' + AppDir + '\drivers\filter\anyusb_filter.sys' + #13#10;
-  if not FileExists(AppDir + '\drivers\filter\anyusb_filter.cat') then
-    MissingList := MissingList + '  - ' + AppDir + '\drivers\filter\anyusb_filter.cat' + #13#10;
 
   if MissingList <> '' then
   begin
@@ -211,7 +202,6 @@ begin
     end;
 
     InstallDriverPackage(AppDir + '\drivers\vhci\anyusb_vhci.inf');
-    InstallDriverPackage(AppDir + '\drivers\filter\anyusb_filter.inf');
 
     // Instantiate root-enumerated VHCI device node dynamically (zero-reboot)
     Exec(ExpandConstant('{sys}\pnputil.exe'), '/add-device /device-id "root\anyusb_vhci"', '', SW_HIDE, ewWaitUntilTerminated, CertResultCode);

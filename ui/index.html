@@ -2025,6 +2025,12 @@
             </div>
           </div>
           <div class="flex items-center space-x-2 flex-shrink-0">
+            ${(dev.is_mounted || dev.is_shared) ? `
+              <button onclick="reclaimDevice('${dev.id}')" class="px-2.5 py-2 bg-amber-600/20 hover:bg-amber-600/30 text-amber-300 border border-amber-500/30 rounded-lg text-xs font-bold transition flex items-center space-x-1" title="Instantly Release WinUSB Handle &amp; Restore Local OEM Driver Access">
+                <i data-lucide="rotate-ccw" class="w-3.5 h-3.5"></i>
+                <span class="hidden sm:inline">Reclaim Locally</span>
+              </button>
+            ` : ''}
             ${dev.is_mounted ? `
               <button onclick="openSessionTelemetry('${dev.remote_peer_id || 'Active'}', '${dev.friendly_name.replace(/'/g, "\\'")}')" class="px-2.5 py-2 bg-cyan-600/20 hover:bg-cyan-600/30 text-cyan-300 border border-cyan-500/30 rounded-lg text-xs font-bold transition flex items-center space-x-1" title="Active Session Deep Telemetry">
                 <i data-lucide="activity" class="w-3.5 h-3.5"></i>
@@ -2150,6 +2156,31 @@
         }
       } catch (err) {
         console.warn("[UI] Error fetching devices from daemon:", err.message);
+      }
+    }
+
+    async function reclaimDevice(devId) {
+      const dev = localDevices.find(d => d.id === devId);
+      const name = dev ? dev.friendly_name : devId;
+      try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (window.__DAEMON_TOKEN__) {
+          headers['Authorization'] = `Bearer ${window.__DAEMON_TOKEN__}`;
+        }
+        const res = await fetch(`${API_BASE}/api/devices/reclaim`, {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify({ device_id: devId })
+        });
+        if (res.ok) {
+          showToast('Device Reclaimed', `Hardware "${name}" released from remote session. Local OEM driver access restored.`);
+          fetchDevices();
+        } else {
+          const errText = await res.text();
+          alert('Failed to reclaim device: ' + errText);
+        }
+      } catch (e) {
+        console.error('Reclaim error:', e);
       }
     }
 

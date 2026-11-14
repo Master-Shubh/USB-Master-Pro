@@ -148,6 +148,11 @@ pub struct ForwardRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReclaimRequest {
+    pub device_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectRequest {
     pub target_id: String,
     #[serde(default)]
@@ -730,6 +735,7 @@ pub fn create_router(state: Arc<DaemonState>) -> Router {
         .route("/api/sessions", get(handle_get_sessions))
         .route("/api/forward", post(handle_post_forward))
         .route("/api/devices/share", post(handle_share_device))
+        .route("/api/devices/reclaim", post(handle_reclaim_device))
         .route("/api/connect", post(handle_post_connect))
         .route("/api/respond", post(handle_post_respond))
         .route("/api/disconnect", post(handle_post_disconnect))
@@ -1125,6 +1131,67 @@ pub async fn handle_post_forward(
     handle_share_device(headers, state, payload).await
 }
 
+pub async fn handle_reclaim_device(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(payload): Json<ReclaimRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    validate_request_origin_and_auth(&headers, &state)?;
+
+    let mut dev_lock = state.devices.write().await;
+    let dev = dev_lock.iter_mut().find(|d| d.id == payload.device_id || derive_numeric_device_id(&d.id).to_string() == payload.device_id);
+
+    match dev {
+        Some(d) => {
+            let numeric_dev_id = derive_numeric_device_id(&d.id);
+            let closed_peer_id = d.remote_peer_id.take();
+            d.is_shared = false;
+            d.is_mounted = false;
+
+            // Release WinUSB device handle immediately -> invokes WinUsb_Free and CloseHandle
+            // This immediately unbinds the user-mode claim and lets Windows re-bind the physical device
+            // to the local OEM vendor driver (e.g. Mantra RD Service) without requiring cable replug!
+            state.winusb_client.release_device(numeric_dev_id);
+            let _ = state.filter_client.stop_capture(numeric_dev_id);
+
+            let reclaimed_name = d.friendly_name.clone();
+            let reclaimed_id = d.id.clone();
+            drop(dev_lock);
+
+            // If there was an active session, cleanly terminate it and inform the remote peer
+            if let Some(peer_id) = closed_peer_id {
+                let disconnect_msg = serde_json::json!({
+                    "type": "DISCONNECT",
+                    "toId": peer_id,
+                    "reason": "Host operator reclaimed device locally"
+                });
+                let _ = state.broker_tx.send(disconnect_msg).await;
+
+                let mut sessions = state.active_sessions.write().await;
+                if let Some(session) = sessions.get_mut(&peer_id) {
+                    let _ = session.transition_to(SessionState::Closing, Some("Device reclaimed by host operator".to_string()));
+                    let _ = session.transition_to(SessionState::Ready, Some("Reclaimed locally".to_string()));
+                }
+            }
+
+            let _ = state.ui_events_tx.send(serde_json::json!({
+                "type": "DEVICE_RECLAIMED",
+                "device_id": reclaimed_id,
+                "deviceName": reclaimed_name
+            }));
+
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "message": format!("Device '{}' reclaimed successfully. Local OEM driver access restored.", reclaimed_name)
+            })))
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!("Device ID '{}' not found on local machine", payload.device_id)
+        )),
+    }
+}
+
 async fn handle_post_connect(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
@@ -1240,10 +1307,18 @@ async fn handle_post_respond(
         let session_clone = session.clone();
         drop(sessions);
 
-        // Mark local shared device as mounted
+        // Mark local shared device as mounted with atomic single-peer ownership
         let mut dev_lock = state.devices.write().await;
         let mut target_device_id = derive_numeric_device_id(&clean_from_id);
         if let Some(first_shareable) = dev_lock.iter_mut().find(|d| d.can_forward) {
+            if first_shareable.is_mounted && first_shareable.remote_peer_id.as_deref() != Some(&clean_from_id) {
+                let current_owner = first_shareable.remote_peer_id.clone().unwrap_or_default();
+                drop(dev_lock);
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("Device '{}' is already locked by remote peer [{}]. Cannot accept concurrent session.", first_shareable.friendly_name, current_owner)
+                ));
+            }
             first_shareable.is_shared = true;
             first_shareable.is_mounted = true;
             first_shareable.remote_peer_id = Some(clean_from_id.clone());
@@ -2282,6 +2357,26 @@ async fn run_signaling_client(
                     "connected": true
                 }));
 
+                // Restore interrupted sessions
+                {
+                    let mut sessions = state.active_sessions.write().await;
+                    for session in sessions.values_mut() {
+                        if session.state() == SessionState::Interrupted {
+                            let _ = session.transition_to(SessionState::Recovering, Some("Signaling channel restored".to_string()));
+                            let _ = session.transition_to(SessionState::Active, Some("Turbo-URB link re-established".to_string()));
+                            let _ = state.ui_events_tx.send(serde_json::json!({
+                                "type": "SESSION_STATE_CHANGED",
+                                "session_id": session.session_id,
+                                "peer_id": session.peer_id,
+                                "device_id": session.device_id,
+                                "state": session.state(),
+                                "previous_state": session.state_machine.previous_state(),
+                                "reason": session.state_machine.last_reason()
+                            }));
+                        }
+                    }
+                }
+
                 let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
 
                 loop {
@@ -2339,6 +2434,23 @@ async fn run_signaling_client(
                 }
 
                 state.broker_connected.store(false, Ordering::Relaxed);
+                {
+                    let mut sessions = state.active_sessions.write().await;
+                    for session in sessions.values_mut() {
+                        if session.state() == SessionState::Active {
+                            let _ = session.transition_to(SessionState::Interrupted, Some("Signaling channel disconnected".to_string()));
+                            let _ = state.ui_events_tx.send(serde_json::json!({
+                                "type": "SESSION_STATE_CHANGED",
+                                "session_id": session.session_id,
+                                "peer_id": session.peer_id,
+                                "device_id": session.device_id,
+                                "state": session.state(),
+                                "previous_state": session.state_machine.previous_state(),
+                                "reason": session.state_machine.last_reason()
+                            }));
+                        }
+                    }
+                }
                 let _ = state.ui_events_tx.send(serde_json::json!({
                     "type": "BROKER_STATUS",
                     "connected": false
@@ -2481,6 +2593,43 @@ async fn handle_broker_message(state: &Arc<DaemonState>, raw_json: &str) {
                     }
                     PinVerificationResult::Success => {
                         println!("  🔐 PIN successfully verified for incoming peer [{}]", from_id);
+                    }
+                }
+
+                // 2. Atomic Single-Peer Device Ownership Lock Check
+                {
+                    let devs = state.devices.read().await;
+                    let target_dev = if dev_id == "auto" {
+                        devs.iter().find(|d| d.is_shared || d.can_forward)
+                    } else {
+                        devs.iter().find(|d| d.id == dev_id || derive_numeric_device_id(&d.id).to_string() == dev_id)
+                    };
+
+                    if let Some(d) = target_dev {
+                        if let Some(ref current_owner) = d.remote_peer_id {
+                            if current_owner != from_id {
+                                let conflict_msg = format!(
+                                    "Device '{}' is currently locked and active with remote peer [{}]. Concurrent connection rejected.",
+                                    d.friendly_name, current_owner
+                                );
+                                eprintln!("  🛡️ [Single-Peer Lock] Rejected collision request from [{}]: {}", from_id, conflict_msg);
+                                let reject_msg = serde_json::json!({
+                                    "type": "CONNECT_RESPONSE",
+                                    "toId": from_id,
+                                    "accepted": false,
+                                    "reason": conflict_msg
+                                });
+                                let _ = state.broker_tx.send(reject_msg).await;
+                                let _ = state.ui_events_tx.send(serde_json::json!({
+                                    "type": "DEVICE_COLLISION_BLOCKED",
+                                    "fromId": from_id,
+                                    "lockedBy": current_owner,
+                                    "deviceId": d.id,
+                                    "deviceName": d.friendly_name
+                                }));
+                                return;
+                            }
+                        }
                     }
                 }
 

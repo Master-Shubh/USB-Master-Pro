@@ -56,10 +56,9 @@ if %errorLevel% equ 3010 (
     )
 )
 
-echo [USB Master Pro] Dynamically staging Hardware Capture Filter Driver (anyusb_filter)...
-pnputil.exe /add-driver "%DRIVER_DIR%\filter\anyusb_filter.inf" /install >nul 2>&1
-if %errorLevel% equ 3010 (
-    echo [NOTICE] Reboot is required by Windows to complete driver registration.
+if exist "%DRIVER_DIR%\filter\anyusb_filter.inf" (
+    echo [USB Master Pro] Staging Hardware Capture Filter Driver (Optional/Legacy: anyusb_filter)...
+    pnputil.exe /add-driver "%DRIVER_DIR%\filter\anyusb_filter.inf" /install >nul 2>&1
 )
 
 echo [USB Master Pro] Configuring Windows Firewall Rules (Zero PowerShell Dependency)...

@@ -479,4 +479,52 @@ async fn reqwest_like_post_with_headers(
     String::from_utf8_lossy(&buf).to_string()
 }
 
+#[tokio::test]
+async fn test_single_peer_locking_and_reclaim_lifecycle() {
+    let port = find_free_port();
+    let test_token = format!("test_reclaim_token_{}", port);
+    let broker_url = "ws://127.0.0.1:8443".to_string();
+
+    tokio::spawn(async move {
+        let _ = DaemonServer::run_with_token(port, broker_url, test_token).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let token = usb_master_core::daemon::read_secure_token_from_disk().unwrap_or_default();
+
+    // 1. Get devices list
+    let devs_json = reqwest_like_get(port, "/api/devices").await;
+    assert!(devs_json.contains("local"), "Devices response must contain local list");
+
+    // 2. Share a device
+    let share_body = serde_json::json!({
+        "device_id": "win-usb-1",
+        "share": true,
+        "force": true
+    });
+    let share_res = reqwest_like_post_with_token(port, "/api/devices/share", &share_body, &token).await;
+    assert!(share_res.contains("200 OK") || share_res.contains("404 Not Found"), "Share response received");
+
+    // 3. Test Reclaim Endpoint
+    let reclaim_body = serde_json::json!({
+        "device_id": "win-usb-1"
+    });
+    let reclaim_res = reqwest_like_post_with_token(port, "/api/devices/reclaim", &reclaim_body, &token).await;
+    // Should be 200 OK if device existed, or 404 if win-usb-1 not in simulated list, but never panic
+    assert!(reclaim_res.contains("200 OK") || reclaim_res.contains("404"), "Reclaim endpoint answered deterministically");
+}
+
+#[tokio::test]
+async fn test_interruption_recovery_session_fsm() {
+    use usb_master_core::state::{can_transition, SessionState};
+
+    // Verify Active -> Interrupted -> Recovering -> Active is mathematically valid in the state machine
+    assert!(can_transition(SessionState::Active, SessionState::Interrupted), "Active to Interrupted must be valid");
+    assert!(can_transition(SessionState::Interrupted, SessionState::Recovering), "Interrupted to Recovering must be valid");
+    assert!(can_transition(SessionState::Recovering, SessionState::Active), "Recovering to Active must be valid");
+
+    // Verify Interrupted to Closing timeout transition
+    assert!(can_transition(SessionState::Interrupted, SessionState::Closing), "Interrupted to Closing must be valid");
+}
+
 

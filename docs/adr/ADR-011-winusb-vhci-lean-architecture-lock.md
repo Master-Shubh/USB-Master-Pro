@@ -80,3 +80,4 @@ During engineering implementation and field validation, critical architectural r
 
 ### Negative / Trade-Offs:
 - Devices requiring Isochronous streaming (e.g. UVC webcams) are deferred to post-v1.0. (Bulk and Control devices, covering 100% of target biometrics and crypto tokens, are fully supported).
+
