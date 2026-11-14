@@ -39,6 +39,10 @@ pub struct WinUsbClient {
     default_device_id: AtomicU32,
     #[cfg(any(test, feature = "driver-simulation"))]
     simulation_responses: Mutex<HashMap<u64, (i32, Vec<u8>)>>,
+    #[cfg(any(test, feature = "driver-simulation"))]
+    loopback_fixture_enabled: std::sync::atomic::AtomicBool,
+    #[cfg(any(test, feature = "driver-simulation"))]
+    loopback_queue: Mutex<std::collections::VecDeque<Vec<u8>>>,
 }
 
 impl Default for WinUsbClient {
@@ -54,6 +58,10 @@ impl WinUsbClient {
             default_device_id: AtomicU32::new(0),
             #[cfg(any(test, feature = "driver-simulation"))]
             simulation_responses: Mutex::new(HashMap::new()),
+            #[cfg(any(test, feature = "driver-simulation"))]
+            loopback_fixture_enabled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "driver-simulation"))]
+            loopback_queue: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -227,6 +235,14 @@ impl WinUsbClient {
         map.insert(sequence_id, (status, data));
     }
 
+    #[cfg(any(test, feature = "driver-simulation"))]
+    pub fn enable_test_loopback_fixture(&self, enable: bool) {
+        self.loopback_fixture_enabled.store(enable, Ordering::SeqCst);
+        if !enable {
+            self.loopback_queue.lock().unwrap().clear();
+        }
+    }
+
     /// Dispatches an incoming URB submission to the physical USB hardware.
     /// Returns `(status: i32, response_data: Vec<u8>)`.
     pub fn dispatch_urb(
@@ -240,6 +256,32 @@ impl WinUsbClient {
             let mut sim = self.simulation_responses.lock().unwrap();
             if let Some(resp) = sim.remove(&header.sequence_id) {
                 return resp;
+            }
+
+            if self.loopback_fixture_enabled.load(Ordering::SeqCst) {
+                match header.transfer_type {
+                    TransferType::Control => {
+                        if let Some(sp) = setup_packet {
+                            // Vendor ping bRequest == 0x42
+                            if sp[1] == 0x42 {
+                                return (USBD_STATUS_SUCCESS as i32, b"PICO_WINUSB_TEST_OK".to_vec());
+                            }
+                        }
+                    }
+                    TransferType::Bulk => {
+                        let is_in = (header.endpoint_address & 0x80) != 0;
+                        if is_in {
+                            let mut q = self.loopback_queue.lock().unwrap();
+                            let data = q.pop_front().unwrap_or_default();
+                            return (USBD_STATUS_SUCCESS as i32, data);
+                        } else {
+                            let mut q = self.loopback_queue.lock().unwrap();
+                            q.push_back(payload.to_vec());
+                            return (USBD_STATUS_SUCCESS as i32, Vec::new());
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
 
