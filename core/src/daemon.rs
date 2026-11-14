@@ -902,7 +902,7 @@ async fn handle_get_pin(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    validate_request_origin_and_auth(&headers, &state)?;
+    validate_request_token_or_origin(&headers, &state)?;
     let pin = state.get_pin().await;
     Ok(Json(serde_json::json!({
         "pin": pin,
