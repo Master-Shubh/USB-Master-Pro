@@ -320,13 +320,10 @@ jobs:
           Copy-Item "target/x86_64-pc-windows-msvc/release/usb_master_daemon.exe" "$bundleDir\" -Force
           Copy-Item "target/x86_64-pc-windows-msvc/release/usb_master_cli.exe" "$bundleDir\" -Force
 
-          # 2. Kernel drivers, manifests, catalogs & certificate
+          # 2. Kernel drivers, manifests, catalogs & certificate (ADR-011: ONLY VHCI)
           Copy-Item "drivers/vhci/anyusb_vhci.sys" "$bundleDir\drivers\vhci\" -Force
           Copy-Item "drivers/vhci/anyusb_vhci.inf" "$bundleDir\drivers\vhci\" -Force
           Copy-Item "drivers/vhci/anyusb_vhci.cat" "$bundleDir\drivers\vhci\" -Force
-          Copy-Item "drivers/filter/anyusb_filter.sys" "$bundleDir\drivers\filter\" -Force
-          Copy-Item "drivers/filter/anyusb_filter.inf" "$bundleDir\drivers\filter\" -Force
-          Copy-Item "drivers/filter/anyusb_filter.cat" "$bundleDir\drivers\filter\" -Force
           Copy-Item "drivers/bhartx_test_ca.cer" "$bundleDir\drivers\" -Force
 
           # 3. Scripts and Documentation
@@ -345,9 +342,7 @@ jobs:
               "drivers\vhci\anyusb_vhci.sys",
               "drivers\vhci\anyusb_vhci.inf",
               "drivers\vhci\anyusb_vhci.cat",
-              "drivers\filter\anyusb_filter.sys",
-              "drivers\filter\anyusb_filter.inf",
-              "drivers\filter\anyusb_filter.cat"
+              "drivers\bhartx_test_ca.cer"
           )
           foreach ($relPath in $expectedBundleFiles) {
               $fullPath = Join-Path $bundleDir $relPath
@@ -359,6 +354,11 @@ jobs:
                   throw "FATAL: Expected bundle file $relPath is empty (0 bytes)!"
               }
               Write-Host "Verified bundle artifact: $relPath ($($fItem.Length) bytes)"
+          }
+
+          # HARD ADR-011 INTEGRITY ASSERTION: Verify anyusb_filter is NOT in release bundle
+          if (Test-Path "$bundleDir\drivers\filter") {
+              throw "SECURITY/ARCHITECTURE VIOLATION: anyusb_filter directory found in production release bundle!"
           }
 
           # 4. Generate Zip Archive
@@ -380,6 +380,14 @@ jobs:
 
           if (-not (Test-Path "dist\bin\USBMasterPro.exe") -or -not (Test-Path "dist\bin\USBMasterDaemon.exe")) {
               throw "FATAL: Staged user-mode binaries (USBMasterPro.exe / USBMasterDaemon.exe) missing in dist\bin"
+          }
+
+          # Authenticode Sign User-Mode Binaries before packaging
+          $signingCert = Get-ChildItem -Path "Cert:\LocalMachine\My" | Where-Object { $_.Subject -like "*BhartX Ecosystems Field Testing CA*" } | Select-Object -First 1
+          if ($signingCert) {
+              Set-AuthenticodeSignature -FilePath "dist\bin\USBMasterPro.exe" -Certificate $signingCert -HashAlgorithm SHA256 | Out-Null
+              Set-AuthenticodeSignature -FilePath "dist\bin\USBMasterDaemon.exe" -Certificate $signingCert -HashAlgorithm SHA256 | Out-Null
+              Write-Host "Signed user-mode executables with BhartX Ecosystems Field Testing CA."
           }
 
           choco install innosetup --no-progress -y
@@ -406,6 +414,13 @@ jobs:
           $installerPath = "dist\installer\USBMasterPro-Setup-v1.0.0.exe"
           if (-not (Test-Path $installerPath)) {
               throw "FATAL: Setup Wizard executable was not produced at $installerPath"
+          }
+
+          # Authenticode Sign the Inno Setup Installer Executable
+          if ($signingCert) {
+              Set-AuthenticodeSignature -FilePath $installerPath -Certificate $signingCert -HashAlgorithm SHA256 | Out-Null
+              $sig = Get-AuthenticodeSignature -FilePath $installerPath
+              Write-Host "Signed Setup Wizard: $($sig.Status) | Signer: $($sig.SignerCertificate.Subject)"
           }
           Write-Host "Setup Wizard compiled successfully: $installerPath ($((Get-Item $installerPath).Length) bytes)"
 

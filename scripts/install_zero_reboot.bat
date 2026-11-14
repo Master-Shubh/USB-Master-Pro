@@ -56,11 +56,6 @@ if %errorLevel% equ 3010 (
     )
 )
 
-if exist "%DRIVER_DIR%\filter\anyusb_filter.inf" (
-    echo [USB Master Pro] Staging Hardware Capture Filter Driver (Optional/Legacy: anyusb_filter)...
-    pnputil.exe /add-driver "%DRIVER_DIR%\filter\anyusb_filter.inf" /install >nul 2>&1
-)
-
 echo [USB Master Pro] Configuring Windows Firewall Rules (Zero PowerShell Dependency)...
 netsh advfirewall firewall delete rule name="USB Master Pro Daemon" >nul 2>&1
 netsh advfirewall firewall delete rule name="USB Master Pro CLI" >nul 2>&1
