@@ -4,6 +4,7 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(not(target_os = "windows"))]
 use std::fs;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

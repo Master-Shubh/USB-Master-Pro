@@ -2164,7 +2164,7 @@ async fn handle_ws_events(
         .and_then(|s| s.strip_prefix("Bearer ").or(Some(s)));
 
     let provided_token = token_query.or(token_header).or(token_auth);
-    let expected_token = state.local_api_token.read().unwrap();
+    let expected_token = state.local_api_token.read().unwrap().clone();
 
     let is_authorized = match provided_token {
         Some(tok) => constant_time_eq_str(tok, &expected_token),

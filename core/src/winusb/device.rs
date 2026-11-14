@@ -4,7 +4,6 @@
 
 use super::ffi::*;
 use std::ffi::c_void;
-use std::sync::Mutex;
 use thiserror::Error;
 
 pub const DEFAULT_USB_TIMEOUT_MS: u32 = 3000;
