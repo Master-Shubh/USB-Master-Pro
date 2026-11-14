@@ -1057,14 +1057,12 @@ pub async fn handle_share_device(
             d.is_shared = payload.share;
             let numeric_dev_id = derive_numeric_device_id(&d.id);
             if payload.share {
-                let _ = state.filter_client.start_capture(numeric_dev_id);
-                // Check if device is a WinUSB peripheral and claim it
+                // Check if device is a WinUSB peripheral and claim it (ADR-011 pure user-mode)
                 let winusb_devs = crate::winusb::WinUsbClient::enumerate_devices(None);
                 if let Some(w_dev) = winusb_devs.iter().find(|w| w.vid == d.vid && w.pid == d.pid) {
                     let _ = state.winusb_client.claim_device(numeric_dev_id, &w_dev.path);
                 }
             } else {
-                let _ = state.filter_client.stop_capture(numeric_dev_id);
                 state.winusb_client.release_device(numeric_dev_id);
             }
 
@@ -1152,7 +1150,6 @@ pub async fn handle_reclaim_device(
             // This immediately unbinds the user-mode claim and lets Windows re-bind the physical device
             // to the local OEM vendor driver (e.g. Mantra RD Service) without requiring cable replug!
             state.winusb_client.release_device(numeric_dev_id);
-            let _ = state.filter_client.stop_capture(numeric_dev_id);
 
             let reclaimed_name = d.friendly_name.clone();
             let reclaimed_id = d.id.clone();
@@ -1555,6 +1552,8 @@ pub async fn run_network_to_vhci_pump(
 
 /// Pulls captured physical URBs from `filter_client.fetch_urb()` with adaptive backoff
 /// (100 µs to 2 ms) and streams them across the session data channel to the remote peer.
+#[allow(dead_code)]
+#[deprecated(note = "Legacy ADR-003 filter pump. WinUSB is the sole production capture backend under ADR-011.")]
 pub async fn run_filter_to_network_pump(
     filter_client: Arc<FilterDriverClient>,
     device_id: u32,
@@ -1663,6 +1662,8 @@ pub async fn run_filter_to_network_pump(
 
 /// Receives completed URBs from the network data channel, parses wire framing,
 /// enforces 64 KB single-URB bounds protection, and dispatches completion to the filter driver.
+#[allow(dead_code)]
+#[deprecated(note = "Legacy ADR-003 filter pump. WinUSB is the sole production capture backend under ADR-011.")]
 pub async fn run_network_to_filter_pump(
     filter_client: Arc<FilterDriverClient>,
     mut session_data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
@@ -1716,6 +1717,71 @@ pub async fn run_network_to_filter_pump(
     }
 }
 
+/// Host-side (Sender) pump: receives submit URBs from the remote receiver via session channel,
+/// dispatches them directly to the physical USB hardware via WinUSB FFI,
+/// encodes completion wire frames, and streams them back to the receiver.
+pub async fn run_network_to_winusb_pump(
+    winusb_client: Arc<WinUsbClient>,
+    mut session_data_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    session_data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        let frame = tokio::select! {
+            msg = session_data_rx.recv() => {
+                match msg {
+                    Some(f) => f,
+                    None => break, // Data channel closed
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let (header, setup_packet, payload) = match decode_submit_urb_frame(&frame) {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("⚠️ Wire submit URB parsing error in WinUSB pump: {}", e);
+                continue;
+            }
+        };
+
+        let client = Arc::clone(&winusb_client);
+        let payload_vec = payload.to_vec();
+        let hdr_clone = header.clone();
+        let dispatch_res = tokio::task::spawn_blocking(move || {
+            client.dispatch_urb(&hdr_clone, setup_packet.as_ref(), &payload_vec)
+        }).await;
+
+        let (status, response_data) = match dispatch_res {
+            Ok(res) => res,
+            Err(_) => (crate::winusb::client::STATUS_NOT_SUPPORTED, Vec::new()),
+        };
+
+        let actual_len = response_data.len() as u32;
+        let mut resp_header = TurboUrbHeader::new(
+            CMD_COMPLETE_URB,
+            header.sequence_id,
+            header.device_id,
+            header.endpoint_address,
+            header.transfer_type,
+            actual_len,
+        );
+        resp_header.actual_length = actual_len;
+        resp_header.status = status;
+
+        if let Ok(comp_frame) = encode_complete_urb_frame(&resp_header, &response_data) {
+            if session_data_tx.send(comp_frame).await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
 /// Spawns VHCI-to-network and network-to-VHCI pump worker tasks for an active session.
 pub async fn spawn_session_pumps(
     state: &Arc<DaemonState>,
@@ -1748,16 +1814,11 @@ pub async fn spawn_session_pumps(
     };
 
     let (driver_to_net_task, net_to_driver_task) = if is_local_sender {
-        let filter_client_1 = Arc::clone(&state.filter_client);
-        let t1 = tokio::spawn(async move {
-            run_filter_to_network_pump(filter_client_1, device_id, driver_to_net_tx, shutdown_rx_driver).await;
+        let winusb_client = Arc::clone(&state.winusb_client);
+        let sender_pump = tokio::spawn(async move {
+            run_network_to_winusb_pump(winusb_client, net_to_driver_rx, driver_to_net_tx, shutdown_rx_net).await;
         });
-
-        let filter_client_2 = Arc::clone(&state.filter_client);
-        let t2 = tokio::spawn(async move {
-            run_network_to_filter_pump(filter_client_2, net_to_driver_rx, shutdown_rx_net).await;
-        });
-        (t1, t2)
+        (tokio::spawn(async {}), sender_pump)
     } else {
         let driver_client_1 = Arc::clone(&state.driver_client);
         let t1 = tokio::spawn(async move {
@@ -1881,7 +1942,7 @@ pub async fn execute_session_disconnect(
     }
     drop(rem_lock);
 
-    // Unmount local device if bound to this peer and stop filter capture
+    // Unmount local device if bound to this peer and release WinUSB physical claim
     let mut dev_lock = state.devices.write().await;
     for dev in dev_lock.iter_mut() {
         if dev.remote_peer_id.as_deref() == Some(&clean_peer_id) {
@@ -1889,14 +1950,13 @@ pub async fn execute_session_disconnect(
             dev.remote_peer_id = None;
             found = true;
             let local_numeric_id = derive_numeric_device_id(&dev.id);
-            let _ = state.filter_client.stop_capture(local_numeric_id);
+            state.winusb_client.release_device(local_numeric_id);
         }
     }
     drop(dev_lock);
 
-    // Detach virtual device from VHCI driver and stop filter capture on derived peer device id
+    // Detach virtual device from VHCI driver on derived peer device id
     let numeric_dev_id = derive_numeric_device_id(&clean_peer_id);
-    let _ = state.filter_client.stop_capture(numeric_dev_id);
     let driver_client = Arc::clone(&state.driver_client);
     let _ = tokio::task::spawn_blocking(move || {
         match driver_client.detach_device(numeric_dev_id) {
