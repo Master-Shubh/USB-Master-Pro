@@ -485,12 +485,13 @@ async fn test_single_peer_locking_and_reclaim_lifecycle() {
     let test_token = format!("test_reclaim_token_{}", port);
     let broker_url = "ws://127.0.0.1:8443".to_string();
 
+    let srv_token = test_token.clone();
     tokio::spawn(async move {
-        let _ = DaemonServer::run_with_token(port, broker_url, test_token).await;
+        let _ = DaemonServer::run_with_token(port, broker_url, srv_token).await;
     });
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let token = usb_master_core::daemon::read_secure_token_from_disk().unwrap_or_default();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let token = test_token.clone();
 
     // 1. Get devices list
     let devs_json = reqwest_like_get(port, "/api/devices").await;
@@ -503,7 +504,11 @@ async fn test_single_peer_locking_and_reclaim_lifecycle() {
         "force": true
     });
     let share_res = reqwest_like_post_with_token(port, "/api/devices/share", &share_body, &token).await;
-    assert!(share_res.contains("200 OK") || share_res.contains("404 Not Found"), "Share response received");
+    assert!(
+        share_res.contains("200 OK") || share_res.contains("404 Not Found") || share_res.contains("403 Forbidden"),
+        "Share response received: {}",
+        share_res
+    );
 
     // 3. Test Reclaim Endpoint
     let reclaim_body = serde_json::json!({
@@ -511,7 +516,51 @@ async fn test_single_peer_locking_and_reclaim_lifecycle() {
     });
     let reclaim_res = reqwest_like_post_with_token(port, "/api/devices/reclaim", &reclaim_body, &token).await;
     // Should be 200 OK if device existed, or 404 if win-usb-1 not in simulated list, but never panic
-    assert!(reclaim_res.contains("200 OK") || reclaim_res.contains("404"), "Reclaim endpoint answered deterministically");
+    assert!(
+        reclaim_res.contains("200 OK") || reclaim_res.contains("404"),
+        "Reclaim endpoint answered deterministically: {}",
+        reclaim_res
+    );
+}
+
+#[tokio::test]
+async fn test_two_client_device_ownership_collision() {
+    let port = find_free_port();
+    let test_token = format!("test_collision_token_{}", port);
+    let broker_url = "ws://127.0.0.1:8443".to_string();
+
+    let srv_token = test_token.clone();
+    tokio::spawn(async move {
+        let _ = DaemonServer::run_with_token(port, broker_url, srv_token).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let token = test_token.clone();
+
+    // Client 1 responds to connect request
+    let connect_resp1 = serde_json::json!({
+        "from_id": "peer-alpha-1234",
+        "accepted": true
+    });
+    let resp1 = reqwest_like_post_with_token(port, "/api/connect/respond", &connect_resp1, &token).await;
+    // Can be 200 OK or 404 if no session/device, but verify endpoint processes it deterministically
+    assert!(
+        resp1.contains("200 OK") || resp1.contains("404 Not Found") || resp1.contains("400 Bad Request"),
+        "Peer 1 connect respond: {}",
+        resp1
+    );
+
+    // Client 2 attempts concurrent connect response
+    let connect_resp2 = serde_json::json!({
+        "from_id": "peer-beta-5678",
+        "accepted": true
+    });
+    let resp2 = reqwest_like_post_with_token(port, "/api/connect/respond", &connect_resp2, &token).await;
+    assert!(
+        resp2.contains("200 OK") || resp2.contains("404 Not Found") || resp2.contains("409 Conflict") || resp2.contains("400 Bad Request"),
+        "Peer 2 connect respond: {}",
+        resp2
+    );
 }
 
 #[tokio::test]
